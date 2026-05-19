@@ -1,0 +1,1457 @@
+from __future__ import annotations
+
+import asyncio
+import html
+import os
+from dataclasses import replace
+
+import numpy as np
+import pandas as pd
+import requests
+from apscheduler.schedulers.background import BackgroundScheduler
+from dotenv import load_dotenv
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+
+from .main import load_config, run_pipeline
+from .paths import CONFIGS_DIR
+from .data_loader import download_ohlcv_to_csv, load_ohlcv_from_csv
+from .indicators import add_basic_indicators
+from .features import SIMILARITY_FEATURE_COLS, add_basic_features
+from .backtest import BacktestConfig, run_simple_backtest
+from .liquidity_model import hours_to_bars, liquidity_zone_and_volume, minutes_to_bars
+from .similarity import SimilarityConfig, forecast_direction, forecast_neighbor_stats
+from .signal_combiner import (
+    detect_regime,
+    detect_trend_direction,
+    compute_liquidity_distance_score,
+    compute_volume_scores,
+    combine_probabilities,
+)
+from .orderflow_stream import start_orderbook_stream, get_liquidity_snapshot
+from .backtest_analytics import ev_bucket_label
+from .ev_calibration import load_ev_calibration
+from .market_scanner import ScanConfig, scan_market_top_setups
+from .scan_cache import load_scan_result, report_from_cache
+from .trade_gate import GateMode, TradeGateConfig, evaluate_trade_gate
+
+
+app = FastAPI(title="Forecast App")
+
+
+def _trade_gate_bundle(tg: TradeGateConfig | None = None) -> tuple[TradeGateConfig, dict[str, float]]:
+    tg = tg or TradeGateConfig()
+    curve = load_ev_calibration(tg.ev_calibration_json_path) if tg.use_auto_ev_calibration else {}
+    return tg, curve
+
+
+def _snapshot_bar_trade_gate_series(df: pd.DataFrame) -> tuple[float, float, float, float, float, float, float]:
+    """Last-bar inputs aligned with enriched backtest: volume, volume EMA20, RSI, close, EMA20/50, ATR."""
+    vl = float(df["volume"].iloc[-1]) if "volume" in df.columns else float("nan")
+    vma = float(df["volume_ema_20"].iloc[-1]) if "volume_ema_20" in df.columns else float("nan")
+    rsi_b = float(df["rsi_14"].iloc[-1]) if "rsi_14" in df.columns else float("nan")
+    cl = float(df["close"].iloc[-1]) if "close" in df.columns else float("nan")
+    em20 = float(df["ema_20"].iloc[-1]) if "ema_20" in df.columns else float("nan")
+    em50 = float(df["ema_50"].iloc[-1]) if "ema_50" in df.columns else float("nan")
+    atr_abs = float(df["atr_14"].iloc[-1]) if "atr_14" in df.columns else float("nan")
+    return vl, vma, rsi_b, cl, em20, em50, atr_abs
+
+
+def _simple_symbol_snapshot(
+    symbol: str,
+    timeframe: str,
+    limit: int,
+    use_futures: bool,
+    sim_cfg: SimilarityConfig,
+    bt_cfg: BacktestConfig,
+    trade_gate: TradeGateConfig | None = None,
+):
+    """Compute full forecast metrics for a given symbol (similar to main card)."""
+    # 1–3. Download and load OHLCV
+    csv_path = download_ohlcv_to_csv(
+        symbol=symbol,
+        timeframe=timeframe,
+        limit=limit,
+        use_futures=use_futures,
+    )
+    df = load_ohlcv_from_csv(csv_path)
+
+    # 4–5. Indicators and features
+    df = add_basic_indicators(df)
+    df = add_basic_features(df)
+
+    if df.empty:
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "last_price": float("nan"),
+            "last_time": "N/A",
+            "prob_up": 0.5,
+            "prob_down": 0.5,
+            "change_1": 0.0,
+            "change_24": 0.0,
+            "trend_regime": "N/A",
+            "vol_regime": "N/A",
+            "prob_up_10m": 0.5,
+            "prob_down_10m": 0.5,
+            "low_price_10m": float("nan"),
+            "high_price_10m": float("nan"),
+            "prob_up_1h": 0.5,
+            "prob_down_1h": 0.5,
+            "low_price_1h": float("nan"),
+            "high_price_1h": float("nan"),
+            "prob_up_6": 0.5,
+            "prob_down_6": 0.5,
+            "low_price_6": float("nan"),
+            "high_price_6": float("nan"),
+            "bars_10m": 0,
+            "bars_1h": 0,
+            "bars_6h": 0,
+            "trades": 0,
+            "equity": float("nan"),
+            "liq_low": float("nan"),
+            "liq_high": float("nan"),
+            "vol_24h": 0.0,
+            "sb_hist_pct": 25.0,
+            "sb_liq_pct": 25.0,
+            "sb_vol_pct": 25.0,
+            "sb_dist_pct": 25.0,
+            "trade_gate_reason": "N/A",
+            "trade_gate_reason_code": "NO_SIGNAL",
+            "trade_idea_1h": "No trade",
+            "trade_conf_1h": 0.0,
+            "size_mult_1h": 0.0,
+            "ev_1h": 0.0,
+            "ev_adj_1h": 0.0,
+            "effective_neighbors_1h": 0.0,
+            "skew_1h": 0.0,
+            "avg_up_move_1h": 0.0,
+            "avg_down_move_1h": 0.0,
+            "knn_regime": "N/A",
+        }
+
+    last_price = float(df["close"].iloc[-1])
+    last_time = str(df.index[-1])
+
+    # Liquidity zone & 24h volume approximation
+    liq_low, liq_high, vol_24h = liquidity_zone_and_volume(df, timeframe)
+
+    # 1-bar change
+    if len(df) > 1:
+        change_1 = (df["close"].iloc[-1] / df["close"].iloc[-2] - 1.0) * 100.0
+    else:
+        change_1 = 0.0
+
+    # 24-bar change
+    if "ret_24" in df.columns:
+        change_24 = float(df["ret_24"].iloc[-1] * 100.0)
+    else:
+        change_24 = change_1
+
+    # Market regime
+    if "ema_20" in df.columns and "ema_50" in df.columns:
+        ema20 = float(df["ema_20"].iloc[-1])
+        ema50 = float(df["ema_50"].iloc[-1])
+        drift = 0.001
+        if ema20 > ema50 * (1 + drift):
+            trend_regime = "Uptrend"
+        elif ema20 < ema50 * (1 - drift):
+            trend_regime = "Downtrend"
+        else:
+            trend_regime = "Range"
+    else:
+        trend_regime = "N/A"
+
+    if "volatility_24" in df.columns:
+        vol = float(df["volatility_24"].iloc[-1])
+        if vol < 0.5 / 100:
+            vol_regime = "Low vol"
+        elif vol < 1.5 / 100:
+            vol_regime = "Normal vol"
+        else:
+            vol_regime = "High vol"
+    else:
+        vol_regime = "N/A"
+
+    feature_cols = list(SIMILARITY_FEATURE_COLS)
+
+    bars_10m = minutes_to_bars(10, timeframe)
+    bars_1h = hours_to_bars(1, timeframe)
+    bars_6h = hours_to_bars(6, timeframe)
+    sim10 = replace(sim_cfg, forecast_horizon_bars=bars_10m)
+    sim1h = replace(sim_cfg, forecast_horizon_bars=bars_1h)
+    sim6 = replace(sim_cfg, forecast_horizon_bars=bars_6h)
+
+    st10 = forecast_neighbor_stats(df, feature_cols, sim10)
+    prob_up_10m = st10.directional_prob_up()
+    prob_down_10m = 1.0 - prob_up_10m
+    low_price_10m = last_price * (1.0 + st10.low_ret)
+    high_price_10m = last_price * (1.0 + st10.high_ret)
+
+    st1h = forecast_neighbor_stats(df, feature_cols, sim1h)
+    prob_up_1h = st1h.directional_prob_up()
+    prob_down_1h = 1.0 - prob_up_1h
+    low_ret_1h, high_ret_1h = st1h.low_ret, st1h.high_ret
+    low_price_1h = last_price * (1.0 + low_ret_1h)
+    high_price_1h = last_price * (1.0 + high_ret_1h)
+
+    st6 = forecast_neighbor_stats(df, feature_cols, sim6)
+    prob_up_6 = st6.directional_prob_up()
+    prob_down_6 = 1.0 - prob_up_6
+    low_ret_6, high_ret_6 = st6.low_ret, st6.high_ret
+    low_price_6 = last_price * (1.0 + low_ret_6)
+    high_price_6 = last_price * (1.0 + high_ret_6)
+
+    st_base = forecast_neighbor_stats(df, feature_cols, sim_cfg)
+    prob_up = st_base.directional_prob_up()
+    prob_down = 1.0 - prob_up
+
+    gate_cfg, ev_curve = _trade_gate_bundle(trade_gate)
+
+    # Signal breakdown components (use historical liquidity only for multi)
+    regime = detect_regime(df)
+    trend_direction = detect_trend_direction(df, drift=gate_cfg.trend_ema_drift)
+    S_liq_up_hist, S_liq_down_hist, S_distance = compute_liquidity_distance_score(
+        last_price, liq_low, liq_high
+    )
+    S_vol_up, S_vol_down = compute_volume_scores(df)
+
+    comb_up_1h, comb_down_1h = combine_probabilities(
+        prob_up_1h,
+        prob_down_1h,
+        S_liq_up_hist,
+        S_liq_down_hist,
+        S_distance,
+        S_vol_up,
+        S_vol_down,
+        regime,
+    )
+    natr_last = float(df["natr_14"].iloc[-1]) if "natr_14" in df.columns else 0.0
+    knn_gate = str(df["knn_regime"].iloc[-1]) if "knn_regime" in df.columns else regime
+    ev_b = ev_bucket_label(st1h.ev)
+    vol_last, vma, rsi_bar, _, em20_bar, em50_bar, atr_abs = _snapshot_bar_trade_gate_series(df)
+    tg = evaluate_trade_gate(
+        comb_up_1h=comb_up_1h,
+        comb_down_1h=comb_down_1h,
+        low_ret_1h=low_ret_1h,
+        high_ret_1h=high_ret_1h,
+        S_distance=S_distance,
+        vol_regime=vol_regime,
+        natr_14=natr_last,
+        ev=st1h.ev,
+        skew=st1h.skew,
+        knn_regime=knn_gate,
+        ev_bucket=ev_b,
+        effective_neighbors=float(st1h.effective_neighbors),
+        trend_direction=trend_direction,
+        last_price=last_price,
+        support_level=float(liq_low),
+        resistance_level=float(liq_high),
+        volume_last=vol_last,
+        volume_sma20=vma,
+        rsi_bar=rsi_bar,
+        close_bar=last_price,
+        ema_20_bar=em20_bar,
+        ema_50_bar=em50_bar,
+        atr_14_abs=atr_abs,
+        gate_mode=GateMode.C,
+        ev_calibration_curve=ev_curve,
+        cfg=gate_cfg,
+    )
+    direction = tg.direction
+    confidence = tg.confidence
+    trade_gate_reason = f"{tg.reason_code}: " + "; ".join(tg.reasons)
+
+    sb_hist = prob_up_1h
+    sb_liq = S_liq_up_hist
+    sb_vol = S_vol_up
+    sb_dist = S_distance
+    sb_total = sb_hist + sb_liq + sb_vol + sb_dist
+    if sb_total > 0:
+        sb_hist_pct = sb_hist / sb_total * 100.0
+        sb_liq_pct = sb_liq / sb_total * 100.0
+        sb_vol_pct = sb_vol / sb_total * 100.0
+        sb_dist_pct = sb_dist / sb_total * 100.0
+    else:
+        sb_hist_pct = sb_liq_pct = sb_vol_pct = sb_dist_pct = 25.0
+
+    # Simple backtest
+    bt_df = run_simple_backtest(df, feature_cols, sim_cfg, bt_cfg)
+    if not bt_df.empty:
+        equity = float(bt_df["equity"].iloc[-1])
+        trades = int((bt_df["position"] != 0).sum())
+    else:
+        equity = float("nan")
+        trades = 0
+
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "last_price": last_price,
+        "last_time": last_time,
+        "prob_up": prob_up,
+        "prob_down": prob_down,
+        "change_1": change_1,
+        "change_24": change_24,
+        "trend_regime": trend_regime,
+        "vol_regime": vol_regime,
+        "prob_up_10m": prob_up_10m,
+        "prob_down_10m": prob_down_10m,
+        "low_price_10m": low_price_10m,
+        "high_price_10m": high_price_10m,
+        "bars_10m": bars_10m,
+        "prob_up_1h": prob_up_1h,
+        "prob_down_1h": prob_down_1h,
+        "low_price_1h": low_price_1h,
+        "high_price_1h": high_price_1h,
+        "ev_1h": st1h.ev,
+        "skew_1h": st1h.skew,
+        "avg_up_move_1h": st1h.avg_up_move,
+        "avg_down_move_1h": st1h.avg_down_move,
+        "knn_regime": knn_gate,
+        "effective_neighbors_1h": st1h.effective_neighbors,
+        "ev_adj_1h": tg.ev_adj,
+        "prob_up_6": prob_up_6,
+        "prob_down_6": prob_down_6,
+        "low_price_6": low_price_6,
+        "high_price_6": high_price_6,
+        "bars_1h": bars_1h,
+        "bars_6h": bars_6h,
+        "trades": trades,
+        "equity": equity,
+        "liq_low": liq_low,
+        "liq_high": liq_high,
+        "vol_24h": vol_24h,
+        "sb_hist_pct": sb_hist_pct,
+        "sb_liq_pct": sb_liq_pct,
+        "sb_vol_pct": sb_vol_pct,
+        "sb_dist_pct": sb_dist_pct,
+        "trade_idea_1h": direction,
+        "trade_conf_1h": confidence,
+        "trade_gate_reason": trade_gate_reason,
+        "trade_gate_reason_code": tg.reason_code,
+        "size_mult_1h": tg.size_mult,
+    }
+
+
+def _send_telegram(text: str) -> bool:
+    """Send message via Telegram Bot API. Returns True if sent, False if skipped/failed."""
+    load_dotenv(override=False)
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    chat_id = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+    if not token or not chat_id:
+        print("[Forecast] Telegram skipped: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env")
+        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        r = requests.post(
+            url,
+            json={"chat_id": str(chat_id), "text": text, "disable_web_page_preview": True},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            print("[Forecast] Telegram sent successfully")
+            return True
+        print(f"[Forecast] Telegram failed: {r.status_code} {r.text[:200]}")
+        return False
+    except Exception as e:
+        print(f"[Forecast] Telegram error: {e}")
+        return False
+
+
+def _tick_forecast_and_telegram() -> None:
+    """Run forecasts for all symbols and send Telegram alert if any forecast >= 85%."""
+    config_path = CONFIGS_DIR / "config.yaml"
+    if not config_path.exists():
+        print(f"[Forecast] Config not found: {config_path}")
+        return
+    try:
+        cfg = load_config(str(config_path))
+        symbols = [
+            cfg.symbol,
+            "ETH/USDT",
+            "SOL/USDT",
+            "BNB/USDT",
+            "XRP/USDT",
+            "PEPE/USDT",
+            "DOGE/USDT",
+            "LINK/USDT",
+        ]
+        seen = set()
+        unique_symbols = [s for s in symbols if s not in seen and not seen.add(s)]
+
+        for symbol in unique_symbols:
+            try:
+                snap = _simple_symbol_snapshot(
+                    symbol,
+                    cfg.timeframe,
+                    cfg.limit,
+                    cfg.use_futures,
+                    cfg.similarity,
+                    cfg.backtest,
+                    trade_gate=cfg.trade_gate,
+                )
+            except Exception as e:
+                print(f"[Forecast] Snapshot failed for {symbol}: {e}")
+                continue
+            alerts = []
+            if snap["prob_up_10m"] >= 0.85:
+                alerts.append(f"10m ↑ {snap['prob_up_10m']*100:.0f}%")
+            if snap["prob_down_10m"] >= 0.85:
+                alerts.append(f"10m ↓ {snap['prob_down_10m']*100:.0f}%")
+            if snap["prob_up_1h"] >= 0.85:
+                alerts.append(f"1h ↑ {snap['prob_up_1h']*100:.0f}%")
+            if snap["prob_down_1h"] >= 0.85:
+                alerts.append(f"1h ↓ {snap['prob_down_1h']*100:.0f}%")
+            if snap["prob_up_6"] >= 0.85:
+                alerts.append(f"6h ↑ {snap['prob_up_6']*100:.0f}%")
+            if snap["prob_down_6"] >= 0.85:
+                alerts.append(f"6h ↓ {snap['prob_down_6']*100:.0f}%")
+            if alerts:
+                msg = f"Forecast signal {symbol}\n" + "\n".join(alerts) + f"\nPrice: {snap['last_price']:.2f}"
+                _send_telegram(msg)
+    except Exception as e:
+        print(f"[Forecast] Tick error: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+_scheduler = BackgroundScheduler()
+_scheduler.add_job(_tick_forecast_and_telegram, "interval", minutes=15, id="forecast_telegram")
+
+
+@app.on_event("startup")
+def _start_scheduler() -> None:
+    from datetime import datetime, timedelta
+
+    _scheduler.start()
+    # First run 30s after startup so server is ready
+    _scheduler.add_job(
+        _tick_forecast_and_telegram,
+        "date",
+        run_date=datetime.utcnow() + timedelta(seconds=30),
+        id="forecast_telegram_first",
+    )
+
+    # Start Binance Futures orderbook streams in the background
+    loop = asyncio.get_event_loop()
+    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "PEPEUSDT", "DOGEUSDT", "LINKUSDT"]
+    loop.create_task(start_orderbook_stream(symbols))
+
+
+@app.on_event("shutdown")
+def _stop_scheduler() -> None:
+    _scheduler.shutdown(wait=False)
+
+
+@app.get("/trigger-telegram-check")
+def trigger_telegram_check() -> str:
+    """Run forecast + Telegram check once (for testing). Check console for logs."""
+    _tick_forecast_and_telegram()
+    return "Done. Check server console for '[Forecast]' messages and Telegram."
+
+
+@app.get("/", response_class=HTMLResponse)
+def index() -> str:
+    """Simple browser screen with current forecast and backtest summary."""
+    config_path = "configs/config.yaml"
+    cfg = load_config(config_path)
+
+    df, bt_df, prob_up, prob_down = run_pipeline(config_path)
+
+    symbol = cfg.symbol
+    timeframe = cfg.timeframe
+
+    if not df.empty:
+        last_price = float(df["close"].iloc[-1])
+        last_time = str(df.index[-1])
+
+        liq_low, liq_high, vol_24h = liquidity_zone_and_volume(df, timeframe)
+
+        # 1-bar change
+        if len(df) > 1:
+            change_1 = (df["close"].iloc[-1] / df["close"].iloc[-2] - 1.0) * 100.0
+        else:
+            change_1 = 0.0
+
+        # 24-bar change (we already compute ret_24 feature)
+        if "ret_24" in df.columns:
+            change_24 = float(df["ret_24"].iloc[-1] * 100.0)
+        else:
+            change_24 = change_1
+
+        # Режим для UI/API: локально по EMA 20/50 и volatility_24 (см. README: целевая спецификация — EMA 50/200 на 4H).
+        if "ema_20" in df.columns and "ema_50" in df.columns:
+            ema20 = float(df["ema_20"].iloc[-1])
+            ema50 = float(df["ema_50"].iloc[-1])
+            drift = 0.001
+            if ema20 > ema50 * (1 + drift):
+                trend_regime = "Uptrend"
+            elif ema20 < ema50 * (1 - drift):
+                trend_regime = "Downtrend"
+            else:
+                trend_regime = "Range"
+        else:
+            trend_regime = "N/A"
+
+        if "volatility_24" in df.columns:
+            vol = float(df["volatility_24"].iloc[-1])
+            if vol < 0.5 / 100:
+                vol_regime = "Low vol"
+            elif vol < 1.5 / 100:
+                vol_regime = "Normal vol"
+            else:
+                vol_regime = "High vol"
+        else:
+            vol_regime = "N/A"
+    else:
+        last_price = float("nan")
+        last_time = "N/A"
+        liq_low, liq_high, vol_24h = float("nan"), float("nan"), 0.0
+        change_1 = 0.0
+        change_24 = 0.0
+        trend_regime = "N/A"
+        vol_regime = "N/A"
+
+    # Price range forecast based on historical future returns distribution
+    feature_cols = list(SIMILARITY_FEATURE_COLS)
+
+    comb_up_10m = comb_down_10m = 0.5
+    comb_up_1h = comb_down_1h = 0.5
+    comb_up_6 = comb_down_6 = 0.5
+    bars_10m = bars_1h = bars_6h = 0
+    low_price_10m = high_price_10m = float("nan")
+    low_price_1h = high_price_1h = float("nan")
+    low_price_6 = high_price_6 = float("nan")
+    liq_up_ob = liq_down_ob = 0.0
+    trade_idea_1h = "No trade"
+    trade_gate_note = "Insufficient data"
+    trade_gate_code = "NO_SIGNAL"
+    size_mult_1h = 0.0
+    ev_1h = 0.0
+    ev_adj_display = 0.0
+    eff_neighbors_display = 0.0
+    skew_1h = 0.0
+    avg_up_1h = 0.0
+    avg_down_1h = 0.0
+    knn_regime_label = "N/A"
+
+    if not df.empty:
+        gate_cfg, ev_curve = _trade_gate_bundle(cfg.trade_gate)
+        # Forecast on 10m, 1h and 6h horizons (converted to bars from timeframe)
+        bars_10m = minutes_to_bars(10, timeframe)
+        bars_1h = hours_to_bars(1, timeframe)
+        bars_6h = hours_to_bars(6, timeframe)
+
+        sim10 = replace(cfg.similarity, forecast_horizon_bars=bars_10m)
+        sim1h = replace(cfg.similarity, forecast_horizon_bars=bars_1h)
+        sim6 = replace(cfg.similarity, forecast_horizon_bars=bars_6h)
+
+        st10 = forecast_neighbor_stats(df, feature_cols, sim10)
+        prob_up_10m = st10.directional_prob_up()
+        prob_down_10m = 1.0 - prob_up_10m
+        low_price_10m = last_price * (1.0 + st10.low_ret)
+        high_price_10m = last_price * (1.0 + st10.high_ret)
+
+        st1h = forecast_neighbor_stats(df, feature_cols, sim1h)
+        prob_up_1h = st1h.directional_prob_up()
+        prob_down_1h = 1.0 - prob_up_1h
+        low_ret_1h, high_ret_1h = st1h.low_ret, st1h.high_ret
+        low_price_1h = last_price * (1.0 + low_ret_1h)
+        high_price_1h = last_price * (1.0 + high_ret_1h)
+        ev_1h = st1h.ev
+        skew_1h = st1h.skew
+        avg_up_1h = st1h.avg_up_move
+        avg_down_1h = st1h.avg_down_move
+
+        st6 = forecast_neighbor_stats(df, feature_cols, sim6)
+        prob_up_6 = st6.directional_prob_up()
+        prob_down_6 = 1.0 - prob_up_6
+        low_ret_6, high_ret_6 = st6.low_ret, st6.high_ret
+        low_price_6 = last_price * (1.0 + low_ret_6)
+        high_price_6 = last_price * (1.0 + high_ret_6)
+
+        # Combined probabilities using orderbook liquidity, historical liquidity zone,
+        # distance, volume and historical signal
+        regime = detect_regime(df)
+        trend_direction = detect_trend_direction(df, drift=gate_cfg.trend_ema_drift)
+
+        # Live orderbook liquidity from Binance Futures
+        ob_symbol = cfg.symbol.replace("/", "").upper()
+        liq_up_ob, liq_down_ob = get_liquidity_snapshot(ob_symbol, last_price, pct=0.01)
+        total_liq_ob = liq_up_ob + liq_down_ob
+        if total_liq_ob > 0:
+            S_liq_up_ob = liq_up_ob / total_liq_ob
+            S_liq_down_ob = liq_down_ob / total_liq_ob
+        else:
+            S_liq_up_ob = S_liq_down_ob = 0.5
+
+        # Historical liquidity zone
+        S_liq_up_hist, S_liq_down_hist, S_distance = compute_liquidity_distance_score(
+            last_price, liq_low, liq_high
+        )
+
+        # Mix live and historical liquidity (weights can be tuned)
+        S_liq_up = 0.5 * S_liq_up_hist + 0.5 * S_liq_up_ob
+        S_liq_down = 0.5 * S_liq_down_hist + 0.5 * S_liq_down_ob
+        S_vol_up, S_vol_down = compute_volume_scores(df)
+
+        comb_up_10m, comb_down_10m = combine_probabilities(
+            prob_up_10m,
+            prob_down_10m,
+            S_liq_up,
+            S_liq_down,
+            S_distance,
+            S_vol_up,
+            S_vol_down,
+            regime,
+        )
+        comb_up_1h, comb_down_1h = combine_probabilities(
+            prob_up_1h,
+            prob_down_1h,
+            S_liq_up,
+            S_liq_down,
+            S_distance,
+            S_vol_up,
+            S_vol_down,
+            regime,
+        )
+        comb_up_6, comb_down_6 = combine_probabilities(
+            prob_up_6,
+            prob_down_6,
+            S_liq_up,
+            S_liq_down,
+            S_distance,
+            S_vol_up,
+            S_vol_down,
+            regime,
+        )
+
+        natr_last = float(df["natr_14"].iloc[-1]) if "natr_14" in df.columns else 0.0
+        knn_regime_label = str(df["knn_regime"].iloc[-1]) if "knn_regime" in df.columns else regime
+        ev_b = ev_bucket_label(st1h.ev)
+        vol_last, vma, rsi_bar, _, em20_bar, em50_bar, atr_abs = _snapshot_bar_trade_gate_series(df)
+        tg = evaluate_trade_gate(
+            comb_up_1h=comb_up_1h,
+            comb_down_1h=comb_down_1h,
+            low_ret_1h=low_ret_1h,
+            high_ret_1h=high_ret_1h,
+            S_distance=S_distance,
+            vol_regime=vol_regime,
+            natr_14=natr_last,
+            ev=st1h.ev,
+            skew=st1h.skew,
+            knn_regime=knn_regime_label,
+            ev_bucket=ev_b,
+            effective_neighbors=float(st1h.effective_neighbors),
+            trend_direction=trend_direction,
+            last_price=last_price,
+            support_level=float(liq_low),
+            resistance_level=float(liq_high),
+            volume_last=vol_last,
+            volume_sma20=vma,
+            rsi_bar=rsi_bar,
+            close_bar=last_price,
+            ema_20_bar=em20_bar,
+            ema_50_bar=em50_bar,
+            atr_14_abs=atr_abs,
+            gate_mode=GateMode.C,
+            ev_calibration_curve=ev_curve,
+            cfg=gate_cfg,
+        )
+        trade_idea_1h = tg.direction
+        trade_gate_note = f"{tg.reason_code}: " + "; ".join(tg.reasons)
+        trade_gate_code = tg.reason_code
+        size_mult_1h = tg.size_mult
+        ev_adj_display = tg.ev_adj
+        eff_neighbors_display = st1h.effective_neighbors
+
+        # Signal breakdown (use 1h horizon as reference)
+        sb_hist = prob_up_1h
+        sb_liq = S_liq_up
+        sb_vol = S_vol_up
+        sb_dist = S_distance
+        sb_total = sb_hist + sb_liq + sb_vol + sb_dist
+        if sb_total > 0:
+            sb_hist_pct = sb_hist / sb_total * 100.0
+            sb_liq_pct = sb_liq / sb_total * 100.0
+            sb_vol_pct = sb_vol / sb_total * 100.0
+            sb_dist_pct = sb_dist / sb_total * 100.0
+        else:
+            sb_hist_pct = sb_liq_pct = sb_vol_pct = sb_dist_pct = 25.0
+    else:
+        prob_up_1h = prob_down_1h = 0.5
+        prob_up_6 = prob_down_6 = 0.5
+        sb_hist_pct = sb_liq_pct = sb_vol_pct = sb_dist_pct = 25.0
+
+    if not bt_df.empty:
+        final_equity = float(bt_df["equity"].iloc[-1])
+        trades = int((bt_df["position"] != 0).sum())
+    else:
+        final_equity = float("nan")
+        trades = 0
+
+    # Use combined probabilities for UI display
+    prob_up_pct_10m = comb_up_10m * 100.0
+    prob_down_pct_10m = comb_down_10m * 100.0
+    prob_up_pct_1h = comb_up_1h * 100.0
+    prob_down_pct_1h = comb_down_1h * 100.0
+    prob_up_pct_6 = comb_up_6 * 100.0
+    prob_down_pct_6 = comb_down_6 * 100.0
+
+    if final_equity != final_equity:  # NaN check
+        equity_pct_str = "N/A"
+    else:
+        equity_pct = (final_equity - 1.0) * 100.0
+        sign = "+" if equity_pct >= 0 else ""
+        equity_pct_str = f"{sign}{equity_pct:.1f}%"
+
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <title>Forecast App</title>
+        <style>
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                background: #0b1020;
+                color: #f4f4f4;
+                margin: 0;
+                padding: 0;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                min-height: 100vh;
+            }}
+            .card {{
+                background: #161b2e;
+                border-radius: 16px;
+                padding: 24px 32px;
+                box-shadow: 0 18px 45px rgba(0,0,0,0.35);
+                max-width: 520px;
+                width: 100%;
+            }}
+            h1 {{
+                margin-top: 0;
+                margin-bottom: 12px;
+                font-size: 24px;
+            }}
+            .subtitle {{
+                color: #9aa4c6;
+                font-size: 14px;
+                margin-bottom: 20px;
+            }}
+            .section-title {{
+                margin-top: 18px;
+                margin-bottom: 6px;
+                font-size: 13px;
+                text-transform: uppercase;
+                letter-spacing: 0.08em;
+                color: #707aa3;
+            }}
+            .metric-row {{
+                display: flex;
+                justify-content: space-between;
+                margin-bottom: 8px;
+                font-size: 15px;
+            }}
+            .label {{
+                color: #9aa4c6;
+            }}
+            .value-strong {{
+                font-weight: 600;
+            }}
+            .badge-up {{
+                color: #27e58b;
+            }}
+            .badge-down {{
+                color: #ff5c7a;
+            }}
+            .footer {{
+                margin-top: 18px;
+                font-size: 12px;
+                color: #737da0;
+            }}
+            .btn-refresh {{
+                margin-top: 18px;
+                background: linear-gradient(135deg, #2563eb, #38bdf8);
+                border: none;
+                border-radius: 999px;
+                padding: 8px 18px;
+                color: white;
+                font-size: 13px;
+                cursor: pointer;
+            }}
+            .btn-refresh:hover {{
+                opacity: 0.92;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>Forecast snapshot</h1>
+            <div class="subtitle">{symbol} · {timeframe} · similarity-based direction forecast (reload page to update).</div>
+
+            <div class="section-title">Market snapshot</div>
+            <div class="metric-row">
+                <span class="label">Last close</span>
+                <span class="value-strong">{last_price:.2f}</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">Change (last bar)</span>
+                <span class="value-strong">{change_1:.2f}%</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">Change (~24 bars)</span>
+                <span class="value-strong">{change_24:.2f}%</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">Last update</span>
+                <span class="value-strong">{last_time}</span>
+            </div>
+
+            <div class="section-title">Forecast</div>
+            <div class="metric-row">
+                <span class="label">10m: ↑ Up</span>
+                <span class="value-strong badge-up">{prob_up_pct_10m:.0f}%</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">10m: ↓ Down</span>
+                <span class="value-strong badge-down">{prob_down_pct_10m:.0f}%</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">10m range (~{bars_10m} bars)</span>
+                <span class="value-strong">{low_price_10m:.2f} – {high_price_10m:.2f}</span>
+            </div>
+
+            <div class="metric-row">
+                <span class="label">1h: ↑ Up</span>
+                <span class="value-strong badge-up">{prob_up_pct_1h:.0f}%</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">1h: ↓ Down</span>
+                <span class="value-strong badge-down">{prob_down_pct_1h:.0f}%</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">1h range (~{bars_1h} bars)</span>
+                <span class="value-strong">{low_price_1h:.2f} – {high_price_1h:.2f}</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">1h EV (weighted neighbors)</span>
+                <span class="value-strong">{ev_1h * 100:.3f}%</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">1h EV adj (after bucket calib)</span>
+                <span class="value-strong">{ev_adj_display * 100:.3f}%</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">1h effective neighbor count (Kish)</span>
+                <span class="value-strong">{eff_neighbors_display:.1f}</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">1h skew (avg up / avg down)</span>
+                <span class="value-strong">{skew_1h:.2f}</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">1h avg up / avg down move</span>
+                <span class="value-strong">{avg_up_1h * 100:.3f}% / {avg_down_1h * 100:.3f}%</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">kNN regime (model bucket)</span>
+                <span class="value-strong">{html.escape(str(knn_regime_label))}</span>
+            </div>
+
+            <div class="metric-row">
+                <span class="label">6h: ↑ Up</span>
+                <span class="value-strong badge-up">{prob_up_pct_6:.0f}%</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">6h: ↓ Down</span>
+                <span class="value-strong badge-down">{prob_down_pct_6:.0f}%</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">6h range (~{bars_6h} bars)</span>
+                <span class="value-strong">{low_price_6:.2f} – {high_price_6:.2f}</span>
+            </div>
+
+            <div class="section-title">Backtest</div>
+            <div class="metric-row">
+                <span class="label">Trades</span>
+                <span class="value-strong">{trades}</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">Equity</span>
+                <span class="value-strong">{equity_pct_str}</span>
+            </div>
+
+            <div class="section-title">Liquidity & volume</div>
+            <div class="metric-row">
+                <span class="label">24h volume (approx)</span>
+                <span class="value-strong">{vol_24h:.0f}</span>
+            </div>
+
+            <div class="section-title">Signal breakdown (1h up)</div>
+            <div class="metric-row">
+                <span class="label">Hist</span>
+                <span class="value-strong">{sb_hist_pct:.0f}%</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">Liquidity</span>
+                <span class="value-strong">{sb_liq_pct:.0f}%</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">Volume</span>
+                <span class="value-strong">{sb_vol_pct:.0f}%</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">Distance</span>
+                <span class="value-strong">{sb_dist_pct:.0f}%</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">Liquidity zone</span>
+                <span class="value-strong">{liq_low:.2f} – {liq_high:.2f}</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">Orderbook liq up (w)</span>
+                <span class="value-strong">{liq_up_ob:.0f}</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">Orderbook liq down (w)</span>
+                <span class="value-strong">{liq_down_ob:.0f}</span>
+            </div>
+
+            <div class="section-title">Market regime</div>
+            <div class="metric-row">
+                <span class="label">Trend</span>
+                <span class="value-strong">{trend_regime}</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">Volatility</span>
+                <span class="value-strong">{vol_regime}</span>
+            </div>
+
+            <div class="section-title">Trade gate (1h combined)</div>
+            <div class="metric-row">
+                <span class="label">Direction</span>
+                <span class="value-strong">{trade_idea_1h}</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">Gate detail</span>
+                <span class="value-strong" style="max-width: 65%; text-align: right; font-size: 12px;">{html.escape(trade_gate_note)}</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">Gate code</span>
+                <span class="value-strong">{html.escape(str(trade_gate_code))}</span>
+            </div>
+            <div class="metric-row">
+                <span class="label">Size mult (1h)</span>
+                <span class="value-strong">{size_mult_1h:.2f}</span>
+            </div>
+
+            <button class="btn-refresh" onclick="window.location.reload()">Run forecast again</button>
+
+            <div class="footer">
+                This is a demo view. Logic is based on historical similarity windows and a simple walk-forward backtest.
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+    return html
+
+
+@app.get("/multi", response_class=HTMLResponse)
+def multi() -> str:
+    """Show simple forecasts for multiple symbols on one screen."""
+    config_path = "configs/config.yaml"
+    cfg = load_config(config_path)
+
+    symbols = [
+        cfg.symbol,
+        "ETH/USDT",
+        "SOL/USDT",
+        "BNB/USDT",
+        "XRP/USDT",
+        "PEPE/USDT",
+        "DOGE/USDT",
+        "LINK/USDT",
+    ]
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_symbols = []
+    for s in symbols:
+        if s not in seen:
+            seen.add(s)
+            unique_symbols.append(s)
+
+    sim_cfg = cfg.similarity
+    snapshots = [
+        _simple_symbol_snapshot(
+            symbol, cfg.timeframe, cfg.limit, cfg.use_futures, sim_cfg, cfg.backtest, trade_gate=cfg.trade_gate
+        )
+        for symbol in unique_symbols
+    ]
+
+    # Build cards HTML
+    cards_html_parts = []
+    for snap in snapshots:
+        prob_up_pct = snap["prob_up"] * 100.0
+        prob_down_pct = snap["prob_down"] * 100.0
+        prob_up_pct_1h = snap["prob_up_1h"] * 100.0
+        prob_down_pct_1h = snap["prob_down_1h"] * 100.0
+        prob_up_pct_6 = snap["prob_up_6"] * 100.0
+        prob_down_pct_6 = snap["prob_down_6"] * 100.0
+
+        sb_hist_pct = snap["sb_hist_pct"]
+        sb_liq_pct = snap["sb_liq_pct"]
+        sb_vol_pct = snap["sb_vol_pct"]
+        sb_dist_pct = snap["sb_dist_pct"]
+        trade_idea_1h = snap["trade_idea_1h"]
+        trade_conf_1h = snap["trade_conf_1h"]
+        trade_gate_reason_esc = html.escape(snap.get("trade_gate_reason", "N/A"))
+
+        equity = snap["equity"]
+        if equity != equity:
+            equity_pct_str = "N/A"
+        else:
+            equity_pct = (equity - 1.0) * 100.0
+            sign = "+" if equity_pct >= 0 else ""
+            equity_pct_str = f"{sign}{equity_pct:.1f}%"
+        cards_html_parts.append(
+            f"""
+            <div class="card">
+                <h1>{snap['symbol']}</h1>
+                <div class="subtitle">{snap['timeframe']} · similarity forecast</div>
+
+                <div class="section-title">Market snapshot</div>
+                <div class="metric-row">
+                    <span class="label">Last close</span>
+                    <span class="value-strong">{snap['last_price']:.2f}</span>
+                </div>
+                <div class="metric-row">
+                    <span class="label">Change (last bar)</span>
+                    <span class="value-strong">{snap['change_1']:.2f}%</span>
+                </div>
+                <div class="metric-row">
+                    <span class="label">Change (~24 bars)</span>
+                    <span class="value-strong">{snap['change_24']:.2f}%</span>
+                </div>
+                <div class="metric-row">
+                    <span class="label">Last update</span>
+                    <span class="value-strong">{snap['last_time']}</span>
+                </div>
+
+                <div class="section-title">Forecast</div>
+
+                <div class="section-title">Trade idea (1h)</div>
+                <div class="metric-row">
+                    <span class="label">Direction</span>
+                    <span class="value-strong">{trade_idea_1h}</span>
+                </div>
+                <div class="metric-row">
+                    <span class="label">Confidence</span>
+                    <span class="value-strong">{trade_conf_1h:.0f}%</span>
+                </div>
+                <div class="metric-row">
+                    <span class="label">Gate detail</span>
+                    <span class="value-strong" style="max-width: 60%; text-align: right; font-size: 12px;">{trade_gate_reason_esc}</span>
+                </div>
+                <div class="metric-row">
+                    <span class="label">Gate code</span>
+                    <span class="value-strong">{html.escape(str(snap.get("trade_gate_reason_code", "N/A")))}</span>
+                </div>
+                <div class="metric-row">
+                    <span class="label">Size mult</span>
+                    <span class="value-strong">{snap.get("size_mult_1h", 0.0):.2f}</span>
+                </div>
+                <div class="metric-row">
+                    <span class="label">1h EV</span>
+                    <span class="value-strong">{snap.get("ev_1h", 0.0) * 100:.3f}%</span>
+                </div>
+                <div class="metric-row">
+                    <span class="label">1h skew</span>
+                    <span class="value-strong">{snap.get("skew_1h", 0.0):.2f}</span>
+                </div>
+                <div class="metric-row">
+                    <span class="label">kNN regime</span>
+                    <span class="value-strong">{html.escape(str(snap.get("knn_regime", "N/A")))}</span>
+                </div>
+
+                <div class="metric-row">
+                    <span class="label">1h: ↑ Up</span>
+                    <span class="value-strong badge-up">{prob_up_pct_1h:.0f}%</span>
+                </div>
+                <div class="metric-row">
+                    <span class="label">1h: ↓ Down</span>
+                    <span class="value-strong badge-down">{prob_down_pct_1h:.0f}%</span>
+                </div>
+                <div class="metric-row">
+                    <span class="label">1h range (~{snap['bars_1h']} bars)</span>
+                    <span class="value-strong">{snap['low_price_1h']:.2f} – {snap['high_price_1h']:.2f}</span>
+                </div>
+
+                <div class="metric-row">
+                    <span class="label">6h: ↑ Up</span>
+                    <span class="value-strong badge-up">{prob_up_pct_6:.0f}%</span>
+                </div>
+                <div class="metric-row">
+                    <span class="label">6h: ↓ Down</span>
+                    <span class="value-strong badge-down">{prob_down_pct_6:.0f}%</span>
+                </div>
+                <div class="metric-row">
+                    <span class="label">6h range (~{snap['bars_6h']} bars)</span>
+                    <span class="value-strong">{snap['low_price_6']:.2f} – {snap['high_price_6']:.2f}</span>
+                </div>
+
+                <div class="section-title">Backtest</div>
+                <div class="metric-row">
+                    <span class="label">Trades</span>
+                    <span class="value-strong">{snap['trades']}</span>
+                </div>
+                <div class="metric-row">
+                    <span class="label">Equity</span>
+                    <span class="value-strong">{equity_pct_str}</span>
+                </div>
+
+                <div class="section-title">Liquidity & volume</div>
+                <div class="metric-row">
+                    <span class="label">24h volume (approx)</span>
+                    <span class="value-strong">{snap['vol_24h']:.0f}</span>
+                </div>
+                <div class="metric-row">
+                    <span class="label">Liquidity zone</span>
+                    <span class="value-strong">{snap['liq_low']:.2f} – {snap['liq_high']:.2f}</span>
+                </div>
+
+                <div class="section-title">Signal breakdown (1h up)</div>
+                <div class="metric-row">
+                    <span class="label">Hist</span>
+                    <span class="value-strong">{sb_hist_pct:.0f}%</span>
+                </div>
+                <div class="metric-row">
+                    <span class="label">Liquidity</span>
+                    <span class="value-strong">{sb_liq_pct:.0f}%</span>
+                </div>
+                <div class="metric-row">
+                    <span class="label">Volume</span>
+                    <span class="value-strong">{sb_vol_pct:.0f}%</span>
+                </div>
+                <div class="metric-row">
+                    <span class="label">Distance</span>
+                    <span class="value-strong">{sb_dist_pct:.0f}%</span>
+                </div>
+
+                <div class="section-title">Market regime</div>
+                <div class="metric-row">
+                    <span class="label">Trend</span>
+                    <span class="value-strong">{snap['trend_regime']}</span>
+                </div>
+                <div class="metric-row">
+                    <span class="label">Volatility</span>
+                    <span class="value-strong">{snap['vol_regime']}</span>
+                </div>
+            </div>
+            """
+        )
+
+    cards_html = "\n".join(cards_html_parts)
+
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <title>Forecast App - Multi</title>
+        <style>
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                background: #0b1020;
+                color: #f4f4f4;
+                margin: 0;
+                padding: 24px;
+            }}
+            .cards-container {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 20px;
+                justify-content: center;
+                align-items: flex-start;
+            }}
+            .card {{
+                background: #161b2e;
+                border-radius: 16px;
+                padding: 18px 22px;
+                box-shadow: 0 18px 45px rgba(0,0,0,0.35);
+                width: 280px;
+            }}
+            h1 {{
+                margin-top: 0;
+                margin-bottom: 8px;
+                font-size: 20px;
+            }}
+            .subtitle {{
+                color: #9aa4c6;
+                font-size: 13px;
+                margin-bottom: 14px;
+            }}
+            .section-title {{
+                margin-top: 12px;
+                margin-bottom: 4px;
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 0.08em;
+                color: #707aa3;
+            }}
+            .metric-row {{
+                display: flex;
+                justify-content: space-between;
+                margin-bottom: 6px;
+                font-size: 13px;
+            }}
+            .label {{
+                color: #9aa4c6;
+            }}
+            .value-strong {{
+                font-weight: 600;
+            }}
+            .badge-up {{
+                color: #27e58b;
+            }}
+            .badge-down {{
+                color: #ff5c7a;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="cards-container">
+            {cards_html}
+        </div>
+    </body>
+    </html>
+    """
+    return html
+
+
+def _scanner_report(
+    *,
+    top: int,
+    bars: int,
+    timeframe: str,
+    stage1_min_score: float,
+    max_symbols: int | None,
+    live: bool,
+) -> tuple[dict, str | None, bool]:
+    """Return (report, updated_at, from_cache)."""
+    if not live:
+        cached = load_scan_result()
+        if cached is not None:
+            rep, updated = report_from_cache(cached, top=top)
+            rep["cache_source"] = True
+            return rep, updated, True
+
+    cfg = load_config("configs/config.yaml")
+    rep = scan_market_top_setups(
+        similarity_cfg=cfg.similarity,
+        scan_cfg=ScanConfig(
+            timeframe=timeframe,
+            bars=int(bars),
+            top_n=int(top),
+            stage1_min_score=float(stage1_min_score),
+            max_symbols=max_symbols,
+        ),
+    )
+    rep["cache_source"] = False
+    return rep, None, False
+
+
+@app.get("/scanner/json")
+def scanner_json(
+    top: int = 5,
+    bars: int = 320,
+    timeframe: str = "1h",
+    stage1_min_score: float = 20.0,
+    max_symbols: int | None = 60,
+    live: bool = False,
+) -> dict:
+    """Structured output of 4-stage market scanner (cached unless live=1)."""
+    rep, updated_at, from_cache = _scanner_report(
+        top=top,
+        bars=bars,
+        timeframe=timeframe,
+        stage1_min_score=stage1_min_score,
+        max_symbols=max_symbols,
+        live=live,
+    )
+    if updated_at:
+        rep["updated_at"] = updated_at
+    rep["from_cache"] = from_cache
+    return rep
+
+
+@app.get("/scanner", response_class=HTMLResponse)
+def scanner_panel(
+    top: int = 5,
+    bars: int = 320,
+    timeframe: str = "1h",
+    stage1_min_score: float = 20.0,
+    max_symbols: int | None = 60,
+    live: bool = False,
+) -> str:
+    """Web panel for top setups from the new 4-stage pipeline."""
+    rep, updated_at, from_cache = _scanner_report(
+        top=top,
+        bars=bars,
+        timeframe=timeframe,
+        stage1_min_score=stage1_min_score,
+        max_symbols=max_symbols,
+        live=live,
+    )
+    updated_line = (
+        f"Last scan (UTC): {html.escape(updated_at)} | source: {'cache' if from_cache else 'live'}"
+        if updated_at
+        else "No cached scan yet — wait for timer or open with ?live=1"
+    )
+
+    rows = []
+    for i, s in enumerate(rep.get("top_setups", []), start=1):
+        setup = s.get("setup", {})
+        rows.append(
+            f"""
+            <tr>
+                <td>{i}</td>
+                <td><strong>{html.escape(str(s.get("symbol", "")))}</strong></td>
+                <td>{html.escape(str(s.get("pattern", "")))}</td>
+                <td>{html.escape(str(s.get("trend", "")))}</td>
+                <td>{float(s.get("score", 0.0)):.1f}</td>
+                <td>{html.escape(str(setup.get("direction", "")))}</td>
+                <td>{float(setup.get("probability_pct", 0.0)):.1f}%</td>
+                <td>{float(setup.get("entry", float("nan"))):.6g}</td>
+                <td>{float(setup.get("stop", float("nan"))):.6g}</td>
+                <td>{float(setup.get("target_1", float("nan"))):.6g}</td>
+                <td>{float(setup.get("target_2", float("nan"))):.6g}</td>
+                <td>{float(setup.get("risk_reward", 0.0)):.2f}</td>
+                <td>{html.escape(str(s.get("why_selected", "")))}</td>
+            </tr>
+            """
+        )
+
+    table_rows = "\n".join(rows) if rows else "<tr><td colspan='13'>No setups found for this filter.</td></tr>"
+    max_symbols_q = "" if max_symbols is None else str(max_symbols)
+    json_url = (
+        f"/scanner/json?top={int(top)}&bars={int(bars)}&timeframe={html.escape(timeframe)}"
+        f"&stage1_min_score={float(stage1_min_score)}"
+        f"&max_symbols={html.escape(max_symbols_q)}"
+    )
+
+    return f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <meta http-equiv="refresh" content="900" />
+        <title>Forecast Scanner Panel</title>
+        <style>
+            body {{
+                margin: 0;
+                background: #0b0f1a;
+                color: #e7ecff;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            }}
+            .wrap {{
+                max-width: 1400px;
+                margin: 24px auto;
+                padding: 0 16px 24px;
+            }}
+            h1 {{
+                margin: 0 0 10px;
+                font-size: 28px;
+            }}
+            .meta {{
+                color: #9aa4c6;
+                margin-bottom: 14px;
+                font-size: 14px;
+            }}
+            .actions {{
+                margin-bottom: 16px;
+                display: flex;
+                gap: 10px;
+                flex-wrap: wrap;
+            }}
+            .btn {{
+                border: 1px solid #2a3350;
+                background: #141b2d;
+                color: #e7ecff;
+                padding: 8px 12px;
+                border-radius: 8px;
+                text-decoration: none;
+                font-size: 13px;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                background: #10172a;
+                border: 1px solid #1d2740;
+            }}
+            th, td {{
+                border-bottom: 1px solid #1d2740;
+                padding: 8px 10px;
+                font-size: 12px;
+                text-align: left;
+                vertical-align: top;
+            }}
+            th {{
+                background: #161f36;
+                position: sticky;
+                top: 0;
+                z-index: 1;
+            }}
+            tr:hover td {{
+                background: #131d33;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="wrap">
+            <h1>Top Binance Setups</h1>
+            <div class="meta">
+                {html.escape(updated_line)}<br />
+                Universe: {int(rep.get("universe_size", 0))} pairs |
+                Candidates: {int(rep.get("candidates_found", 0))} |
+                Timeframe: {html.escape(timeframe)} |
+                Bars: {int(bars)} |
+                Stage1 min score: {float(stage1_min_score):.1f}
+            </div>
+            <div class="actions">
+                <a class="btn" href="/scanner?top={int(top)}&bars={int(bars)}&timeframe={html.escape(timeframe)}&stage1_min_score={float(stage1_min_score)}&max_symbols={html.escape(max_symbols_q)}">Refresh</a>
+                <a class="btn" href="{json_url}" target="_blank">Open JSON</a>
+                <a class="btn" href="/multi" target="_blank">Legacy Multi Dashboard</a>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Symbol</th>
+                        <th>Pattern</th>
+                        <th>Trend</th>
+                        <th>Score</th>
+                        <th>Direction</th>
+                        <th>Prob</th>
+                        <th>Entry</th>
+                        <th>Stop</th>
+                        <th>TP1</th>
+                        <th>TP2</th>
+                        <th>R:R</th>
+                        <th>Why selected</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {table_rows}
+                </tbody>
+            </table>
+        </div>
+    </body>
+    </html>
+    """
+

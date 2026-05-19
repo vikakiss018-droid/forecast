@@ -1,0 +1,16 @@
+[Unit]
+Description=Forecast market scan (oneshot, writes cache)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=forecast
+Group=forecast
+WorkingDirectory=/opt/forecast
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/opt/forecast/.venv/bin:/usr/bin
+EnvironmentFile=-/opt/forecast/deploy/ubuntu/forecast.env
+ExecStart=/opt/forecast/.venv/bin/python -m forecast.run_scheduled_scan
+StandardOutput=journal
+StandardError=journal

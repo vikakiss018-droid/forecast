@@ -1,0 +1,68 @@
+exchange: binance
+symbol: BTC/USDT
+# Целевой ТФ стратегии: 4H (BTC/ETH). Здесь 1h — для быстрых локальных прогонов; для продакшена поменять на 4h.
+timeframe: 1h
+limit: 3000
+use_futures: false
+
+similarity:
+  window_bars: 24
+  n_neighbors: 24
+  forecast_horizon_bars: 6
+  use_regime_split: true
+  use_distance_weights: true
+  regime_min_train_rows: 36
+  min_effective_neighbors: 5.0
+
+backtest:
+  transaction_cost_bp: 2
+  threshold_long: 0.54
+  threshold_short: 0.44
+
+# Целевая логика (спецификация): среднесрок 4H, только по тренду; long при close>EMA200 и EMA50>EMA200;
+# вход после пробоя high за 20 свечей с подтверждением объёмом; RSI14 не покупать перегрето; SL 1.5×ATR14;
+# риск 0.5–1% депозита; тейк 2R–3R или trailing; желателен BTC market filter. Ниже — промежуточный trade_gate kNN-пайплайна.
+#
+# Про «нулевые сделки»: S_distance (ликвидность) с σ=0.003 часто даёт малые значения; высокий liq_hard_min
+# отсеивает почти всё первым. Одновременно 1.5× объём + trade_with_trend_only + строгое EMA + EV>0
+# оставляет слишком узкое пересечение — см. gate_reason_distribution в analytics.
+trade_gate:
+  use_ev_metrics_in_gate: true
+  use_ev_gate: true
+  blocked_ev_buckets:
+    - ev_lt_0
+  require_forecast_ev_positive: true
+  min_volume_vs_sma20_mult: 1.1
+  rsi_max_long: 70
+  rsi_min_short: 30
+  max_price_ema50_atr_mult: 2.0
+  weak_breakout_edge_ratio: 1.05
+  # Доп. к trade_with_trend_only; при true часто «добивает» оставшиеся кандидаты (см. STRICT_TREND_EMA_BLOCK).
+  strict_trend_ema_alignment: false
+  trend_ema_drift: null
+  cooldown_bars_after_trade: 8
+  block_same_direction_reentry_bars: 8
+  max_trades_per_calendar_day: 1
+  # Режим: в up/down торгуем по тренду, во флэте разрешаем от уровней.
+  trade_with_trend_only: true
+  long_only: false
+  use_support_resistance_filter: true
+  sr_level_tolerance_natr_mult: 0.8
+  use_prob_edge_sizing: false
+  prob_edge_min_size: 0.0
+  prob_edge_power: 1.0
+  comb_prob_min: 0.55
+  # Было 0.095 → ~50% баров только из-за этого; держите согласованно с формулой S_distance в signal_combiner.
+  liq_hard_min: 0.03
+  expected_move_vs_cost_mult: 1.6
+  expected_move_vs_natr_mult: 1.1
+  expected_move_vs_natr_mult_high_vol: 1.52
+  blocked_knn_regimes: []
+  allowed_ev_buckets: []
+  min_ev_trade: 0.0
+  min_forecast_ev_abs: null
+  use_auto_ev_calibration: false
+  ev_min: 0.0
+  min_skew: null
+  min_effective_neighbors_gate: null
+  min_ev_vol_ratio: null
