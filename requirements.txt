@@ -18,4 +18,3 @@ uvicorn
 websockets
 aiohttp
 TA-Lib
-apscheduler

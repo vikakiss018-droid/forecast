@@ -16,8 +16,12 @@ import os
 import sys
 from pathlib import Path
 
+import yaml
+
+from .auto_trader import maybe_run_auto_trade
 from .main import load_config
 from .market_scanner import ScanConfig, scan_market_top_setups
+from .paths import CONFIGS_DIR
 from .scan_cache import save_scan_result
 
 
@@ -75,6 +79,16 @@ def main() -> int:
         f"top={n} saved={path}",
         flush=True,
     )
+
+    auto_yaml: dict = {}
+    cfg_path = Path(config_path)
+    if not cfg_path.is_absolute():
+        cfg_path = CONFIGS_DIR.parent / config_path
+    if cfg_path.is_file():
+        with open(cfg_path, encoding="utf-8") as f:
+            auto_yaml = (yaml.safe_load(f) or {}).get("auto_trade") or {}
+    trade_result = maybe_run_auto_trade(report, yaml_cfg=auto_yaml)
+    print(f"[scan] auto_trade: {trade_result.get('action')} {trade_result.get('reason', '')}", flush=True)
     return 0
 
 

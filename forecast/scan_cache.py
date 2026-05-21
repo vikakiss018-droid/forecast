@@ -8,6 +8,8 @@ from typing import Any
 from .paths import PROCESSED_DATA_DIR, ensure_directories
 
 DEFAULT_CACHE_PATH = PROCESSED_DATA_DIR / "market_scan_latest.json"
+SCAN_HISTORY_PATH = PROCESSED_DATA_DIR / "scan_history.jsonl"
+MAX_SCAN_HISTORY = 96
 
 
 def save_scan_result(
@@ -24,6 +26,69 @@ def save_scan_result(
         "report": report,
     }
     out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    _append_scan_history(payload)
+    return out
+
+
+def _history_summary(report: dict[str, Any]) -> dict[str, Any]:
+    setups = report.get("top_setups") or []
+    if not setups:
+        return {"symbol": None, "score": None, "direction": None}
+    top = setups[0]
+    plan = top.get("setup") or {}
+    return {
+        "symbol": top.get("symbol"),
+        "score": top.get("score"),
+        "direction": plan.get("direction"),
+        "pattern": top.get("pattern"),
+        "trend": top.get("trend"),
+    }
+
+
+def _append_scan_history(payload: dict[str, Any]) -> None:
+    ensure_directories()
+    report = payload.get("report") or {}
+    entry = {
+        "updated_at": payload.get("updated_at"),
+        "scan_config": payload.get("scan_config") or {},
+        "universe_size": report.get("universe_size"),
+        "candidates_found": report.get("candidates_found"),
+        "top": _history_summary(report),
+        "top_count": len(report.get("top_setups") or []),
+    }
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
+    with open(SCAN_HISTORY_PATH, "a", encoding="utf-8") as f:
+        f.write(line)
+    _trim_scan_history()
+
+
+def _trim_scan_history() -> None:
+    if not SCAN_HISTORY_PATH.is_file():
+        return
+    lines = SCAN_HISTORY_PATH.read_text(encoding="utf-8").splitlines()
+    if len(lines) <= MAX_SCAN_HISTORY:
+        return
+    SCAN_HISTORY_PATH.write_text(
+        "\n".join(lines[-MAX_SCAN_HISTORY:]) + "\n",
+        encoding="utf-8",
+    )
+
+
+def load_scan_history(limit: int = 30) -> list[dict[str, Any]]:
+    if not SCAN_HISTORY_PATH.is_file():
+        return []
+    lines = SCAN_HISTORY_PATH.read_text(encoding="utf-8").splitlines()
+    out: list[dict[str, Any]] = []
+    for line in reversed(lines[-max(limit, 1) * 2 :]):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+        if len(out) >= limit:
+            break
     return out
 
 

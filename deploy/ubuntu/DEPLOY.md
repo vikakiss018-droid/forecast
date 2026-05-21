@@ -94,6 +94,36 @@ export FORECAST_MAX_SYMBOLS=100 FORECAST_TOP=10
 python -m forecast.run_scheduled_scan
 ```
 
+## Автоторговля (опционально)
+
+После скана открывается позиция на **Binance USDT-M Futures**: **Long** или **Short** по полю `direction` лучшего сетапа.
+
+1. В Binance API: **Enable Futures** (без Withdraw).
+2. На фьючерсном счёте переведите USDT (Transfer → Futures).
+3. В `/opt/forecast/.env` — **отдельный торговый ключ** (рекомендуется):
+
+```bash
+BINANCE_TRADE_API_KEY=ваш_новый_ключ
+BINANCE_TRADE_API_SECRET=ваш_новый_секрет
+```
+
+Старый ключ можно оставить только для сканера (`BINANCE_API_KEY` / `SECRET`, read-only).
+
+4. Автоторговля и остальное в `.env`:
+
+```bash
+AUTO_TRADE_ENABLED=true
+AUTO_TRADE_DRY_RUN=true
+AUTO_TRADE_MAX_NOTIONAL_USDT=30
+AUTO_TRADE_RISK_PCT=0.5
+AUTO_TRADE_LEVERAGE=5
+AUTO_TRADE_MARGIN_MODE=isolated
+```
+
+4. Dry-run: `sudo -u forecast .venv/bin/python -m forecast.run_auto_trade`
+5. Статус: `http://IP:8000/trader/status`
+6. Реальная торговля: `AUTO_TRADE_DRY_RUN=false` (малый notional сначала).
+
 ## Обновление кода (после push с Mac)
 
 На Mac:

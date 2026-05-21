@@ -7,11 +7,8 @@ from dataclasses import replace
 
 import numpy as np
 import pandas as pd
-import requests
-from apscheduler.schedulers.background import BackgroundScheduler
-from dotenv import load_dotenv
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from .main import load_config, run_pipeline
 from .paths import CONFIGS_DIR
@@ -32,7 +29,11 @@ from .orderflow_stream import start_orderbook_stream, get_liquidity_snapshot
 from .backtest_analytics import ev_bucket_label
 from .ev_calibration import load_ev_calibration
 from .market_scanner import ScanConfig, scan_market_top_setups
-from .scan_cache import load_scan_result, report_from_cache
+from .auto_trader import load_auto_trade_config, load_trade_history, load_trade_state
+from .binance_client import trading_credentials_source
+from .futures_account import compute_bot_stats, fetch_futures_account_snapshot
+from .scan_cache import load_scan_history, load_scan_result, report_from_cache
+from .scanner_panel import render_scanner_dashboard
 from .trade_gate import GateMode, TradeGateConfig, evaluate_trade_gate
 
 
@@ -334,126 +335,22 @@ def _simple_symbol_snapshot(
     }
 
 
-def _send_telegram(text: str) -> bool:
-    """Send message via Telegram Bot API. Returns True if sent, False if skipped/failed."""
-    load_dotenv(override=False)
-    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-    chat_id = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
-    if not token or not chat_id:
-        print("[Forecast] Telegram skipped: set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env")
-        return False
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    try:
-        r = requests.post(
-            url,
-            json={"chat_id": str(chat_id), "text": text, "disable_web_page_preview": True},
-            timeout=10,
-        )
-        if r.status_code == 200:
-            print("[Forecast] Telegram sent successfully")
-            return True
-        print(f"[Forecast] Telegram failed: {r.status_code} {r.text[:200]}")
-        return False
-    except Exception as e:
-        print(f"[Forecast] Telegram error: {e}")
-        return False
-
-
-def _tick_forecast_and_telegram() -> None:
-    """Run forecasts for all symbols and send Telegram alert if any forecast >= 85%."""
-    config_path = CONFIGS_DIR / "config.yaml"
-    if not config_path.exists():
-        print(f"[Forecast] Config not found: {config_path}")
-        return
-    try:
-        cfg = load_config(str(config_path))
-        symbols = [
-            cfg.symbol,
-            "ETH/USDT",
-            "SOL/USDT",
-            "BNB/USDT",
-            "XRP/USDT",
-            "PEPE/USDT",
-            "DOGE/USDT",
-            "LINK/USDT",
-        ]
-        seen = set()
-        unique_symbols = [s for s in symbols if s not in seen and not seen.add(s)]
-
-        for symbol in unique_symbols:
-            try:
-                snap = _simple_symbol_snapshot(
-                    symbol,
-                    cfg.timeframe,
-                    cfg.limit,
-                    cfg.use_futures,
-                    cfg.similarity,
-                    cfg.backtest,
-                    trade_gate=cfg.trade_gate,
-                )
-            except Exception as e:
-                print(f"[Forecast] Snapshot failed for {symbol}: {e}")
-                continue
-            alerts = []
-            if snap["prob_up_10m"] >= 0.85:
-                alerts.append(f"10m ↑ {snap['prob_up_10m']*100:.0f}%")
-            if snap["prob_down_10m"] >= 0.85:
-                alerts.append(f"10m ↓ {snap['prob_down_10m']*100:.0f}%")
-            if snap["prob_up_1h"] >= 0.85:
-                alerts.append(f"1h ↑ {snap['prob_up_1h']*100:.0f}%")
-            if snap["prob_down_1h"] >= 0.85:
-                alerts.append(f"1h ↓ {snap['prob_down_1h']*100:.0f}%")
-            if snap["prob_up_6"] >= 0.85:
-                alerts.append(f"6h ↑ {snap['prob_up_6']*100:.0f}%")
-            if snap["prob_down_6"] >= 0.85:
-                alerts.append(f"6h ↓ {snap['prob_down_6']*100:.0f}%")
-            if alerts:
-                msg = f"Forecast signal {symbol}\n" + "\n".join(alerts) + f"\nPrice: {snap['last_price']:.2f}"
-                _send_telegram(msg)
-    except Exception as e:
-        print(f"[Forecast] Tick error: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-_scheduler = BackgroundScheduler()
-_scheduler.add_job(_tick_forecast_and_telegram, "interval", minutes=15, id="forecast_telegram")
-
-
 @app.on_event("startup")
-def _start_scheduler() -> None:
-    from datetime import datetime, timedelta
-
-    _scheduler.start()
-    # First run 30s after startup so server is ready
-    _scheduler.add_job(
-        _tick_forecast_and_telegram,
-        "date",
-        run_date=datetime.utcnow() + timedelta(seconds=30),
-        id="forecast_telegram_first",
-    )
-
-    # Start Binance Futures orderbook streams in the background
+def _on_startup() -> None:
     loop = asyncio.get_event_loop()
     symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "PEPEUSDT", "DOGEUSDT", "LINKUSDT"]
     loop.create_task(start_orderbook_stream(symbols))
 
 
-@app.on_event("shutdown")
-def _stop_scheduler() -> None:
-    _scheduler.shutdown(wait=False)
+@app.get("/")
+def index_redirect():
+    """Main dashboard: scanner + auto-trader."""
+    return RedirectResponse(url="/scanner", status_code=302)
 
 
-@app.get("/trigger-telegram-check")
-def trigger_telegram_check() -> str:
-    """Run forecast + Telegram check once (for testing). Check console for logs."""
-    _tick_forecast_and_telegram()
-    return "Done. Check server console for '[Forecast]' messages and Telegram."
-
-
-@app.get("/", response_class=HTMLResponse)
-def index() -> str:
-    """Simple browser screen with current forecast and backtest summary."""
+@app.get("/legacy", response_class=HTMLResponse)
+def index_legacy() -> str:
+    """Legacy browser screen with current forecast and backtest summary."""
     config_path = "configs/config.yaml"
     cfg = load_config(config_path)
 
@@ -1265,6 +1162,48 @@ def _scanner_report(
     return rep, None, False
 
 
+def _auto_trade_yaml() -> dict:
+    import yaml as _yaml
+
+    with open(CONFIGS_DIR / "config.yaml", encoding="utf-8") as f:
+        return (_yaml.safe_load(f) or {}).get("auto_trade") or {}
+
+
+@app.get("/futures/account")
+def futures_account_json(force: bool = False) -> dict:
+    """Futures USDT balance, positions, bot stats (cached ~50s)."""
+    trade_hist = load_trade_history(40)
+    scan_hist = load_scan_history(30)
+    return {
+        "account": fetch_futures_account_snapshot(force=force),
+        "bot_stats": compute_bot_stats(trade_hist, scan_hist),
+    }
+
+
+@app.get("/trader/status")
+def trader_status() -> dict:
+    """Auto-trader config and last state (no secrets)."""
+    at = load_auto_trade_config(_auto_trade_yaml())
+    return {
+        "config": {
+            "enabled": at.enabled,
+            "dry_run": at.dry_run,
+            "min_score": at.min_score,
+            "max_notional_usdt": at.max_notional_usdt,
+            "cooldown_minutes": at.cooldown_minutes,
+            "leverage": at.leverage,
+            "margin_mode": at.margin_mode,
+            "market": "futures",
+            "api_credentials": trading_credentials_source(),
+        },
+        "state": load_trade_state(),
+        "trade_history": load_trade_history(40),
+        "scan_history": load_scan_history(30),
+        "futures_account": fetch_futures_account_snapshot(),
+        "bot_stats": compute_bot_stats(load_trade_history(40), load_scan_history(30)),
+    }
+
+
 @app.get("/scanner/json")
 def scanner_json(
     top: int = 5,
@@ -1286,19 +1225,44 @@ def scanner_json(
     if updated_at:
         rep["updated_at"] = updated_at
     rep["from_cache"] = from_cache
+    cached_full = load_scan_result()
+    at = load_auto_trade_config(_auto_trade_yaml())
+    rep["trader"] = {
+        "config": {
+            "enabled": at.enabled,
+            "dry_run": at.dry_run,
+            "min_score": at.min_score,
+            "min_probability_pct": at.min_probability_pct,
+            "min_risk_reward": at.min_risk_reward,
+            "risk_pct_of_balance": at.risk_pct_of_balance,
+            "max_notional_usdt": at.max_notional_usdt,
+            "leverage": at.leverage,
+            "margin_mode": at.margin_mode,
+            "cooldown_minutes": at.cooldown_minutes,
+            "market": "futures",
+            "api_credentials": trading_credentials_source(),
+        },
+        "state": load_trade_state(),
+    }
+    rep["scan_history"] = load_scan_history(30)
+    rep["trade_history"] = load_trade_history(40)
+    rep["futures_account"] = fetch_futures_account_snapshot()
+    rep["bot_stats"] = compute_bot_stats(rep["trade_history"], rep["scan_history"])
+    if cached_full:
+        rep["scan_config"] = cached_full.get("scan_config") or {}
     return rep
 
 
 @app.get("/scanner", response_class=HTMLResponse)
 def scanner_panel(
-    top: int = 5,
+    top: int = 10,
     bars: int = 320,
     timeframe: str = "1h",
     stage1_min_score: float = 20.0,
     max_symbols: int | None = 60,
     live: bool = False,
 ) -> str:
-    """Web panel for top setups from the new 4-stage pipeline."""
+    """Dashboard: scanner setups, futures auto-trader, history."""
     rep, updated_at, from_cache = _scanner_report(
         top=top,
         bars=bars,
@@ -1307,151 +1271,26 @@ def scanner_panel(
         max_symbols=max_symbols,
         live=live,
     )
-    updated_line = (
-        f"Last scan (UTC): {html.escape(updated_at)} | source: {'cache' if from_cache else 'live'}"
-        if updated_at
-        else "No cached scan yet — wait for timer or open with ?live=1"
+    cached = load_scan_result() or {}
+    at = load_auto_trade_config(_auto_trade_yaml())
+    trade_hist = load_trade_history(30)
+    scan_hist = load_scan_history(25)
+    return render_scanner_dashboard(
+        report=rep,
+        updated_at=updated_at,
+        from_cache=from_cache,
+        scan_config=cached.get("scan_config") or {},
+        at=at,
+        trade_state=load_trade_state(),
+        scan_history=scan_hist,
+        trade_history=trade_hist,
+        account=fetch_futures_account_snapshot(),
+        bot_stats=compute_bot_stats(trade_hist, scan_hist),
+        top=top,
+        bars=bars,
+        timeframe=timeframe,
+        stage1_min_score=stage1_min_score,
+        max_symbols=max_symbols,
+        live=live,
     )
-
-    rows = []
-    for i, s in enumerate(rep.get("top_setups", []), start=1):
-        setup = s.get("setup", {})
-        rows.append(
-            f"""
-            <tr>
-                <td>{i}</td>
-                <td><strong>{html.escape(str(s.get("symbol", "")))}</strong></td>
-                <td>{html.escape(str(s.get("pattern", "")))}</td>
-                <td>{html.escape(str(s.get("trend", "")))}</td>
-                <td>{float(s.get("score", 0.0)):.1f}</td>
-                <td>{html.escape(str(setup.get("direction", "")))}</td>
-                <td>{float(setup.get("probability_pct", 0.0)):.1f}%</td>
-                <td>{float(setup.get("entry", float("nan"))):.6g}</td>
-                <td>{float(setup.get("stop", float("nan"))):.6g}</td>
-                <td>{float(setup.get("target_1", float("nan"))):.6g}</td>
-                <td>{float(setup.get("target_2", float("nan"))):.6g}</td>
-                <td>{float(setup.get("risk_reward", 0.0)):.2f}</td>
-                <td>{html.escape(str(s.get("why_selected", "")))}</td>
-            </tr>
-            """
-        )
-
-    table_rows = "\n".join(rows) if rows else "<tr><td colspan='13'>No setups found for this filter.</td></tr>"
-    max_symbols_q = "" if max_symbols is None else str(max_symbols)
-    json_url = (
-        f"/scanner/json?top={int(top)}&bars={int(bars)}&timeframe={html.escape(timeframe)}"
-        f"&stage1_min_score={float(stage1_min_score)}"
-        f"&max_symbols={html.escape(max_symbols_q)}"
-    )
-
-    return f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <meta http-equiv="refresh" content="900" />
-        <title>Forecast Scanner Panel</title>
-        <style>
-            body {{
-                margin: 0;
-                background: #0b0f1a;
-                color: #e7ecff;
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-            }}
-            .wrap {{
-                max-width: 1400px;
-                margin: 24px auto;
-                padding: 0 16px 24px;
-            }}
-            h1 {{
-                margin: 0 0 10px;
-                font-size: 28px;
-            }}
-            .meta {{
-                color: #9aa4c6;
-                margin-bottom: 14px;
-                font-size: 14px;
-            }}
-            .actions {{
-                margin-bottom: 16px;
-                display: flex;
-                gap: 10px;
-                flex-wrap: wrap;
-            }}
-            .btn {{
-                border: 1px solid #2a3350;
-                background: #141b2d;
-                color: #e7ecff;
-                padding: 8px 12px;
-                border-radius: 8px;
-                text-decoration: none;
-                font-size: 13px;
-            }}
-            table {{
-                width: 100%;
-                border-collapse: collapse;
-                background: #10172a;
-                border: 1px solid #1d2740;
-            }}
-            th, td {{
-                border-bottom: 1px solid #1d2740;
-                padding: 8px 10px;
-                font-size: 12px;
-                text-align: left;
-                vertical-align: top;
-            }}
-            th {{
-                background: #161f36;
-                position: sticky;
-                top: 0;
-                z-index: 1;
-            }}
-            tr:hover td {{
-                background: #131d33;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="wrap">
-            <h1>Top Binance Setups</h1>
-            <div class="meta">
-                {html.escape(updated_line)}<br />
-                Universe: {int(rep.get("universe_size", 0))} pairs |
-                Candidates: {int(rep.get("candidates_found", 0))} |
-                Timeframe: {html.escape(timeframe)} |
-                Bars: {int(bars)} |
-                Stage1 min score: {float(stage1_min_score):.1f}
-            </div>
-            <div class="actions">
-                <a class="btn" href="/scanner?top={int(top)}&bars={int(bars)}&timeframe={html.escape(timeframe)}&stage1_min_score={float(stage1_min_score)}&max_symbols={html.escape(max_symbols_q)}">Refresh</a>
-                <a class="btn" href="{json_url}" target="_blank">Open JSON</a>
-                <a class="btn" href="/multi" target="_blank">Legacy Multi Dashboard</a>
-            </div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>#</th>
-                        <th>Symbol</th>
-                        <th>Pattern</th>
-                        <th>Trend</th>
-                        <th>Score</th>
-                        <th>Direction</th>
-                        <th>Prob</th>
-                        <th>Entry</th>
-                        <th>Stop</th>
-                        <th>TP1</th>
-                        <th>TP2</th>
-                        <th>R:R</th>
-                        <th>Why selected</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {table_rows}
-                </tbody>
-            </table>
-        </div>
-    </body>
-    </html>
-    """
 
