@@ -13,7 +13,7 @@ from typing import Any
 from dotenv import load_dotenv
 
 from .binance_client import create_trading_client
-from .paths import PROCESSED_DATA_DIR, ensure_directories
+from .paths import PROCESSED_DATA_DIR, ensure_directories, load_project_env
 from .scan_cache import DEFAULT_CACHE_PATH, load_scan_result
 
 STATE_PATH = PROCESSED_DATA_DIR / "auto_trade_state.json"
@@ -33,6 +33,7 @@ class AutoTradeConfig:
     leverage: int = 5
     margin_mode: str = "isolated"
     use_target_2: bool = True
+    pick_from_top_n: int = 4
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -53,6 +54,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def load_auto_trade_config(yaml_cfg: dict[str, Any] | None = None) -> AutoTradeConfig:
+    load_project_env(force=True)
     y = yaml_cfg or {}
     max_n = float(y.get("max_notional_usdt", y.get("max_quote_usdt", 50.0)))
     base = AutoTradeConfig(
@@ -67,6 +69,7 @@ def load_auto_trade_config(yaml_cfg: dict[str, Any] | None = None) -> AutoTradeC
         leverage=int(y.get("leverage", 5)),
         margin_mode=str(y.get("margin_mode", "isolated")).lower(),
         use_target_2=bool(y.get("use_target_2", True)),
+        pick_from_top_n=int(y.get("pick_from_top_n", 4)),
     )
     env_map = {
         "AUTO_TRADE_ENABLED": ("enabled", _env_bool),
@@ -79,6 +82,7 @@ def load_auto_trade_config(yaml_cfg: dict[str, Any] | None = None) -> AutoTradeC
         "AUTO_TRADE_MAX_QUOTE_USDT": ("max_notional_usdt", _env_float),
         "AUTO_TRADE_COOLDOWN_MINUTES": ("cooldown_minutes", _env_int),
         "AUTO_TRADE_LEVERAGE": ("leverage", _env_int),
+        "AUTO_TRADE_TOP_N": ("pick_from_top_n", _env_int),
     }
     for env_name, (attr, fn) in env_map.items():
         if os.environ.get(env_name, "").strip():
@@ -141,8 +145,36 @@ def _cooldown_active(state: dict[str, Any], cfg: AutoTradeConfig) -> bool:
 
 
 def pick_best_setup(report: dict[str, Any]) -> dict[str, Any] | None:
+    """Top-1 for display; auto-trade uses pick_trade_candidate."""
     setups = report.get("top_setups") or []
     return setups[0] if setups else None
+
+
+def pick_trade_candidate(
+    report: dict[str, Any],
+    cfg: AutoTradeConfig,
+) -> tuple[dict[str, Any] | None, str]:
+    """
+    First setup in top-N that passes trade filters (not only rank #1).
+    Entry is always market price on the exchange; stop/TP from the plan.
+    """
+    n = max(1, int(cfg.pick_from_top_n))
+    setups = list(report.get("top_setups") or [])[:n]
+    if not setups:
+        return None, "NO_SETUP"
+    last_reason = "NO_SETUP"
+    for rank, cand in enumerate(setups, start=1):
+        ok, reason = validate_setup(cand, cfg)
+        if ok:
+            out = dict(cand)
+            out["_trade_rank"] = rank
+            return out, "OK"
+        last_reason = f"#{rank}:{reason}"
+        print(
+            f"[auto_trade] skip rank {rank} {cand.get('symbol')} score={cand.get('score')} ({reason})",
+            flush=True,
+        )
+    return None, f"NO_QUALIFIED_IN_TOP{n} (last {last_reason})"
 
 
 def _normalize_side(direction: str) -> str:
@@ -387,6 +419,7 @@ def maybe_run_auto_trade(
                 "side": res.get("side"),
                 "dry_run": cfg.dry_run,
                 "notional_usdt": res.get("notional_usdt"),
+                "rank": res.get("trade_rank"),
             },
         )
         save_trade_state(state)
@@ -396,19 +429,14 @@ def maybe_run_auto_trade(
         cached = load_scan_result()
         report = (cached or {}).get("report") or {}
 
-    candidate = pick_best_setup(report)
+    candidate, pick_reason = pick_trade_candidate(report, cfg)
     if not candidate:
-        result = {"action": "skipped", "reason": "NO_SETUP"}
+        result = {"action": "skipped", "reason": pick_reason}
         print(f"[auto_trade] {result['reason']}", flush=True)
         return _finish(result)
 
-    ok, reason = validate_setup(candidate, cfg)
-    if not ok:
-        result = {"action": "skipped", "reason": reason, "symbol": candidate.get("symbol")}
-        print(f"[auto_trade] {result}", flush=True)
-        return _finish(result)
-
     symbol = str(candidate["symbol"])
+    trade_rank = int(candidate.get("_trade_rank", 1))
     setup = candidate["setup"]
     side = _normalize_side(str(setup.get("direction", "")))
 
@@ -445,7 +473,8 @@ def maybe_run_auto_trade(
 
     print(
         f"[auto_trade] {'DRY_RUN' if cfg.dry_run else 'LIVE'} FUTURES {side.upper()} {symbol} "
-        f"score={candidate.get('score')} notional≈{notional:.2f} USDT lev={cfg.leverage}x",
+        f"rank={trade_rank}/{cfg.pick_from_top_n} score={candidate.get('score')} "
+        f"market entry notional≈{notional:.2f} USDT lev={cfg.leverage}x",
         flush=True,
     )
     exec_result = execute_futures_trade(
@@ -491,6 +520,8 @@ def maybe_run_auto_trade(
         "action": "dry_run" if cfg.dry_run else "executed",
         "symbol": symbol,
         "side": side,
+        "trade_rank": trade_rank,
+        "pick_from_top_n": cfg.pick_from_top_n,
         **exec_result,
     }
     print(f"[auto_trade] done {result.get('action')} {side} {symbol}", flush=True)

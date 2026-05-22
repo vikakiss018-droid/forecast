@@ -21,7 +21,7 @@ import yaml
 from .auto_trader import maybe_run_auto_trade
 from .main import load_config
 from .market_scanner import ScanConfig, scan_market_top_setups
-from .paths import CONFIGS_DIR
+from .paths import CONFIGS_DIR, load_project_env
 from .scan_cache import save_scan_result
 
 
@@ -40,6 +40,7 @@ def _env_max_symbols() -> int | None:
 
 
 def main() -> int:
+    load_project_env(force=True)
     config_path = os.environ.get("FORECAST_CONFIG", "configs/config.yaml")
     cfg = load_config(config_path)
 

@@ -7,11 +7,11 @@ from dataclasses import replace
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from .main import load_config, run_pipeline
-from .paths import CONFIGS_DIR
+from .paths import CONFIGS_DIR, load_project_env
 from .data_loader import download_ohlcv_to_csv, load_ohlcv_from_csv
 from .indicators import add_basic_indicators
 from .features import SIMILARITY_FEATURE_COLS, add_basic_features
@@ -33,9 +33,13 @@ from .auto_trader import load_auto_trade_config, load_trade_history, load_trade_
 from .binance_client import trading_credentials_source
 from .futures_account import compute_bot_stats, fetch_futures_account_snapshot
 from .scan_cache import load_scan_history, load_scan_result, report_from_cache
+from .env_config import SETTINGS_META, update_env_values
+from .panel_auth import PANEL_AUTH_DEPS
 from .scanner_panel import render_scanner_dashboard
 from .trade_gate import GateMode, TradeGateConfig, evaluate_trade_gate
 
+
+load_project_env()
 
 app = FastAPI(title="Forecast App")
 
@@ -342,7 +346,7 @@ def _on_startup() -> None:
     loop.create_task(start_orderbook_stream(symbols))
 
 
-@app.get("/")
+@app.get("/", dependencies=PANEL_AUTH_DEPS)
 def index_redirect():
     """Main dashboard: scanner + auto-trader."""
     return RedirectResponse(url="/scanner", status_code=302)
@@ -1169,7 +1173,7 @@ def _auto_trade_yaml() -> dict:
         return (_yaml.safe_load(f) or {}).get("auto_trade") or {}
 
 
-@app.get("/futures/account")
+@app.get("/futures/account", dependencies=PANEL_AUTH_DEPS)
 def futures_account_json(force: bool = False) -> dict:
     """Futures USDT balance, positions, bot stats (cached ~50s)."""
     trade_hist = load_trade_history(40)
@@ -1180,7 +1184,7 @@ def futures_account_json(force: bool = False) -> dict:
     }
 
 
-@app.get("/trader/status")
+@app.get("/trader/status", dependencies=PANEL_AUTH_DEPS)
 def trader_status() -> dict:
     """Auto-trader config and last state (no secrets)."""
     at = load_auto_trade_config(_auto_trade_yaml())
@@ -1195,6 +1199,7 @@ def trader_status() -> dict:
             "margin_mode": at.margin_mode,
             "market": "futures",
             "api_credentials": trading_credentials_source(),
+            "pick_from_top_n": at.pick_from_top_n,
         },
         "state": load_trade_state(),
         "trade_history": load_trade_history(40),
@@ -1204,7 +1209,7 @@ def trader_status() -> dict:
     }
 
 
-@app.get("/scanner/json")
+@app.get("/scanner/json", dependencies=PANEL_AUTH_DEPS)
 def scanner_json(
     top: int = 5,
     bars: int = 320,
@@ -1241,6 +1246,7 @@ def scanner_json(
             "cooldown_minutes": at.cooldown_minutes,
             "market": "futures",
             "api_credentials": trading_credentials_source(),
+            "pick_from_top_n": at.pick_from_top_n,
         },
         "state": load_trade_state(),
     }
@@ -1253,7 +1259,31 @@ def scanner_json(
     return rep
 
 
-@app.get("/scanner", response_class=HTMLResponse)
+@app.post("/scanner/settings", dependencies=PANEL_AUTH_DEPS)
+async def save_scanner_settings(request: Request) -> RedirectResponse:
+    """Save dashboard form fields to /opt/forecast/.env."""
+    form = await request.form()
+    updates: dict[str, str] = {}
+    for meta in SETTINGS_META:
+        key = meta["key"]
+        if meta.get("type") == "bool":
+            raw_list = form.getlist(key) if hasattr(form, "getlist") else []
+            if not raw_list and key in form:
+                raw_list = [form[key]]
+            updates[key] = "true" if any(str(v).lower() == "true" for v in raw_list) else "false"
+        elif key in form:
+            updates[key] = str(form[key])
+    try:
+        update_env_values(updates)
+        msg = "saved=1"
+    except OSError as e:
+        msg = f"error={html.escape(str(e))}"
+    return_q = str(form.get("return_q", "")).strip()
+    sep = "&" if return_q else ""
+    return RedirectResponse(url=f"/scanner?{return_q}{sep}{msg}", status_code=303)
+
+
+@app.get("/scanner", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
 def scanner_panel(
     top: int = 10,
     bars: int = 320,
@@ -1261,6 +1291,8 @@ def scanner_panel(
     stage1_min_score: float = 20.0,
     max_symbols: int | None = 60,
     live: bool = False,
+    saved: str | None = None,
+    error: str | None = None,
 ) -> str:
     """Dashboard: scanner setups, futures auto-trader, history."""
     rep, updated_at, from_cache = _scanner_report(
@@ -1275,6 +1307,11 @@ def scanner_panel(
     at = load_auto_trade_config(_auto_trade_yaml())
     trade_hist = load_trade_history(30)
     scan_hist = load_scan_history(25)
+    saved_msg = None
+    if saved == "1":
+        saved_msg = "Настройки сохранены в .env"
+    elif error:
+        saved_msg = f"Ошибка сохранения: {error}"
     return render_scanner_dashboard(
         report=rep,
         updated_at=updated_at,
@@ -1292,5 +1329,6 @@ def scanner_panel(
         stage1_min_score=stage1_min_score,
         max_symbols=max_symbols,
         live=live,
+        saved_msg=saved_msg,
     )
 

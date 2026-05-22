@@ -10,6 +10,7 @@ Group=forecast
 WorkingDirectory=/opt/forecast
 Environment=PYTHONUNBUFFERED=1
 Environment=PATH=/opt/forecast/.venv/bin:/usr/bin
+EnvironmentFile=-/opt/forecast/.env
 EnvironmentFile=-/opt/forecast/deploy/ubuntu/forecast.env
 ExecStart=/opt/forecast/.venv/bin/python -m forecast.run_scheduled_scan
 StandardOutput=journal

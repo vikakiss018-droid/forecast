@@ -8,6 +8,7 @@ from typing import Any
 
 from .auto_trader import AutoTradeConfig, load_trade_history, load_trade_state
 from .binance_client import trading_credentials_source
+from .env_config import SETTINGS_META, get_settings_for_panel
 
 
 def _e(s: Any) -> str:
@@ -60,7 +61,7 @@ def _action_badge(action: str) -> str:
     return _badge(action or "—", "muted")
 
 
-def _hero_setup(setup_row: dict[str, Any] | None) -> str:
+def _hero_setup(setup_row: dict[str, Any] | None, *, pick_from_top_n: int = 4) -> str:
     if not setup_row:
         return '<div class="hero empty">Нет сетапов в последнем скане</div>'
     plan = setup_row.get("setup") or {}
@@ -84,7 +85,7 @@ def _hero_setup(setup_row: dict[str, Any] | None) -> str:
         <div><label>TP2</label><div class="mono tp">{_fmt_num(plan.get('target_2'))}</div></div>
       </div>
       <p class="hero-why">{_e(setup_row.get('why_selected'))}</p>
-      <p class="hero-note">Автоторговля откроет <strong>Futures {direction.upper()}</strong> по этой паре, если фильтры пройдены.</p>
+      <p class="hero-note">Автоторговля: <strong>market</strong> вход, перебор <strong>топ-{int(pick_from_top_n)}</strong> (не только №1). №1 на экране — лучший score.</p>
     </div>
     """
 
@@ -176,6 +177,7 @@ def _trader_config_cards(at: AutoTradeConfig) -> str:
         ("Плечо", f"{at.leverage}x"),
         ("Маржа", _e(at.margin_mode)),
         ("Cooldown", f"{at.cooldown_minutes} мин"),
+        ("Выбор пары", f"Топ-{int(at.pick_from_top_n)} (первая под фильтры)"),
     ]
     return "".join(
         f'<div class="cfg-card"><span>{_e(k)}</span><strong>{_e(v)}</strong></div>' for k, v in items
@@ -289,6 +291,54 @@ def _bot_stats_section(stats: dict[str, Any]) -> str:
     </section>"""
 
 
+def _settings_form_html(*, return_q: str, saved_msg: str | None = None) -> str:
+    rows = get_settings_for_panel()
+    trade_fields: list[str] = []
+    scan_fields: list[str] = []
+    for row in rows:
+        key = row["key"]
+        label = _e(row["label"])
+        val = _e(row.get("value", ""))
+        t = row.get("type", "str")
+        if t == "bool":
+            checked = "checked" if val.lower() in ("true", "1", "yes", "on") else ""
+            field = f"""
+            <label class="field bool-field">
+              <input type="hidden" name="{key}" value="false" />
+              <input type="checkbox" name="{key}" value="true" {checked} />
+              <span>{label}</span>
+            </label>"""
+        else:
+            field = f"""
+            <label class="field">
+              <span>{label}</span>
+              <input type="text" name="{key}" value="{val}" />
+            </label>"""
+        if row.get("group") == "scan":
+            scan_fields.append(field)
+        else:
+            trade_fields.append(field)
+
+    banner = ""
+    if saved_msg:
+        banner = f'<div class="save-banner ok">{_e(saved_msg)}</div>'
+
+    return f"""
+    <section class="settings-section">
+      <h2>Настройки (.env)</h2>
+      <p class="settings-hint">Ключи Binance и пароль панели (PANEL_AUTH_*) — только в .env на сервере, не здесь. После сохранения настройки применяются сразу.</p>
+      {banner}
+      <form method="post" action="/scanner/settings" class="settings-form">
+        <input type="hidden" name="return_q" value="{_e(return_q)}" />
+        <h3 class="form-group-title">Автоторговля</h3>
+        <div class="field-grid">{"".join(trade_fields)}</div>
+        <h3 class="form-group-title">Сканер (таймер)</h3>
+        <div class="field-grid">{"".join(scan_fields)}</div>
+        <button type="submit" class="btn btn-primary btn-save">Сохранить в .env</button>
+      </form>
+    </section>"""
+
+
 def _open_position_card(state: dict[str, Any]) -> str:
     op = state.get("open")
     if not op:
@@ -332,6 +382,7 @@ def render_scanner_dashboard(
     stage1_min_score: float,
     max_symbols: int | None,
     live: bool,
+    saved_msg: str | None = None,
 ) -> str:
     setups = report.get("top_setups") or []
     hero = setups[0] if setups else None
@@ -505,6 +556,22 @@ def render_scanner_dashboard(
     .trend-down {{ color: var(--short); }}
     .trend-range {{ color: var(--warn); }}
     .empty-cell {{ text-align: center; color: var(--muted); padding: 24px !important; }}
+    .settings-section .settings-hint {{ color: var(--muted); font-size: 0.85rem; margin: 0 0 14px; }}
+    .save-banner {{ padding: 10px 14px; border-radius: 10px; margin-bottom: 14px; font-size: 0.9rem; }}
+    .save-banner.ok {{ background: rgba(34,211,168,.12); border: 1px solid rgba(34,211,168,.35); color: var(--accent2); }}
+    .settings-form .form-group-title {{ margin: 16px 0 10px; font-size: 0.9rem; color: var(--muted); }}
+    .field-grid {{
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px;
+    }}
+    .field {{ display: flex; flex-direction: column; gap: 6px; }}
+    .field span {{ font-size: 0.75rem; color: var(--muted); }}
+    .field input[type="text"] {{
+      background: var(--surface2); border: 1px solid var(--border); border-radius: 8px;
+      color: var(--text); padding: 8px 10px; font-size: 0.88rem;
+    }}
+    .bool-field {{ flex-direction: row; align-items: center; gap: 8px; }}
+    .bool-field input {{ width: auto; }}
+    .btn-save {{ margin-top: 16px; cursor: pointer; border: none; }}
     footer {{ text-align: center; color: var(--muted); font-size: 0.78rem; margin-top: 24px; }}
   </style>
 </head>
@@ -541,12 +608,13 @@ def render_scanner_dashboard(
     </div>
 
     {_balance_section(account)}
+    {_settings_form_html(return_q=base_q, saved_msg=saved_msg)}
     {_bot_stats_section(bot_stats)}
     {_exchange_positions_table(account)}
 
     <section>
       <h2>Лучший сетап (№1)</h2>
-      {_hero_setup(hero)}
+      {_hero_setup(hero, pick_from_top_n=int(at.pick_from_top_n))}
     </section>
 
     <div class="two-col">

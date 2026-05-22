@@ -70,7 +70,20 @@ sudo journalctl -u forecast-scan -f
 sudo systemctl list-timers | grep forecast
 ```
 
-Панель в браузере: `http://IP-СЕРВЕРА:8000/scanner`  
+Панель в браузере: `http://IP-СЕРВЕРА:8000/scanner`
+
+### Пароль на панель
+
+В `/opt/forecast/.env`:
+
+```bash
+PANEL_AUTH_USER=admin
+PANEL_AUTH_PASSWORD=ваш_длинный_пароль
+chown forecast:forecast /opt/forecast/.env
+sudo systemctl restart forecast-api
+```
+
+Браузер запросит логин/пароль при открытии `/scanner`. Без `PANEL_AUTH_PASSWORD` панель остаётся открытой (не рекомендуется).  
 Принудительный живой скан (тяжёлый): `?live=1`
 
 ## 6. Файрвол (опционально)

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import ccxt
 from ccxt.base.errors import AuthenticationError
-from dotenv import load_dotenv
+from .paths import load_project_env
 
 
 @dataclass
@@ -17,7 +17,7 @@ class BinanceConfig:
 
 
 def _load_env() -> None:
-    load_dotenv(override=False)
+    load_project_env()
 
 
 def _resolve_api_credentials(*, for_trading: bool) -> tuple[str | None, str | None]:

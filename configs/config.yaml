@@ -80,3 +80,4 @@ auto_trade:
   leverage: 5
   margin_mode: isolated
   use_target_2: true
+  pick_from_top_n: 4
