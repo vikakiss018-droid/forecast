@@ -178,6 +178,8 @@ def _trader_config_cards(at: AutoTradeConfig) -> str:
         ("Маржа", _e(at.margin_mode)),
         ("Cooldown", f"{at.cooldown_minutes} мин"),
         ("Выбор пары", f"Топ-{int(at.pick_from_top_n)} (первая под фильтры)"),
+        ("Макс. позиций", str(int(at.max_open_positions))),
+        ("Закрытие при +%", f"{_fmt_num(at.profit_close_pct, 1)}% от notional"),
     ]
     return "".join(
         f'<div class="cfg-card"><span>{_e(k)}</span><strong>{_e(v)}</strong></div>' for k, v in items
@@ -339,28 +341,60 @@ def _settings_form_html(*, return_q: str, saved_msg: str | None = None) -> str:
     </section>"""
 
 
-def _open_position_card(state: dict[str, Any]) -> str:
-    op = state.get("open")
-    if not op:
-        return """
+def _open_positions_section(state: dict[str, Any], at: AutoTradeConfig, *, return_q: str) -> str:
+    positions = list(state.get("open_positions") or [])
+    max_n = int(at.max_open_positions)
+    if not positions:
+        return f"""
         <div class="pos-card pos-empty">
-          <h3>Открытая позиция</h3>
-          <p>Нет активной позиции в state</p>
+          <h3>Открытые позиции (0/{max_n})</h3>
+          <p>Нет активных позиций в state</p>
         </div>"""
+
+    cards: list[str] = []
+    for op in positions:
+        fsym = str(op.get("futures_symbol") or "")
+        upnl = float(op.get("unrealized_pnl") or 0.0)
+        target = float(op.get("profit_target_usdt") or 0.0)
+        dry = bool(op.get("dry_run"))
+        close_html = ""
+        if fsym and not dry and not at.dry_run:
+            sym_label = _e(op.get("symbol") or fsym)
+            close_html = f"""
+        <form method="post" action="/trader/close" class="pos-close-form" onsubmit="return confirm('Закрыть {sym_label} по рынку?');">
+          <input type="hidden" name="futures_symbol" value="{_e(fsym)}" />
+          <input type="hidden" name="return_q" value="{_e(return_q)}" />
+          <button type="submit" class="btn btn-close">Закрыть</button>
+        </form>"""
+        elif dry or at.dry_run:
+            close_html = '<span class="muted">Dry-run — закрытие недоступно</span>'
+
+        cards.append(
+            f"""
+      <div class="pos-card pos-open">
+        <div class="pos-head">
+          <h3>{_e(op.get('symbol'))}</h3>
+          {_direction_badge(str(op.get('side', '')))}
+          {close_html}
+        </div>
+        <div class="pos-grid">
+          <div><label>Futures</label><strong class="mono">{_e(fsym)}</strong></div>
+          <div><label>Открыта</label><span class="mono">{_fmt_ts(op.get('opened_at'))}</span></div>
+          <div><label>Notional</label><span>{_fmt_num(op.get('notional_usdt'), 1)} USDT</span></div>
+          <div><label>Плечо</label><span>{_e(op.get('leverage'))}x</span></div>
+          <div><label>uPnL</label><span class="{_pnl_class(upnl)}">{_fmt_num(upnl, 2)}</span></div>
+          <div><label>Цель +{at.profit_close_pct:.0f}%</label><span class="tp">{_fmt_num(target, 2)} USDT</span></div>
+          <div><label>Вход</label><span class="mono">{_fmt_num(op.get('entry_price') or op.get('entry'))}</span></div>
+          <div><label>Стоп</label><span class="mono stop">{_fmt_num(op.get('stop'))}</span></div>
+          <div><label>Тейк</label><span class="mono tp">{_fmt_num(op.get('take_profit'))}</span></div>
+        </div>
+      </div>"""
+        )
+
     return f"""
-    <div class="pos-card pos-open">
-      <h3>Открытая позиция</h3>
-      <div class="pos-grid">
-        <div><label>Пара</label><strong>{_e(op.get('symbol'))}</strong></div>
-        <div><label>Futures</label><strong class="mono">{_e(op.get('futures_symbol'))}</strong></div>
-        <div><label>Сторона</label>{_direction_badge(str(op.get('side', '')))}</div>
-        <div><label>Открыта</label><span class="mono">{_fmt_ts(op.get('opened_at'))}</span></div>
-        <div><label>Notional</label><span>{_fmt_num(op.get('notional_usdt'), 1)} USDT</span></div>
-        <div><label>Плечо</label><span>{_e(op.get('leverage'))}x</span></div>
-        <div><label>Вход</label><span class="mono">{_fmt_num(op.get('entry'))}</span></div>
-        <div><label>Стоп</label><span class="mono stop">{_fmt_num(op.get('stop'))}</span></div>
-        <div><label>Тейк</label><span class="mono tp">{_fmt_num(op.get('take_profit'))}</span></div>
-      </div>
+    <div class="pos-stack">
+      <p class="pos-summary">Открыто <strong>{len(positions)}/{max_n}</strong> — новые сделки не откроются при лимите</p>
+      {"".join(cards)}
     </div>"""
 
 
@@ -572,6 +606,18 @@ def render_scanner_dashboard(
     .bool-field {{ flex-direction: row; align-items: center; gap: 8px; }}
     .bool-field input {{ width: auto; }}
     .btn-save {{ margin-top: 16px; cursor: pointer; border: none; }}
+    .btn-close {{
+      background: rgba(239,68,68,.15); border-color: rgba(239,68,68,.45); color: #fca5a5;
+      cursor: pointer; font-size: 0.8rem; padding: 6px 12px;
+    }}
+    .btn-close:hover {{ background: rgba(239,68,68,.28); }}
+    .pos-stack {{ display: flex; flex-direction: column; gap: 12px; }}
+    .pos-summary {{ margin: 0 0 4px; font-size: 0.85rem; color: var(--muted); }}
+    .pos-head {{
+      display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 10px;
+    }}
+    .pos-head h3 {{ margin: 0; flex: 1; min-width: 120px; }}
+    .pos-close-form {{ margin: 0; }}
     footer {{ text-align: center; color: var(--muted); font-size: 0.78rem; margin-top: 24px; }}
   </style>
 </head>
@@ -603,6 +649,7 @@ def render_scanner_dashboard(
       <div class="stat"><label>Таймфрейм</label><strong>{_e(timeframe)}</strong></div>
       <div class="stat"><label>Bars</label><strong>{int(bars)}</strong></div>
       <div class="stat"><label>Stage1 ≥</label><strong>{float(stage1_min_score):.0f}</strong></div>
+      <div class="stat"><label>Открыто позиций</label><strong>{len(trade_state.get('open_positions') or [])}/{int(at.max_open_positions)}</strong></div>
       <div class="stat"><label>Посл. сделка</label><strong>{_fmt_ts(last_trade.get('at'))}</strong></div>
       <div class="stat"><label>Закрытие</label><strong>{_fmt_ts(last_close) if last_close else '—'}</strong></div>
     </div>
@@ -623,7 +670,8 @@ def render_scanner_dashboard(
         <div class="cfg-grid">{_trader_config_cards(at)}</div>
       </section>
       <section>
-        {_open_position_card(trade_state)}
+        <h2>Открытые позиции бота</h2>
+        {_open_positions_section(trade_state, at, return_q=base_q)}
       </section>
     </div>
 

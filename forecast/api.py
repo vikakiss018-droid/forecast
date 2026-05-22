@@ -29,7 +29,12 @@ from .orderflow_stream import start_orderbook_stream, get_liquidity_snapshot
 from .backtest_analytics import ev_bucket_label
 from .ev_calibration import load_ev_calibration
 from .market_scanner import ScanConfig, scan_market_top_setups
-from .auto_trader import load_auto_trade_config, load_trade_history, load_trade_state
+from .auto_trader import (
+    close_position_from_panel,
+    load_auto_trade_config,
+    load_trade_history,
+    load_trade_state,
+)
 from .binance_client import trading_credentials_source
 from .futures_account import compute_bot_stats, fetch_futures_account_snapshot
 from .scan_cache import load_scan_history, load_scan_result, report_from_cache
@@ -1200,6 +1205,8 @@ def trader_status() -> dict:
             "market": "futures",
             "api_credentials": trading_credentials_source(),
             "pick_from_top_n": at.pick_from_top_n,
+            "max_open_positions": at.max_open_positions,
+            "profit_close_pct": at.profit_close_pct,
         },
         "state": load_trade_state(),
         "trade_history": load_trade_history(40),
@@ -1247,6 +1254,8 @@ def scanner_json(
             "market": "futures",
             "api_credentials": trading_credentials_source(),
             "pick_from_top_n": at.pick_from_top_n,
+            "max_open_positions": at.max_open_positions,
+            "profit_close_pct": at.profit_close_pct,
         },
         "state": load_trade_state(),
     }
@@ -1283,6 +1292,27 @@ async def save_scanner_settings(request: Request) -> RedirectResponse:
     return RedirectResponse(url=f"/scanner?{return_q}{sep}{msg}", status_code=303)
 
 
+@app.post("/trader/close", dependencies=PANEL_AUTH_DEPS)
+async def trader_close_position(request: Request) -> RedirectResponse:
+    """Market-close one futures position from the dashboard."""
+    form = await request.form()
+    fsym = str(form.get("futures_symbol", "")).strip()
+    return_q = str(form.get("return_q", "")).strip()
+    if not fsym:
+        msg = "close_error=missing_symbol"
+    else:
+        try:
+            res = close_position_from_panel(fsym, yaml_cfg=_auto_trade_yaml())
+            if res.get("ok"):
+                msg = "closed=1"
+            else:
+                msg = f"close_error={html.escape(str(res.get('reason', 'close_failed')))}"
+        except Exception as e:
+            msg = f"close_error={html.escape(str(e))}"
+    sep = "&" if return_q else ""
+    return RedirectResponse(url=f"/scanner?{return_q}{sep}{msg}", status_code=303)
+
+
 @app.get("/scanner", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
 def scanner_panel(
     top: int = 10,
@@ -1293,6 +1323,8 @@ def scanner_panel(
     live: bool = False,
     saved: str | None = None,
     error: str | None = None,
+    closed: str | None = None,
+    close_error: str | None = None,
 ) -> str:
     """Dashboard: scanner setups, futures auto-trader, history."""
     rep, updated_at, from_cache = _scanner_report(
@@ -1310,6 +1342,10 @@ def scanner_panel(
     saved_msg = None
     if saved == "1":
         saved_msg = "Настройки сохранены в .env"
+    elif closed == "1":
+        saved_msg = "Позиция закрыта по рынку"
+    elif close_error:
+        saved_msg = f"Ошибка закрытия: {close_error}"
     elif error:
         saved_msg = f"Ошибка сохранения: {error}"
     return render_scanner_dashboard(

@@ -81,3 +81,5 @@ auto_trade:
   margin_mode: isolated
   use_target_2: true
   pick_from_top_n: 4
+  max_open_positions: 3
+  profit_close_pct: 10

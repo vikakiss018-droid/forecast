@@ -18,7 +18,7 @@ from pathlib import Path
 
 import yaml
 
-from .auto_trader import maybe_run_auto_trade
+from .auto_trader import manage_open_positions, maybe_run_auto_trade
 from .main import load_config
 from .market_scanner import ScanConfig, scan_market_top_setups
 from .paths import CONFIGS_DIR, load_project_env
@@ -88,6 +88,12 @@ def main() -> int:
     if cfg_path.is_file():
         with open(cfg_path, encoding="utf-8") as f:
             auto_yaml = (yaml.safe_load(f) or {}).get("auto_trade") or {}
+    pos_result = manage_open_positions(yaml_cfg=auto_yaml)
+    print(
+        f"[scan] positions open={pos_result.get('open_count')} "
+        f"profit_closed={len(pos_result.get('profit_closed') or [])}",
+        flush=True,
+    )
     trade_result = maybe_run_auto_trade(report, yaml_cfg=auto_yaml)
     print(f"[scan] auto_trade: {trade_result.get('action')} {trade_result.get('reason', '')}", flush=True)
     return 0
