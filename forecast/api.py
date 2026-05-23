@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import html
+import logging
 import os
 from dataclasses import replace
+from typing import Any
+from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
@@ -47,6 +50,16 @@ from .trade_gate import GateMode, TradeGateConfig, evaluate_trade_gate
 load_project_env()
 
 app = FastAPI(title="Forecast App")
+_log = logging.getLogger(__name__)
+
+
+def _form_field_values(form: Any, key: str) -> list[str]:
+    if hasattr(form, "getlist"):
+        return [str(v) for v in form.getlist(key)]
+    if hasattr(form, "multi_items"):
+        return [str(v) for k, v in form.multi_items() if k == key]
+    raw = form.get(key)
+    return [str(raw)] if raw is not None else []
 
 
 def _trade_gate_bundle(tg: TradeGateConfig | None = None) -> tuple[TradeGateConfig, dict[str, float]]:
@@ -1271,23 +1284,34 @@ def scanner_json(
 @app.post("/scanner/settings", dependencies=PANEL_AUTH_DEPS)
 async def save_scanner_settings(request: Request) -> RedirectResponse:
     """Save dashboard form fields to /opt/forecast/.env."""
-    form = await request.form()
-    updates: dict[str, str] = {}
-    for meta in SETTINGS_META:
-        key = meta["key"]
-        if meta.get("type") == "bool":
-            raw_list = form.getlist(key) if hasattr(form, "getlist") else []
-            if not raw_list and key in form:
-                raw_list = [form[key]]
-            updates[key] = "true" if any(str(v).lower() == "true" for v in raw_list) else "false"
-        elif key in form:
-            updates[key] = str(form[key])
+    return_q = ""
     try:
+        form = await request.form()
+        return_q = str(form.get("return_q", "")).strip()
+        updates: dict[str, str] = {}
+        for meta in SETTINGS_META:
+            key = meta["key"]
+            if meta.get("type") == "bool":
+                raw_list = _form_field_values(form, key)
+                updates[key] = "true" if any(v.lower() == "true" for v in raw_list) else "false"
+            else:
+                vals = _form_field_values(form, key)
+                if vals:
+                    updates[key] = vals[-1]
         update_env_values(updates)
         msg = "saved=1"
     except OSError as e:
-        msg = f"error={html.escape(str(e))}"
-    return_q = str(form.get("return_q", "")).strip()
+        _log.exception("save .env failed (os)")
+        msg = f"error={quote(str(e), safe='')}"
+    except ValueError as e:
+        _log.warning("save .env invalid value: %s", e)
+        msg = f"error={quote(str(e), safe='')}"
+    except Exception as e:
+        _log.exception("save .env failed")
+        detail = str(e)
+        if "python-multipart" in detail.lower():
+            detail = "На сервере не установлен python-multipart (pip install python-multipart)"
+        msg = f"error={quote(detail, safe='')}"
     sep = "&" if return_q else ""
     return RedirectResponse(url=f"/scanner?{return_q}{sep}{msg}", status_code=303)
 

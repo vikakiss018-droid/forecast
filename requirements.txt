@@ -15,6 +15,7 @@ joblib
 requests
 fastapi
 uvicorn
+python-multipart
 websockets
 aiohttp
 TA-Lib

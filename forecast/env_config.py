@@ -87,9 +87,15 @@ def _format_env_value(key: str, value: str, meta_type: str) -> str:
     if meta_type == "bool":
         return "true" if v.lower() in ("1", "true", "yes", "on") else "false"
     if meta_type == "int":
-        return str(int(float(v or "0")))
+        try:
+            return str(int(float(v.replace(",", ".") or "0")))
+        except ValueError as e:
+            raise ValueError(f"{key}: нужно целое число") from e
     if meta_type == "float":
-        return str(float(v or "0"))
+        try:
+            return str(float(v.replace(",", ".") or "0"))
+        except ValueError as e:
+            raise ValueError(f"{key}: нужно число") from e
     return v
 
 
@@ -117,7 +123,14 @@ def update_env_values(updates: dict[str, str]) -> dict[str, str]:
             lines.append(f"{key}={val}")
 
     ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
-    ENV_FILE.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    content = "\n".join(lines).rstrip() + "\n"
+    tmp = ENV_FILE.with_suffix(".env.tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(ENV_FILE)
+    try:
+        ENV_FILE.chmod(0o600)
+    except OSError:
+        pass
 
     load_project_env(force=True)
     return allowed
