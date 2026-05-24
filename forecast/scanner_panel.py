@@ -179,7 +179,7 @@ def _trader_config_cards(at: AutoTradeConfig) -> str:
         ("Cooldown", f"{at.cooldown_minutes} мин"),
         ("Выбор пары", f"Топ-{int(at.pick_from_top_n)} (первая под фильтры)"),
         ("Макс. позиций", str(int(at.max_open_positions))),
-        ("Закрытие при +%", f"{_fmt_num(at.profit_close_pct, 1)}% от notional"),
+        ("Закрытие при +%", f"{_fmt_num(at.profit_close_pct, 1)}% от маржи"),
     ]
     return "".join(
         f'<div class="cfg-card"><span>{_e(k)}</span><strong>{_e(v)}</strong></div>' for k, v in items
@@ -355,6 +355,9 @@ def _open_positions_section(state: dict[str, Any], at: AutoTradeConfig, *, retur
     for op in positions:
         fsym = str(op.get("futures_symbol") or "")
         upnl = float(op.get("unrealized_pnl") or 0.0)
+        notional = float(op.get("notional_usdt") or 0.0)
+        lev = max(1, int(op.get("leverage") or 1))
+        margin = notional / lev if notional > 0 else 0.0
         target = float(op.get("profit_target_usdt") or 0.0)
         dry = bool(op.get("dry_run"))
         close_html = ""
@@ -383,7 +386,8 @@ def _open_positions_section(state: dict[str, Any], at: AutoTradeConfig, *, retur
           <div><label>Notional</label><span>{_fmt_num(op.get('notional_usdt'), 1)} USDT</span></div>
           <div><label>Плечо</label><span>{_e(op.get('leverage'))}x</span></div>
           <div><label>uPnL</label><span class="{_pnl_class(upnl)}">{_fmt_num(upnl, 2)}</span></div>
-          <div><label>Цель +{at.profit_close_pct:.0f}%</label><span class="tp">{_fmt_num(target, 2)} USDT</span></div>
+          <div><label>Маржа</label><span>{_fmt_num(margin, 2)} USDT</span></div>
+          <div><label>Цель +{at.profit_close_pct:.0f}% маржи</label><span class="tp">{_fmt_num(target, 2)} USDT</span></div>
           <div><label>Вход</label><span class="mono">{_fmt_num(op.get('entry_price') or op.get('entry'))}</span></div>
           <div><label>Стоп</label><span class="mono stop">{_fmt_num(op.get('stop'))}</span></div>
           <div><label>Тейк</label><span class="mono tp">{_fmt_num(op.get('take_profit'))}</span></div>

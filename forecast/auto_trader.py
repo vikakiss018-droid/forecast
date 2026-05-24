@@ -298,9 +298,17 @@ def _fetch_live_positions_map(exchange: Any) -> dict[str, dict[str, Any]]:
     return out
 
 
-def _profit_target_usdt(rec: dict[str, Any], cfg: AutoTradeConfig) -> float:
+def _position_margin_usdt(rec: dict[str, Any]) -> float:
+    """USDT margin ≈ notional / leverage (собственные средства в сделке)."""
     notional = float(rec.get("notional_usdt") or 0.0)
-    return notional * (float(cfg.profit_close_pct) / 100.0)
+    lev = max(1, int(rec.get("leverage") or 1))
+    return notional / lev if notional > 0 else 0.0
+
+
+def _profit_target_usdt(rec: dict[str, Any], cfg: AutoTradeConfig) -> float:
+    """Цель uPnL: profit_close_pct % от маржи позиции, не от полного notional."""
+    margin = _position_margin_usdt(rec)
+    return margin * (float(cfg.profit_close_pct) / 100.0)
 
 
 def _sync_open_positions(exchange: Any, state: dict[str, Any], cfg: AutoTradeConfig) -> dict[str, Any]:
@@ -396,7 +404,7 @@ def check_profit_closes(exchange: Any, state: dict[str, Any], cfg: AutoTradeConf
         if target > 0 and upnl >= target:
             print(
                 f"[auto_trade] profit close {fsym} uPnL={upnl:.2f} target={target:.2f} "
-                f"({cfg.profit_close_pct}% of notional)",
+                f"({cfg.profit_close_pct}% of margin)",
                 flush=True,
             )
             res = close_futures_position_market(exchange, fsym, reason=f"PROFIT_{cfg.profit_close_pct}PCT", cfg=cfg)
@@ -555,7 +563,10 @@ def execute_futures_trade(
         "entry_price": entry_price,
         "stop": stop,
         "take_profit": tp,
-        "profit_target_usdt": notional_usdt * (float(cfg.profit_close_pct) / 100.0),
+        "profit_target_usdt": _profit_target_usdt(
+            {"notional_usdt": notional_usdt, "leverage": cfg.leverage},
+            cfg,
+        ),
     }
 
 
@@ -673,7 +684,10 @@ def maybe_run_auto_trade(
                 "entry_price": exec_result.get("entry_price", setup["entry"]),
                 "stop": setup["stop"],
                 "take_profit": exec_result.get("take_profit"),
-                "profit_target_usdt": notional * (float(cfg.profit_close_pct) / 100.0),
+                "profit_target_usdt": _profit_target_usdt(
+                    {"notional_usdt": notional, "leverage": cfg.leverage},
+                    cfg,
+                ),
                 "orders": {
                     "entry": exec_result.get("entry_order_id"),
                     "stop": exec_result.get("stop_order_id"),

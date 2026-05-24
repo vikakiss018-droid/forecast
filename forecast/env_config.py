@@ -36,7 +36,7 @@ SETTINGS_META: list[dict[str, Any]] = [
     {"key": "AUTO_TRADE_DRY_RUN", "label": "Dry-run (без ордеров)", "type": "bool", "group": "trade"},
     {"key": "AUTO_TRADE_TOP_N", "label": "Перебор топ-N сетапов", "type": "int", "group": "trade"},
     {"key": "AUTO_TRADE_MAX_POSITIONS", "label": "Макс. открытых позиций", "type": "int", "group": "trade"},
-    {"key": "AUTO_TRADE_PROFIT_CLOSE_PCT", "label": "Закрытие при прибыли % от notional", "type": "float", "group": "trade"},
+    {"key": "AUTO_TRADE_PROFIT_CLOSE_PCT", "label": "Закрытие при прибыли % от маржи", "type": "float", "group": "trade"},
     {"key": "AUTO_TRADE_MIN_SCORE", "label": "Min score", "type": "float", "group": "trade"},
     {"key": "AUTO_TRADE_MIN_PROB_PCT", "label": "Min prob %", "type": "float", "group": "trade"},
     {"key": "AUTO_TRADE_MIN_RR", "label": "Min R:R", "type": "float", "group": "trade"},
