@@ -72,12 +72,16 @@ def main() -> int:
             "top_n": top_n,
             "stage1_min_score": stage1,
             "max_symbols": max_sym,
+            "scan_duration_sec": report.get("scan_duration_sec"),
+            "symbols_scanned": report.get("symbols_scanned"),
         },
     )
     n = len(report.get("top_setups", []))
+    dur = report.get("scan_duration_sec")
+    sym_n = report.get("symbols_scanned", report.get("universe_size"))
     print(
         f"[scan] done candidates={report.get('candidates_found')} "
-        f"top={n} saved={path}",
+        f"top={n} pairs={sym_n} duration_sec={dur} saved={path}",
         flush=True,
     )
 
@@ -91,7 +95,8 @@ def main() -> int:
     pos_result = manage_open_positions(yaml_cfg=auto_yaml)
     print(
         f"[scan] positions open={pos_result.get('open_count')} "
-        f"profit_closed={len(pos_result.get('profit_closed') or [])}",
+        f"profit_closed={len(pos_result.get('profit_closed') or [])} "
+        f"loss_closed={len(pos_result.get('loss_closed') or [])}",
         flush=True,
     )
     trade_result = maybe_run_auto_trade(report, yaml_cfg=auto_yaml)

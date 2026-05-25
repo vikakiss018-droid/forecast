@@ -18,6 +18,7 @@ from .scan_cache import DEFAULT_CACHE_PATH, load_scan_result
 
 STATE_PATH = PROCESSED_DATA_DIR / "auto_trade_state.json"
 MAX_TRADE_HISTORY = 80
+MAX_CLOSED_TRADES = 200
 
 
 @dataclass
@@ -36,6 +37,8 @@ class AutoTradeConfig:
     pick_from_top_n: int = 4
     max_open_positions: int = 3
     profit_close_pct: float = 10.0
+    stop_loss_roi_usdt: float = 0.0
+    allow_level_breakout: bool = True
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -74,6 +77,8 @@ def load_auto_trade_config(yaml_cfg: dict[str, Any] | None = None) -> AutoTradeC
         pick_from_top_n=int(y.get("pick_from_top_n", 4)),
         max_open_positions=int(y.get("max_open_positions", 3)),
         profit_close_pct=float(y.get("profit_close_pct", 10.0)),
+        stop_loss_roi_usdt=float(y.get("stop_loss_roi_usdt", 0.0)),
+        allow_level_breakout=bool(y.get("allow_level_breakout", True)),
     )
     env_map = {
         "AUTO_TRADE_ENABLED": ("enabled", _env_bool),
@@ -89,6 +94,8 @@ def load_auto_trade_config(yaml_cfg: dict[str, Any] | None = None) -> AutoTradeC
         "AUTO_TRADE_TOP_N": ("pick_from_top_n", _env_int),
         "AUTO_TRADE_MAX_POSITIONS": ("max_open_positions", _env_int),
         "AUTO_TRADE_PROFIT_CLOSE_PCT": ("profit_close_pct", _env_float),
+        "AUTO_TRADE_STOP_LOSS_ROI_USDT": ("stop_loss_roi_usdt", _env_float),
+        "AUTO_TRADE_ALLOW_LEVEL_BREAKOUT": ("allow_level_breakout", _env_bool),
     }
     for env_name, (attr, fn) in env_map.items():
         if os.environ.get(env_name, "").strip():
@@ -104,6 +111,8 @@ def _normalize_state(state: dict[str, Any]) -> dict[str, Any]:
         state["open_positions"] = [dict(state.pop("open"))]
     if not isinstance(state.get("open_positions"), list):
         state["open_positions"] = []
+    if not isinstance(state.get("closed_trades"), list):
+        state["closed_trades"] = []
     return state
 
 
@@ -137,6 +146,86 @@ def load_trade_history(limit: int = 40) -> list[dict[str, Any]]:
     if not isinstance(hist, list):
         return []
     return hist[: max(1, int(limit))]
+
+
+def load_closed_trades(limit: int = 80) -> list[dict[str, Any]]:
+    rows = load_trade_state().get("closed_trades") or []
+    if not isinstance(rows, list):
+        return []
+    return rows[: max(1, int(limit))]
+
+
+def _duration_seconds(opened_at: str | None, closed_at: str | None) -> int | None:
+    start = _parse_ts(opened_at)
+    end = _parse_ts(closed_at)
+    if not start or not end:
+        return None
+    return max(0, int((end - start).total_seconds()))
+
+
+def _setup_metadata_from_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    setup = candidate.get("setup") or {}
+    return {
+        "pattern": candidate.get("pattern"),
+        "trend": candidate.get("trend"),
+        "score": candidate.get("score"),
+        "probability_pct": setup.get("probability_pct"),
+        "risk_reward": setup.get("risk_reward"),
+        "why_selected": candidate.get("why_selected"),
+        "trade_rank": candidate.get("_trade_rank"),
+    }
+
+
+def record_closed_trade(
+    state: dict[str, Any],
+    rec: dict[str, Any] | None,
+    *,
+    close_reason: str,
+    realized_pnl: float | None = None,
+    closed_at: str | None = None,
+) -> None:
+    """Append one row to closed_trades journal (deduped by symbol + opened_at)."""
+    if not rec or rec.get("dry_run"):
+        return
+    state = _normalize_state(state)
+    closed_iso = closed_at or datetime.now(timezone.utc).isoformat()
+    opened_iso = str(rec.get("opened_at") or "")
+    fsym = str(rec.get("futures_symbol") or "")
+    dedupe_key = (fsym, opened_iso)
+    for row in state.get("closed_trades") or []:
+        if (str(row.get("futures_symbol") or ""), str(row.get("opened_at") or "")) == dedupe_key:
+            return
+
+    dur = _duration_seconds(opened_iso, closed_iso)
+    pnl = realized_pnl
+    if pnl is None and rec.get("unrealized_pnl") is not None:
+        pnl = float(rec.get("unrealized_pnl"))
+
+    journal = {
+        "symbol": rec.get("symbol"),
+        "futures_symbol": fsym,
+        "side": rec.get("side"),
+        "pattern": rec.get("pattern"),
+        "trend": rec.get("trend"),
+        "score": rec.get("score"),
+        "probability_pct": rec.get("probability_pct"),
+        "risk_reward": rec.get("risk_reward"),
+        "why_selected": rec.get("why_selected"),
+        "trade_rank": rec.get("trade_rank"),
+        "opened_at": opened_iso,
+        "closed_at": closed_iso,
+        "duration_sec": dur,
+        "close_reason": close_reason,
+        "notional_usdt": rec.get("notional_usdt"),
+        "leverage": rec.get("leverage"),
+        "entry_price": rec.get("entry_price") or rec.get("entry"),
+        "stop": rec.get("stop"),
+        "take_profit": rec.get("take_profit"),
+        "realized_pnl": pnl,
+    }
+    hist = state.get("closed_trades") or []
+    hist.insert(0, journal)
+    state["closed_trades"] = hist[:MAX_CLOSED_TRADES]
 
 
 def _parse_ts(iso: str | None) -> datetime | None:
@@ -191,6 +280,21 @@ def pick_trade_candidate(
     return None, f"NO_QUALIFIED_IN_TOP{n} (last {last_reason})"
 
 
+def is_level_breakout_candidate(candidate: dict[str, Any]) -> bool:
+    """Сетап на пробитие / ретест уровня (не открывать, если allow_level_breakout=false)."""
+    if candidate.get("retest_breakout"):
+        return True
+    if candidate.get("breakout_consolidation"):
+        return True
+    pat = str(candidate.get("pattern") or "").lower().replace("_", " ")
+    if "breakout" in pat:
+        return True
+    why = str(candidate.get("why_selected") or "").lower()
+    if "ретест пробоя" in why:
+        return True
+    return False
+
+
 def _normalize_side(direction: str) -> str:
     d = direction.strip().lower()
     if d in ("long", "buy"):
@@ -201,6 +305,8 @@ def _normalize_side(direction: str) -> str:
 
 
 def validate_setup(candidate: dict[str, Any], cfg: AutoTradeConfig) -> tuple[bool, str]:
+    if not cfg.allow_level_breakout and is_level_breakout_candidate(candidate):
+        return False, "BREAKOUT_LEVEL_DISABLED"
     setup = candidate.get("setup") or {}
     side = _normalize_side(str(setup.get("direction", "")))
     if side not in ("long", "short"):
@@ -311,6 +417,11 @@ def _profit_target_usdt(rec: dict[str, Any], cfg: AutoTradeConfig) -> float:
     return margin * (float(cfg.profit_close_pct) / 100.0)
 
 
+def _loss_limit_usdt(cfg: AutoTradeConfig) -> float:
+    """Макс. убыток uPnL в USDT (положительное число в конфиге, напр. 5 → закрыть при −5 USDT)."""
+    return max(0.0, float(cfg.stop_loss_roi_usdt))
+
+
 def _sync_open_positions(exchange: Any, state: dict[str, Any], cfg: AutoTradeConfig) -> dict[str, Any]:
     state = _normalize_state(state)
     live = _fetch_live_positions_map(exchange)
@@ -320,6 +431,13 @@ def _sync_open_positions(exchange: Any, state: dict[str, Any], cfg: AutoTradeCon
         fsym = str(rec.get("futures_symbol") or _futures_symbol(exchange, spot))
         p = live.get(fsym)
         if p is None:
+            if not cfg.dry_run:
+                cancel_symbol_open_orders(
+                    exchange,
+                    fsym,
+                    order_ids=_order_ids_from_rec(rec),
+                )
+                record_closed_trade(state, rec, close_reason="EXCHANGE_CLOSED")
             continue
         upnl = float(p.get("unrealizedPnl") or p.get("unrealisedPnl") or 0.0)
         row = dict(rec)
@@ -328,6 +446,7 @@ def _sync_open_positions(exchange: Any, state: dict[str, Any], cfg: AutoTradeCon
         row["unrealized_pnl"] = upnl
         row["contracts"] = abs(float(p.get("contracts") or 0.0))
         row["profit_target_usdt"] = _profit_target_usdt(row, cfg)
+        row["loss_limit_usdt"] = _loss_limit_usdt(cfg)
         row["mark_price"] = float(p.get("markPrice") or p.get("entryPrice") or 0.0)
         kept.append(row)
     if len(kept) < len(state.get("open_positions") or []):
@@ -349,12 +468,59 @@ def _has_symbol_open(state: dict[str, Any], futures_symbol: str) -> bool:
     return False
 
 
+def _order_ids_from_rec(rec: dict[str, Any] | None) -> list[str]:
+    if not rec:
+        return []
+    orders = rec.get("orders") or {}
+    ids: list[str] = []
+    for key in ("stop", "tp", "entry"):
+        oid = orders.get(key)
+        if oid is not None and str(oid).strip():
+            ids.append(str(oid))
+    return ids
+
+
+def cancel_symbol_open_orders(
+    exchange: Any,
+    futures_symbol: str,
+    *,
+    order_ids: list[str] | None = None,
+) -> None:
+    """Cancel regular + conditional (algo) orders on Binance USDT-M."""
+    seen_cancel: set[tuple[str, frozenset[tuple[str, str]]]] = set()
+
+    def _try_cancel_all(extra: dict[str, Any] | None) -> None:
+        params = extra or {}
+        key = (futures_symbol, frozenset(params.items()))
+        if key in seen_cancel:
+            return
+        seen_cancel.add(key)
+        exchange.cancel_all_orders(futures_symbol, params)
+
+    for extra in (None, {"conditional": True}, {"trigger": True}):
+        try:
+            _try_cancel_all(extra)
+        except Exception as e:
+            label = extra or {}
+            print(
+                f"[auto_trade] cancel_all_orders {futures_symbol} {label} warning: {e}",
+                flush=True,
+            )
+
+    for oid in order_ids or []:
+        try:
+            exchange.cancel_order(oid, futures_symbol)
+        except Exception as e:
+            print(f"[auto_trade] cancel_order {futures_symbol} id={oid} warning: {e}", flush=True)
+
+
 def close_futures_position_market(
     exchange: Any,
     futures_symbol: str,
     *,
     reason: str,
     cfg: AutoTradeConfig,
+    order_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     if cfg.dry_run:
         return {"ok": True, "dry_run": True, "futures_symbol": futures_symbol, "reason": reason}
@@ -366,10 +532,7 @@ def close_futures_position_market(
     side = str(pos.get("side") or "").lower()
     close_side = "sell" if side == "long" else "buy"
     amount = float(exchange.amount_to_precision(futures_symbol, abs(float(pos.get("contracts") or 0.0))))
-    try:
-        exchange.cancel_all_orders(futures_symbol)
-    except Exception as e:
-        print(f"[auto_trade] cancel_all_orders warning: {e}", flush=True)
+    cancel_symbol_open_orders(exchange, futures_symbol, order_ids=order_ids)
 
     order = exchange.create_order(
         futures_symbol,
@@ -379,6 +542,7 @@ def close_futures_position_market(
         None,
         {"reduceOnly": True},
     )
+    cancel_symbol_open_orders(exchange, futures_symbol, order_ids=order_ids)
     return {
         "ok": True,
         "futures_symbol": futures_symbol,
@@ -407,8 +571,20 @@ def check_profit_closes(exchange: Any, state: dict[str, Any], cfg: AutoTradeConf
                 f"({cfg.profit_close_pct}% of margin)",
                 flush=True,
             )
-            res = close_futures_position_market(exchange, fsym, reason=f"PROFIT_{cfg.profit_close_pct}PCT", cfg=cfg)
+            res = close_futures_position_market(
+                exchange,
+                fsym,
+                reason=f"PROFIT_{cfg.profit_close_pct}PCT",
+                cfg=cfg,
+                order_ids=_order_ids_from_rec(rec),
+            )
             closed.append(res)
+            record_closed_trade(
+                state,
+                rec,
+                close_reason=str(res.get("reason") or f"PROFIT_{cfg.profit_close_pct}PCT"),
+                realized_pnl=float(res.get("unrealized_pnl") or 0.0),
+            )
             append_trade_history(
                 state,
                 {
@@ -423,16 +599,73 @@ def check_profit_closes(exchange: Any, state: dict[str, Any], cfg: AutoTradeConf
     return closed
 
 
+def check_loss_closes(exchange: Any, state: dict[str, Any], cfg: AutoTradeConfig) -> list[dict[str, Any]]:
+    """Закрыть позицию, если нереализованный uPnL ≤ −stop_loss_roi_usdt."""
+    closed: list[dict[str, Any]] = []
+    limit = _loss_limit_usdt(cfg)
+    if cfg.dry_run or limit <= 0:
+        return closed
+    for rec in list(state.get("open_positions") or []):
+        fsym = str(rec.get("futures_symbol") or "")
+        if not fsym:
+            continue
+        live = _fetch_open_position(exchange, fsym)
+        if live is None:
+            continue
+        upnl = float(live.get("unrealizedPnl") or 0.0)
+        if upnl <= -limit:
+            print(
+                f"[auto_trade] stop-loss ROI close {fsym} uPnL={upnl:.2f} limit=-{limit:.2f} USDT",
+                flush=True,
+            )
+            res = close_futures_position_market(
+                exchange,
+                fsym,
+                reason=f"STOP_LOSS_ROI_{limit:.0f}USDT",
+                cfg=cfg,
+                order_ids=_order_ids_from_rec(rec),
+            )
+            closed.append(res)
+            record_closed_trade(
+                state,
+                rec,
+                close_reason=str(res.get("reason") or f"STOP_LOSS_ROI_{limit:.0f}USDT"),
+                realized_pnl=float(res.get("unrealized_pnl") or 0.0),
+            )
+            append_trade_history(
+                state,
+                {
+                    "action": "closed",
+                    "reason": res.get("reason"),
+                    "symbol": rec.get("symbol"),
+                    "side": rec.get("side"),
+                    "dry_run": False,
+                    "notional_usdt": rec.get("notional_usdt"),
+                },
+            )
+    return closed
+
+
+def _apply_auto_closes(exchange: Any, state: dict[str, Any], cfg: AutoTradeConfig) -> dict[str, Any]:
+    profit = check_profit_closes(exchange, state, cfg)
+    loss = check_loss_closes(exchange, state, cfg)
+    return {"profit_closed": profit, "loss_closed": loss}
+
+
 def manage_open_positions(*, yaml_cfg: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Sync positions, apply +profit% closes. Call each scan cycle."""
+    """Sync positions, apply profit/loss ROI closes. Call each scan cycle."""
     cfg = load_auto_trade_config(yaml_cfg)
     state = load_trade_state()
     exchange = create_trading_client(use_futures=True)
     state = _sync_open_positions(exchange, state, cfg)
-    closed = check_profit_closes(exchange, state, cfg)
+    closed = _apply_auto_closes(exchange, state, cfg)
     state = _sync_open_positions(exchange, state, cfg)
     save_trade_state(state)
-    return {"open_count": _open_positions_count(state), "profit_closed": closed}
+    return {
+        "open_count": _open_positions_count(state),
+        "profit_closed": closed["profit_closed"],
+        "loss_closed": closed["loss_closed"],
+    }
 
 
 def close_position_from_panel(futures_symbol: str, *, yaml_cfg: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -444,8 +677,22 @@ def close_position_from_panel(futures_symbol: str, *, yaml_cfg: dict[str, Any] |
         (r for r in state.get("open_positions") or [] if str(r.get("futures_symbol")) == fsym),
         None,
     )
-    res = close_futures_position_market(exchange, fsym, reason="MANUAL_PANEL", cfg=cfg)
+    res = close_futures_position_market(
+        exchange,
+        fsym,
+        reason="MANUAL_PANEL",
+        cfg=cfg,
+        order_ids=_order_ids_from_rec(rec),
+    )
+    if not res.get("ok") and not cfg.dry_run:
+        cancel_symbol_open_orders(exchange, fsym, order_ids=_order_ids_from_rec(rec))
     if res.get("ok") and not cfg.dry_run:
+        record_closed_trade(
+            state,
+            rec,
+            close_reason="MANUAL_PANEL",
+            realized_pnl=float(res.get("unrealized_pnl") or 0.0),
+        )
         append_trade_history(
             state,
             {
@@ -585,7 +832,7 @@ def maybe_run_auto_trade(
     state = load_trade_state()
     exchange = create_trading_client(use_futures=True)
     state = _sync_open_positions(exchange, state, cfg)
-    check_profit_closes(exchange, state, cfg)
+    _apply_auto_closes(exchange, state, cfg)
     state = _sync_open_positions(exchange, state, cfg)
     save_trade_state(state)
 
@@ -671,6 +918,7 @@ def maybe_run_auto_trade(
         return _finish(result)
 
     now = datetime.now(timezone.utc).isoformat()
+    meta = _setup_metadata_from_candidate(candidate)
     if not cfg.dry_run:
         state.setdefault("open_positions", []).append(
             {
@@ -688,11 +936,13 @@ def maybe_run_auto_trade(
                     {"notional_usdt": notional, "leverage": cfg.leverage},
                     cfg,
                 ),
+                "loss_limit_usdt": _loss_limit_usdt(cfg),
                 "orders": {
                     "entry": exec_result.get("entry_order_id"),
                     "stop": exec_result.get("stop_order_id"),
                     "tp": exec_result.get("tp_order_id"),
                 },
+                **meta,
             }
         )
     elif cfg.dry_run:

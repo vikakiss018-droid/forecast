@@ -83,3 +83,5 @@ auto_trade:
   pick_from_top_n: 4
   max_open_positions: 3
   profit_close_pct: 10
+  allow_level_breakout: true
+  stop_loss_roi_usdt: 0

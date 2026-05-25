@@ -6,7 +6,7 @@ import html
 from datetime import datetime
 from typing import Any
 
-from .auto_trader import AutoTradeConfig, load_trade_history, load_trade_state
+from .auto_trader import AutoTradeConfig, load_closed_trades, load_trade_history, load_trade_state
 from .binance_client import trading_credentials_source
 from .env_config import SETTINGS_META, get_settings_for_panel
 
@@ -120,11 +120,12 @@ def _setup_rows(setups: list[dict[str, Any]]) -> str:
 
 def _scan_history_rows(items: list[dict[str, Any]]) -> str:
     if not items:
-        return '<tr><td colspan="5" class="empty-cell">История появится после нескольких сканов (каждые 15 мин)</td></tr>'
+        return '<tr><td colspan="6" class="empty-cell">История появится после нескольких сканов (каждые 15 мин)</td></tr>'
     rows = []
     for h in items:
         top = h.get("top") or {}
         sym = top.get("symbol") or "—"
+        pairs = h.get("symbols_scanned") or h.get("universe_size")
         rows.append(
             f"""
         <tr>
@@ -132,7 +133,8 @@ def _scan_history_rows(items: list[dict[str, Any]]) -> str:
           <td>{_e(sym)}</td>
           <td>{_direction_badge(str(top.get('direction') or ''))}</td>
           <td>{_fmt_num(top.get('score'), 1) if top.get('score') is not None else '—'}</td>
-          <td>{int(h.get('candidates_found') or 0)} / {int(h.get('universe_size') or 0)}</td>
+          <td>{int(h.get('candidates_found') or 0)} / {int(pairs or 0)}</td>
+          <td>{_fmt_scan_duration(h.get('scan_duration_sec'))}</td>
         </tr>"""
         )
     return "\n".join(rows)
@@ -155,6 +157,213 @@ def _trade_history_rows(items: list[dict[str, Any]]) -> str:
         </tr>"""
         )
     return "\n".join(rows)
+
+
+def _fmt_duration(seconds: int | None) -> str:
+    if seconds is None:
+        return "—"
+    if seconds < 60:
+        return f"{seconds} сек"
+    if seconds < 3600:
+        return f"{seconds // 60} мин"
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    return f"{h} ч {m} мин" if m else f"{h} ч"
+
+
+def _fmt_scan_duration(sec: Any) -> str:
+    try:
+        s = float(sec)
+    except (TypeError, ValueError):
+        return "—"
+    if s != s or s < 0:
+        return "—"
+    if s < 60:
+        return f"{s:.1f} сек"
+    return _fmt_duration(int(round(s)))
+
+
+def _close_reason_label(reason: str | None) -> str:
+    r = str(reason or "")
+    labels = {
+        "MANUAL_PANEL": "Вручную (панель)",
+        "EXCHANGE_CLOSED": "На бирже (стоп/тейк)",
+        "position_closed": "Позиция закрыта",
+    }
+    if r in labels:
+        return labels[r]
+    if r.startswith("PROFIT_"):
+        return "Прибыль (авто % маржи)"
+    if r.startswith("STOP_LOSS_ROI"):
+        return "Стоп по ROI (uPnL)"
+    return r or "—"
+
+
+def _pnl_class(v: float | None) -> str:
+    if v is None:
+        return ""
+    if v > 0:
+        return "pnl-pos"
+    if v < 0:
+        return "pnl-neg"
+    return ""
+
+
+def _dashboard_tabs(*, active: str, base_q: str) -> str:
+    scan_cls = "tab active" if active == "scan" else "tab"
+    closed_cls = "tab active" if active == "closed" else "tab"
+    return f"""
+    <nav class="dash-tabs">
+      <a class="{scan_cls}" href="/scanner?{base_q}">Сканер и торговля</a>
+      <a class="{closed_cls}" href="/scanner?tab=closed&amp;{base_q}">Закрытые сделки</a>
+    </nav>"""
+
+
+def _closed_trades_summary(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return ""
+    pnls = [float(r["realized_pnl"]) for r in rows if r.get("realized_pnl") is not None]
+    durs = [int(r["duration_sec"]) for r in rows if r.get("duration_sec") is not None]
+    wins = sum(1 for p in pnls if p > 0)
+    avg_pnl = sum(pnls) / len(pnls) if pnls else None
+    avg_dur = int(sum(durs) / len(durs)) if durs else None
+    return f"""
+    <div class="stats stats-closed">
+      <div class="stat"><label>Закрыто</label><strong>{len(rows)}</strong></div>
+      <div class="stat"><label>В плюс</label><strong class="pnl-pos">{wins}</strong></div>
+      <div class="stat"><label>Средн. PnL</label><strong class="{_pnl_class(avg_pnl)}">{_fmt_num(avg_pnl, 2) if avg_pnl is not None else '—'}</strong></div>
+      <div class="stat"><label>Средн. время</label><strong>{_fmt_duration(avg_dur)}</strong></div>
+    </div>"""
+
+
+def _closed_trades_rows(items: list[dict[str, Any]]) -> str:
+    if not items:
+        return (
+            '<tr><td colspan="14" class="empty-cell">'
+            "Закрытые LIVE-сделки появятся после первого закрытия позиции"
+            "</td></tr>"
+        )
+    rows = []
+    for t in items:
+        pnl = t.get("realized_pnl")
+        try:
+            pnl_f = float(pnl) if pnl is not None else None
+        except (TypeError, ValueError):
+            pnl_f = None
+        rows.append(
+            f"""
+        <tr>
+          <td class="sym">{_e(t.get('symbol'))}</td>
+          <td>{_direction_badge(str(t.get('side') or ''))}</td>
+          <td>{_e(t.get('pattern') or '—')}</td>
+          <td><span class="trend-{_e(t.get('trend'))}">{_e(t.get('trend') or '—')}</span></td>
+          <td>{_fmt_num(t.get('score'), 1)}</td>
+          <td>{_fmt_num(t.get('probability_pct'), 1)}%</td>
+          <td>{_fmt_num(t.get('risk_reward'), 2)}</td>
+          <td class="mono">{_fmt_ts(t.get('opened_at'))}</td>
+          <td class="mono">{_fmt_ts(t.get('closed_at'))}</td>
+          <td>{_fmt_duration(t.get('duration_sec'))}</td>
+          <td class="reason">{_e(_close_reason_label(t.get('close_reason')))}</td>
+          <td>{_fmt_num(t.get('notional_usdt'), 1)}</td>
+          <td class="mono {_pnl_class(pnl_f)}">{_fmt_num(pnl_f, 2) if pnl_f is not None else '—'}</td>
+          <td class="why">{_e(t.get('why_selected') or '—')}</td>
+        </tr>"""
+        )
+    return "\n".join(rows)
+
+
+def render_closed_trades_dashboard(
+    *,
+    closed_trades: list[dict[str, Any]],
+    base_q: str,
+    saved_msg: str | None = None,
+) -> str:
+    banner = ""
+    if saved_msg:
+        banner = f'<div class="save-banner ok">{_e(saved_msg)}</div>'
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="refresh" content="900" />
+  <title>Forecast — Закрытые сделки</title>
+  <style>
+    :root {{
+      --bg: #070b14; --surface: #0f1628; --surface2: #141e34; --border: #24304d;
+      --text: #e8edff; --muted: #8b96b8; --accent: #5b8cff; --accent2: #22d3a8;
+      --long: #22c55e; --short: #ef4444;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg); color: var(--text); line-height: 1.45;
+    }}
+    .wrap {{ max-width: 1600px; margin: 0 auto; padding: 20px 16px 48px; }}
+    h1 {{ margin: 0; font-size: 1.75rem; }}
+    .subtitle {{ color: var(--muted); font-size: 0.9rem; margin-top: 4px; }}
+    .dash-tabs {{ display: flex; gap: 8px; margin: 16px 0 20px; flex-wrap: wrap; }}
+    .tab {{
+      padding: 10px 16px; border-radius: 10px; border: 1px solid var(--border);
+      background: var(--surface2); color: var(--text); text-decoration: none; font-size: 0.88rem;
+    }}
+    .tab:hover {{ border-color: var(--accent); }}
+    .tab.active {{ background: linear-gradient(135deg, #4f7cff, #3b5bdb); border-color: transparent; }}
+    section {{
+      background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
+      padding: 18px 20px; margin-bottom: 20px;
+    }}
+    section h2 {{ margin: 0 0 14px; font-size: 1.05rem; }}
+    .stats {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; margin-bottom: 20px; }}
+    .stat {{ background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 14px; }}
+    .stat label {{ display: block; font-size: 0.72rem; color: var(--muted); text-transform: uppercase; }}
+    .stat strong {{ font-size: 1.2rem; display: block; margin-top: 4px; }}
+    .table-wrap {{ overflow-x: auto; border-radius: 10px; border: 1px solid var(--border); }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 0.78rem; }}
+    th, td {{ padding: 10px 10px; text-align: left; border-bottom: 1px solid var(--border); }}
+    th {{ background: var(--surface2); color: var(--muted); font-size: 0.68rem; text-transform: uppercase; }}
+    td.sym {{ font-weight: 600; color: var(--accent); }}
+    td.why {{ max-width: 200px; color: var(--muted); }}
+    .empty-cell {{ text-align: center; color: var(--muted); padding: 28px !important; }}
+    .pnl-pos {{ color: var(--long); }} .pnl-neg {{ color: var(--short); }}
+    .trend-up {{ color: var(--long); }} .trend-down {{ color: var(--short); }}
+    .badge {{ display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 0.7rem; font-weight: 600; }}
+    .badge-long {{ background: rgba(34,197,94,.15); color: var(--long); }}
+    .badge-short {{ background: rgba(239,68,68,.15); color: var(--short); }}
+    .badge-muted {{ background: var(--surface2); color: var(--muted); }}
+    .save-banner.ok {{ padding: 10px 14px; border-radius: 10px; margin-bottom: 14px;
+      background: rgba(34,211,168,.12); border: 1px solid rgba(34,211,168,.35); color: var(--accent2); }}
+    footer {{ text-align: center; color: var(--muted); font-size: 0.78rem; margin-top: 24px; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Закрытые сделки</h1>
+      <p class="subtitle">Журнал LIVE-позиций: паттерн, тренд, время в сделке, причина закрытия</p>
+    </header>
+    {_dashboard_tabs(active="closed", base_q=base_q)}
+    {banner}
+    {_closed_trades_summary(closed_trades)}
+    <section>
+      <h2>Все закрытые сделки</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Пара</th><th>Сторона</th><th>Паттерн</th><th>Тренд</th><th>Score</th>
+              <th>Prob</th><th>R:R</th><th>Открыта</th><th>Закрыта</th><th>Длительность</th>
+              <th>Причина</th><th>Notional</th><th>PnL</th><th>Почему</th>
+            </tr>
+          </thead>
+          <tbody>{_closed_trades_rows(closed_trades)}</tbody>
+        </table>
+      </div>
+    </section>
+    <footer>Данные: auto_trade_state.json → closed_trades · <a href="/scanner?{base_q}" style="color:var(--accent)">← Сканер</a></footer>
+  </div>
+</body>
+</html>"""
 
 
 def _trader_config_cards(at: AutoTradeConfig) -> str:
@@ -180,6 +389,14 @@ def _trader_config_cards(at: AutoTradeConfig) -> str:
         ("Выбор пары", f"Топ-{int(at.pick_from_top_n)} (первая под фильтры)"),
         ("Макс. позиций", str(int(at.max_open_positions))),
         ("Закрытие при +%", f"{_fmt_num(at.profit_close_pct, 1)}% от маржи"),
+        (
+            "Стоп ROI (uPnL)",
+            f"{_fmt_num(at.stop_loss_roi_usdt, 1)} USDT" if at.stop_loss_roi_usdt > 0 else "Выкл",
+        ),
+        (
+            "Пробитие уровня",
+            "Разрешено" if at.allow_level_breakout else "Отключено",
+        ),
     ]
     return "".join(
         f'<div class="cfg-card"><span>{_e(k)}</span><strong>{_e(v)}</strong></div>' for k, v in items
@@ -359,6 +576,7 @@ def _open_positions_section(state: dict[str, Any], at: AutoTradeConfig, *, retur
         lev = max(1, int(op.get("leverage") or 1))
         margin = notional / lev if notional > 0 else 0.0
         target = float(op.get("profit_target_usdt") or 0.0)
+        loss_lim = float(op.get("loss_limit_usdt") or at.stop_loss_roi_usdt or 0.0)
         dry = bool(op.get("dry_run"))
         close_html = ""
         if fsym and not dry and not at.dry_run:
@@ -388,6 +606,7 @@ def _open_positions_section(state: dict[str, Any], at: AutoTradeConfig, *, retur
           <div><label>uPnL</label><span class="{_pnl_class(upnl)}">{_fmt_num(upnl, 2)}</span></div>
           <div><label>Маржа</label><span>{_fmt_num(margin, 2)} USDT</span></div>
           <div><label>Цель +{at.profit_close_pct:.0f}% маржи</label><span class="tp">{_fmt_num(target, 2)} USDT</span></div>
+          <div><label>Стоп ROI</label><span class="stop">{'—' if loss_lim <= 0 else f'−{_fmt_num(loss_lim, 2)} USDT'}</span></div>
           <div><label>Вход</label><span class="mono">{_fmt_num(op.get('entry_price') or op.get('entry'))}</span></div>
           <div><label>Стоп</label><span class="mono stop">{_fmt_num(op.get('stop'))}</span></div>
           <div><label>Тейк</label><span class="mono tp">{_fmt_num(op.get('take_profit'))}</span></div>
@@ -442,6 +661,8 @@ def render_scanner_dashboard(
 
     last_trade = trade_state.get("last_trade") or {}
     last_close = trade_state.get("last_close_at")
+    sym_scanned = int(report.get("symbols_scanned") or report.get("universe_size") or 0)
+    scan_dur = report.get("scan_duration_sec")
 
     return f"""<!DOCTYPE html>
 <html lang="ru">
@@ -610,6 +831,13 @@ def render_scanner_dashboard(
     .bool-field {{ flex-direction: row; align-items: center; gap: 8px; }}
     .bool-field input {{ width: auto; }}
     .btn-save {{ margin-top: 16px; cursor: pointer; border: none; }}
+    .dash-tabs {{ display: flex; gap: 8px; margin: 0 0 20px; flex-wrap: wrap; }}
+    .tab {{
+      padding: 10px 16px; border-radius: 10px; border: 1px solid var(--border);
+      background: var(--surface2); color: var(--text); text-decoration: none; font-size: 0.88rem;
+    }}
+    .tab:hover {{ border-color: var(--accent); }}
+    .tab.active {{ background: linear-gradient(135deg, #4f7cff, #3b5bdb); border-color: transparent; }}
     .btn-close {{
       background: rgba(239,68,68,.15); border-color: rgba(239,68,68,.45); color: #fca5a5;
       cursor: pointer; font-size: 0.8rem; padding: 6px 12px;
@@ -639,6 +867,8 @@ def render_scanner_dashboard(
       </div>
     </header>
 
+    {_dashboard_tabs(active="scan", base_q=base_q)}
+
     <div class="actions">
       <a class="btn btn-primary" href="{refresh_url}">Обновить</a>
       <a class="btn" href="{live_url}">Live-скан</a>
@@ -648,7 +878,8 @@ def render_scanner_dashboard(
 
     <div class="stats">
       <div class="stat"><label>Последний скан</label><strong>{_fmt_ts(updated_at)}</strong></div>
-      <div class="stat"><label>Вселенная</label><strong>{int(report.get('universe_size', 0))}</strong></div>
+      <div class="stat"><label>Пар в скане</label><strong>{sym_scanned}</strong></div>
+      <div class="stat"><label>Время скана</label><strong>{_fmt_scan_duration(scan_dur)}</strong></div>
       <div class="stat"><label>Кандидаты</label><strong>{int(report.get('candidates_found', 0))}</strong></div>
       <div class="stat"><label>Таймфрейм</label><strong>{_e(timeframe)}</strong></div>
       <div class="stat"><label>Bars</label><strong>{int(bars)}</strong></div>
@@ -700,7 +931,7 @@ def render_scanner_dashboard(
         <h2>История сканов</h2>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Время</th><th>Топ пара</th><th>Dir</th><th>Score</th><th>Кандидаты</th></tr></thead>
+            <thead><tr><th>Время</th><th>Топ пара</th><th>Dir</th><th>Score</th><th>Кандидаты</th><th>Время скана</th></tr></thead>
             <tbody>{_scan_history_rows(scan_history)}</tbody>
           </table>
         </div>
@@ -718,6 +949,7 @@ def render_scanner_dashboard(
 
     <footer>
       Кэш: market_scan_latest.json · История: scan_history.jsonl · Торги: auto_trade_state.json
+      · <a href="/scanner?tab=closed&amp;{base_q}" style="color:var(--accent)">Закрытые сделки</a>
       · <a class="btn" href="/legacy" style="display:inline-block;margin-top:8px">Старый forecast UI</a>
     </footer>
   </div>

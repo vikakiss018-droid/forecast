@@ -35,6 +35,7 @@ from .market_scanner import ScanConfig, scan_market_top_setups
 from .auto_trader import (
     close_position_from_panel,
     load_auto_trade_config,
+    load_closed_trades,
     load_trade_history,
     load_trade_state,
 )
@@ -43,7 +44,7 @@ from .futures_account import compute_bot_stats, fetch_futures_account_snapshot
 from .scan_cache import load_scan_history, load_scan_result, report_from_cache
 from .env_config import SETTINGS_META, update_env_values
 from .panel_auth import PANEL_AUTH_DEPS
-from .scanner_panel import render_scanner_dashboard
+from .scanner_panel import render_closed_trades_dashboard, render_scanner_dashboard
 from .trade_gate import GateMode, TradeGateConfig, evaluate_trade_gate
 
 
@@ -1220,9 +1221,12 @@ def trader_status() -> dict:
             "pick_from_top_n": at.pick_from_top_n,
             "max_open_positions": at.max_open_positions,
             "profit_close_pct": at.profit_close_pct,
+            "stop_loss_roi_usdt": at.stop_loss_roi_usdt,
+            "allow_level_breakout": at.allow_level_breakout,
         },
         "state": load_trade_state(),
         "trade_history": load_trade_history(40),
+        "closed_trades": load_closed_trades(100),
         "scan_history": load_scan_history(30),
         "futures_account": fetch_futures_account_snapshot(),
         "bot_stats": compute_bot_stats(load_trade_history(40), load_scan_history(30)),
@@ -1269,11 +1273,14 @@ def scanner_json(
             "pick_from_top_n": at.pick_from_top_n,
             "max_open_positions": at.max_open_positions,
             "profit_close_pct": at.profit_close_pct,
+            "stop_loss_roi_usdt": at.stop_loss_roi_usdt,
+            "allow_level_breakout": at.allow_level_breakout,
         },
         "state": load_trade_state(),
     }
     rep["scan_history"] = load_scan_history(30)
     rep["trade_history"] = load_trade_history(40)
+    rep["closed_trades"] = load_closed_trades(100)
     rep["futures_account"] = fetch_futures_account_snapshot()
     rep["bot_stats"] = compute_bot_stats(rep["trade_history"], rep["scan_history"])
     if cached_full:
@@ -1339,6 +1346,7 @@ async def trader_close_position(request: Request) -> RedirectResponse:
 
 @app.get("/scanner", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
 def scanner_panel(
+    tab: str = "scan",
     top: int = 10,
     bars: int = 320,
     timeframe: str = "1h",
@@ -1351,6 +1359,28 @@ def scanner_panel(
     close_error: str | None = None,
 ) -> str:
     """Dashboard: scanner setups, futures auto-trader, history."""
+    max_symbols_q = "" if max_symbols is None else str(max_symbols)
+    base_q = (
+        f"top={int(top)}&bars={int(bars)}&timeframe={html.escape(timeframe)}"
+        f"&stage1_min_score={float(stage1_min_score)}&max_symbols={html.escape(max_symbols_q)}"
+    )
+    saved_msg = None
+    if saved == "1":
+        saved_msg = "Настройки сохранены в .env"
+    elif closed == "1":
+        saved_msg = "Позиция закрыта по рынку"
+    elif close_error:
+        saved_msg = f"Ошибка закрытия: {close_error}"
+    elif error:
+        saved_msg = f"Ошибка сохранения: {error}"
+
+    if tab.strip().lower() == "closed":
+        return render_closed_trades_dashboard(
+            closed_trades=load_closed_trades(100),
+            base_q=base_q,
+            saved_msg=saved_msg,
+        )
+
     rep, updated_at, from_cache = _scanner_report(
         top=top,
         bars=bars,
@@ -1363,15 +1393,6 @@ def scanner_panel(
     at = load_auto_trade_config(_auto_trade_yaml())
     trade_hist = load_trade_history(30)
     scan_hist = load_scan_history(25)
-    saved_msg = None
-    if saved == "1":
-        saved_msg = "Настройки сохранены в .env"
-    elif closed == "1":
-        saved_msg = "Позиция закрыта по рынку"
-    elif close_error:
-        saved_msg = f"Ошибка закрытия: {close_error}"
-    elif error:
-        saved_msg = f"Ошибка сохранения: {error}"
     return render_scanner_dashboard(
         report=rep,
         updated_at=updated_at,
