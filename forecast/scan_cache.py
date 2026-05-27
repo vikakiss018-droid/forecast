@@ -53,6 +53,8 @@ def _append_scan_history(payload: dict[str, Any]) -> None:
         "scan_config": payload.get("scan_config") or {},
         "universe_size": report.get("universe_size"),
         "candidates_found": report.get("candidates_found"),
+        "scan_duration_sec": report.get("scan_duration_sec"),
+        "symbols_scanned": report.get("symbols_scanned"),
         "top": _history_summary(report),
         "top_count": len(report.get("top_setups") or []),
     }

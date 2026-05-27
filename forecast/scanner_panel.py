@@ -386,7 +386,7 @@ def _trader_config_cards(at: AutoTradeConfig) -> str:
         ("Плечо", f"{at.leverage}x"),
         ("Маржа", _e(at.margin_mode)),
         ("Cooldown", f"{at.cooldown_minutes} мин"),
-        ("Выбор пары", f"Топ-{int(at.pick_from_top_n)} (первая под фильтры)"),
+        ("Выбор пар", f"Топ-{int(at.pick_from_top_n)} (все подходящие за скан)"),
         ("Макс. позиций", str(int(at.max_open_positions))),
         ("Закрытие при +%", f"{_fmt_num(at.profit_close_pct, 1)}% от маржи"),
         (
@@ -396,6 +396,10 @@ def _trader_config_cards(at: AutoTradeConfig) -> str:
         (
             "Пробитие уровня",
             "Разрешено" if at.allow_level_breakout else "Отключено",
+        ),
+        (
+            "Паттерн triangle",
+            "Разрешён" if at.allow_triangle else "Отключён",
         ),
     ]
     return "".join(

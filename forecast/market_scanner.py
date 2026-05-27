@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -197,6 +198,7 @@ def scan_market_top_setups(
         universe = universe[: max(1, int(scan_cfg.max_symbols))]
 
     candidates: list[dict[str, Any]] = []
+    t_pairs = time.perf_counter()
     for symbol in universe:
         try:
             rows = ex.fetch_ohlcv(symbol, timeframe=scan_cfg.timeframe, limit=scan_cfg.bars)
@@ -257,8 +259,12 @@ def scan_market_top_setups(
                 "support_level": float(snap["support_level"]),
                 "resistance_level": float(snap["resistance_level"]),
                 "why_selected": ", ".join(reasons),
+                "retest_breakout": bool(snap.get("retest_breakout")),
+                "breakout_consolidation": bool((snap.get("patterns") or {}).get("breakout_consolidation")),
             }
         )
+
+    scan_duration_sec = round(time.perf_counter() - t_pairs, 2)
 
     candidates = sorted(candidates, key=lambda x: float(x["score"]), reverse=True)
     top = candidates[: max(1, int(scan_cfg.top_n))]
@@ -266,5 +272,7 @@ def scan_market_top_setups(
         "universe_size": int(len(universe)),
         "candidates_found": int(len(candidates)),
         "top_setups": top,
+        "scan_duration_sec": scan_duration_sec,
+        "symbols_scanned": int(len(universe)),
     }
 

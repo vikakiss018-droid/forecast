@@ -26,6 +26,7 @@ EDITABLE_KEYS: tuple[str, ...] = (
     "AUTO_TRADE_PROFIT_CLOSE_PCT",
     "AUTO_TRADE_STOP_LOSS_ROI_USDT",
     "AUTO_TRADE_ALLOW_LEVEL_BREAKOUT",
+    "AUTO_TRADE_ALLOW_TRIANGLE",
     "FORECAST_TOP",
     "FORECAST_BARS",
     "FORECAST_TIMEFRAME",
@@ -39,6 +40,12 @@ SETTINGS_META: list[dict[str, Any]] = [
     {
         "key": "AUTO_TRADE_ALLOW_LEVEL_BREAKOUT",
         "label": "Вход на пробитие уровня (ретест/пробой)",
+        "type": "bool",
+        "group": "trade",
+    },
+    {
+        "key": "AUTO_TRADE_ALLOW_TRIANGLE",
+        "label": "Вход по паттерну triangle",
         "type": "bool",
         "group": "trade",
     },

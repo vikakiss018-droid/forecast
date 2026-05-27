@@ -1223,6 +1223,7 @@ def trader_status() -> dict:
             "profit_close_pct": at.profit_close_pct,
             "stop_loss_roi_usdt": at.stop_loss_roi_usdt,
             "allow_level_breakout": at.allow_level_breakout,
+            "allow_triangle": at.allow_triangle,
         },
         "state": load_trade_state(),
         "trade_history": load_trade_history(40),
@@ -1275,6 +1276,7 @@ def scanner_json(
             "profit_close_pct": at.profit_close_pct,
             "stop_loss_roi_usdt": at.stop_loss_roi_usdt,
             "allow_level_breakout": at.allow_level_breakout,
+            "allow_triangle": at.allow_triangle,
         },
         "state": load_trade_state(),
     }

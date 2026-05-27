@@ -84,4 +84,5 @@ auto_trade:
   max_open_positions: 3
   profit_close_pct: 10
   allow_level_breakout: true
+  allow_triangle: true
   stop_loss_roi_usdt: 0

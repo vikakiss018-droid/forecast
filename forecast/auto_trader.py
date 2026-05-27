@@ -39,6 +39,7 @@ class AutoTradeConfig:
     profit_close_pct: float = 10.0
     stop_loss_roi_usdt: float = 0.0
     allow_level_breakout: bool = True
+    allow_triangle: bool = True
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -79,6 +80,7 @@ def load_auto_trade_config(yaml_cfg: dict[str, Any] | None = None) -> AutoTradeC
         profit_close_pct=float(y.get("profit_close_pct", 10.0)),
         stop_loss_roi_usdt=float(y.get("stop_loss_roi_usdt", 0.0)),
         allow_level_breakout=bool(y.get("allow_level_breakout", True)),
+        allow_triangle=bool(y.get("allow_triangle", True)),
     )
     env_map = {
         "AUTO_TRADE_ENABLED": ("enabled", _env_bool),
@@ -96,6 +98,7 @@ def load_auto_trade_config(yaml_cfg: dict[str, Any] | None = None) -> AutoTradeC
         "AUTO_TRADE_PROFIT_CLOSE_PCT": ("profit_close_pct", _env_float),
         "AUTO_TRADE_STOP_LOSS_ROI_USDT": ("stop_loss_roi_usdt", _env_float),
         "AUTO_TRADE_ALLOW_LEVEL_BREAKOUT": ("allow_level_breakout", _env_bool),
+        "AUTO_TRADE_ALLOW_TRIANGLE": ("allow_triangle", _env_bool),
     }
     for env_name, (attr, fn) in env_map.items():
         if os.environ.get(env_name, "").strip():
@@ -253,31 +256,52 @@ def pick_best_setup(report: dict[str, Any]) -> dict[str, Any] | None:
     return setups[0] if setups else None
 
 
-def pick_trade_candidate(
+def pick_trade_candidates(
     report: dict[str, Any],
     cfg: AutoTradeConfig,
-) -> tuple[dict[str, Any] | None, str]:
+) -> tuple[list[dict[str, Any]], str]:
     """
-    First setup in top-N that passes trade filters (not only rank #1).
+    All setups in top-N that pass trade filters (in rank order).
     Entry is always market price on the exchange; stop/TP from the plan.
     """
     n = max(1, int(cfg.pick_from_top_n))
     setups = list(report.get("top_setups") or [])[:n]
     if not setups:
-        return None, "NO_SETUP"
+        return [], "NO_SETUP"
+    qualified: list[dict[str, Any]] = []
     last_reason = "NO_SETUP"
     for rank, cand in enumerate(setups, start=1):
         ok, reason = validate_setup(cand, cfg)
         if ok:
             out = dict(cand)
             out["_trade_rank"] = rank
-            return out, "OK"
-        last_reason = f"#{rank}:{reason}"
-        print(
-            f"[auto_trade] skip rank {rank} {cand.get('symbol')} score={cand.get('score')} ({reason})",
-            flush=True,
-        )
-    return None, f"NO_QUALIFIED_IN_TOP{n} (last {last_reason})"
+            qualified.append(out)
+        else:
+            last_reason = f"#{rank}:{reason}"
+            print(
+                f"[auto_trade] skip rank {rank} {cand.get('symbol')} score={cand.get('score')} ({reason})",
+                flush=True,
+            )
+    if qualified:
+        return qualified, "OK"
+    return [], f"NO_QUALIFIED_IN_TOP{n} (last {last_reason})"
+
+
+def pick_trade_candidate(
+    report: dict[str, Any],
+    cfg: AutoTradeConfig,
+) -> tuple[dict[str, Any] | None, str]:
+    """First qualified setup in top-N (legacy / display)."""
+    candidates, reason = pick_trade_candidates(report, cfg)
+    if candidates:
+        return candidates[0], "OK"
+    return None, reason
+
+
+def is_triangle_candidate(candidate: dict[str, Any]) -> bool:
+    """Сетап с паттерном triangle (не открывать, если allow_triangle=false)."""
+    pat = str(candidate.get("pattern") or "").lower().replace("_", " ").strip()
+    return pat == "triangle" or "triangle" in pat.split()
 
 
 def is_level_breakout_candidate(candidate: dict[str, Any]) -> bool:
@@ -307,6 +331,8 @@ def _normalize_side(direction: str) -> str:
 def validate_setup(candidate: dict[str, Any], cfg: AutoTradeConfig) -> tuple[bool, str]:
     if not cfg.allow_level_breakout and is_level_breakout_candidate(candidate):
         return False, "BREAKOUT_LEVEL_DISABLED"
+    if not cfg.allow_triangle and is_triangle_candidate(candidate):
+        return False, "TRIANGLE_DISABLED"
     setup = candidate.get("setup") or {}
     side = _normalize_side(str(setup.get("direction", "")))
     if side not in ("long", "short"):
@@ -817,76 +843,44 @@ def execute_futures_trade(
     }
 
 
-def maybe_run_auto_trade(
-    report: dict[str, Any] | None = None,
+def _log_trade_attempt(state: dict[str, Any], cfg: AutoTradeConfig, res: dict[str, Any]) -> None:
+    append_trade_history(
+        state,
+        {
+            "action": res.get("action"),
+            "reason": res.get("reason"),
+            "symbol": res.get("symbol"),
+            "side": res.get("side"),
+            "dry_run": cfg.dry_run,
+            "notional_usdt": res.get("notional_usdt"),
+            "rank": res.get("trade_rank"),
+        },
+    )
+
+
+def _try_open_candidate(
+    exchange: Any,
+    state: dict[str, Any],
+    cfg: AutoTradeConfig,
+    candidate: dict[str, Any],
     *,
-    yaml_cfg: dict[str, Any] | None = None,
+    free_usdt: float,
 ) -> dict[str, Any]:
-    load_dotenv(override=False)
-    cfg = load_auto_trade_config(yaml_cfg)
-    result: dict[str, Any] = {"action": "skipped", "reason": "DISABLED"}
-    if not cfg.enabled:
-        print("[auto_trade] disabled (set AUTO_TRADE_ENABLED=true)", flush=True)
-        return result
-
-    state = load_trade_state()
-    exchange = create_trading_client(use_futures=True)
-    state = _sync_open_positions(exchange, state, cfg)
-    _apply_auto_closes(exchange, state, cfg)
-    state = _sync_open_positions(exchange, state, cfg)
-    save_trade_state(state)
-
-    def _finish(res: dict[str, Any]) -> dict[str, Any]:
-        append_trade_history(
-            state,
-            {
-                "action": res.get("action"),
-                "reason": res.get("reason"),
-                "symbol": res.get("symbol"),
-                "side": res.get("side"),
-                "dry_run": cfg.dry_run,
-                "notional_usdt": res.get("notional_usdt"),
-                "rank": res.get("trade_rank"),
-            },
-        )
-        save_trade_state(state)
-        return res
-
-    if report is None:
-        cached = load_scan_result()
-        report = (cached or {}).get("report") or {}
-
-    candidate, pick_reason = pick_trade_candidate(report, cfg)
-    if not candidate:
-        result = {"action": "skipped", "reason": pick_reason}
-        print(f"[auto_trade] {result['reason']}", flush=True)
-        return _finish(result)
-
+    """Try to open one position; does not check cooldown or global max (caller does)."""
     symbol = str(candidate["symbol"])
     trade_rank = int(candidate.get("_trade_rank", 1))
     setup = candidate["setup"]
     side = _normalize_side(str(setup.get("direction", "")))
-
-    if _open_positions_count(state) >= int(cfg.max_open_positions):
-        result = {
-            "action": "skipped",
-            "reason": f"MAX_OPEN_POSITIONS:{_open_positions_count(state)}/{cfg.max_open_positions}",
-        }
-        print(f"[auto_trade] {result['reason']}", flush=True)
-        return _finish(result)
-    if _cooldown_active(state, cfg):
-        result = {"action": "skipped", "reason": "COOLDOWN"}
-        print(f"[auto_trade] {result['reason']}", flush=True)
-        return _finish(result)
-
     fsym = _futures_symbol(exchange, symbol)
-    if _has_symbol_open(state, fsym) or _fetch_open_position(exchange, fsym):
-        result = {"action": "skipped", "reason": "SYMBOL_ALREADY_OPEN", "symbol": fsym}
-        print(f"[auto_trade] {result['reason']}", flush=True)
-        return _finish(result)
 
-    bal = exchange.fetch_balance()
-    free_usdt = float((bal.get("free") or {}).get("USDT", 0.0) or 0.0)
+    if _has_symbol_open(state, fsym) or _fetch_open_position(exchange, fsym):
+        return {
+            "action": "skipped",
+            "reason": "SYMBOL_ALREADY_OPEN",
+            "symbol": fsym,
+            "trade_rank": trade_rank,
+        }
+
     notional = _notional_usdt(
         free_usdt=free_usdt,
         entry=float(setup["entry"]),
@@ -894,9 +888,13 @@ def maybe_run_auto_trade(
         cfg=cfg,
     )
     if notional <= 0:
-        result = {"action": "skipped", "reason": "ZERO_SIZE", "free_usdt": free_usdt}
-        print(f"[auto_trade] {result}", flush=True)
-        return _finish(result)
+        return {
+            "action": "skipped",
+            "reason": "ZERO_SIZE",
+            "symbol": symbol,
+            "trade_rank": trade_rank,
+            "free_usdt": free_usdt,
+        }
 
     print(
         f"[auto_trade] {'DRY_RUN' if cfg.dry_run else 'LIVE'} FUTURES {side.upper()} {symbol} "
@@ -913,9 +911,15 @@ def maybe_run_auto_trade(
         cfg=cfg,
     )
     if not exec_result.get("ok"):
-        result = {"action": "failed", **exec_result}
-        print(f"[auto_trade] {result}", flush=True)
-        return _finish(result)
+        reason = str(exec_result.get("reason") or "")
+        soft_skip = reason.startswith("NOTIONAL_BELOW_MIN") or reason.startswith("AMOUNT_TOO_SMALL")
+        return {
+            "action": "skipped" if soft_skip else "failed",
+            "symbol": symbol,
+            "side": side,
+            "trade_rank": trade_rank,
+            **exec_result,
+        }
 
     now = datetime.now(timezone.utc).isoformat()
     meta = _setup_metadata_from_candidate(candidate)
@@ -945,7 +949,7 @@ def maybe_run_auto_trade(
                 **meta,
             }
         )
-    elif cfg.dry_run:
+    else:
         state.setdefault("open_positions", []).append(
             {
                 "symbol": symbol,
@@ -963,18 +967,131 @@ def maybe_run_auto_trade(
         "dry_run": cfg.dry_run,
         "at": now,
     }
-
-    result = {
-        "action": "dry_run" if cfg.dry_run else "executed",
+    action = "dry_run" if cfg.dry_run else "executed"
+    print(f"[auto_trade] done {action} {side} {symbol}", flush=True)
+    return {
+        "action": action,
         "symbol": symbol,
         "side": side,
         "trade_rank": trade_rank,
-        "pick_from_top_n": cfg.pick_from_top_n,
+        "notional_usdt": notional,
         **exec_result,
     }
-    print(f"[auto_trade] done {result.get('action')} {side} {symbol}", flush=True)
-    result["notional_usdt"] = notional
-    return _finish(result)
+
+
+def maybe_run_auto_trade(
+    report: dict[str, Any] | None = None,
+    *,
+    yaml_cfg: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    load_dotenv(override=False)
+    cfg = load_auto_trade_config(yaml_cfg)
+    result: dict[str, Any] = {"action": "skipped", "reason": "DISABLED", "opened_count": 0, "attempts": []}
+    if not cfg.enabled:
+        print("[auto_trade] disabled (set AUTO_TRADE_ENABLED=true)", flush=True)
+        return result
+
+    state = load_trade_state()
+    exchange = create_trading_client(use_futures=True)
+    state = _sync_open_positions(exchange, state, cfg)
+    _apply_auto_closes(exchange, state, cfg)
+    state = _sync_open_positions(exchange, state, cfg)
+    save_trade_state(state)
+
+    if report is None:
+        cached = load_scan_result()
+        report = (cached or {}).get("report") or {}
+
+    candidates, pick_reason = pick_trade_candidates(report, cfg)
+    if not candidates:
+        result = {"action": "skipped", "reason": pick_reason, "opened_count": 0, "attempts": []}
+        print(f"[auto_trade] {result['reason']}", flush=True)
+        _log_trade_attempt(state, cfg, result)
+        save_trade_state(state)
+        return result
+
+    if _cooldown_active(state, cfg):
+        result = {"action": "skipped", "reason": "COOLDOWN", "opened_count": 0, "attempts": []}
+        print(f"[auto_trade] {result['reason']}", flush=True)
+        _log_trade_attempt(state, cfg, result)
+        save_trade_state(state)
+        return result
+
+    max_pos = int(cfg.max_open_positions)
+    attempts: list[dict[str, Any]] = []
+    opened: list[dict[str, Any]] = []
+    seen_symbols: set[str] = set()
+
+    for candidate in candidates:
+        if _open_positions_count(state) >= max_pos:
+            attempts.append(
+                {
+                    "action": "skipped",
+                    "reason": f"MAX_OPEN_POSITIONS:{_open_positions_count(state)}/{max_pos}",
+                    "symbol": candidate.get("symbol"),
+                }
+            )
+            break
+
+        symbol = str(candidate["symbol"])
+        if symbol in seen_symbols:
+            continue
+        seen_symbols.add(symbol)
+
+        try:
+            bal = exchange.fetch_balance()
+            free_usdt = float((bal.get("free") or {}).get("USDT", 0.0) or 0.0)
+        except Exception as e:
+            one = {"action": "failed", "reason": f"BALANCE_FETCH:{e}", "symbol": symbol}
+            attempts.append(one)
+            _log_trade_attempt(state, cfg, one)
+            break
+
+        one = _try_open_candidate(exchange, state, cfg, candidate, free_usdt=free_usdt)
+        attempts.append(one)
+        _log_trade_attempt(state, cfg, one)
+
+        if one.get("action") in ("executed", "dry_run"):
+            opened.append(one)
+            continue
+        # Skip to next candidate on soft rejects (size, symbol open, notional min, etc.)
+        if one.get("action") == "failed":
+            break
+
+    opened_count = len(opened)
+    if opened_count > 0:
+        action = "dry_run" if cfg.dry_run else "executed"
+        symbols = [o.get("symbol") for o in opened]
+        result = {
+            "action": action,
+            "reason": f"OPENED_{opened_count}",
+            "opened_count": opened_count,
+            "symbols": symbols,
+            "symbol": symbols[0],
+            "side": opened[0].get("side"),
+            "trade_rank": opened[0].get("trade_rank"),
+            "pick_from_top_n": cfg.pick_from_top_n,
+            "attempts": attempts,
+            **{k: opened[-1][k] for k in ("notional_usdt",) if k in opened[-1]},
+        }
+        print(f"[auto_trade] scan batch: opened {opened_count} — {', '.join(str(s) for s in symbols)}", flush=True)
+    elif attempts:
+        last = attempts[-1]
+        result = {
+            "action": last.get("action", "skipped"),
+            "reason": last.get("reason"),
+            "opened_count": 0,
+            "symbol": last.get("symbol"),
+            "side": last.get("side"),
+            "trade_rank": last.get("trade_rank"),
+            "attempts": attempts,
+        }
+        print(f"[auto_trade] {result.get('action')} {result.get('reason')}", flush=True)
+    else:
+        result = {"action": "skipped", "reason": pick_reason, "opened_count": 0, "attempts": []}
+
+    save_trade_state(state)
+    return result
 
 
 def run_from_cache(yaml_cfg: dict[str, Any] | None = None) -> dict[str, Any]:

@@ -100,7 +100,12 @@ def main() -> int:
         flush=True,
     )
     trade_result = maybe_run_auto_trade(report, yaml_cfg=auto_yaml)
-    print(f"[scan] auto_trade: {trade_result.get('action')} {trade_result.get('reason', '')}", flush=True)
+    opened_n = trade_result.get("opened_count", 0)
+    print(
+        f"[scan] auto_trade: {trade_result.get('action')} opened={opened_n} "
+        f"{trade_result.get('reason', '')}",
+        flush=True,
+    )
     return 0
 
 
