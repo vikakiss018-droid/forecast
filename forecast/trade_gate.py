@@ -414,10 +414,10 @@ def evaluate_trade_gate(
             e5 = float(ema_50_bar)
             if not np.all(np.isfinite([c, e2, e5])):
                 return False, ["strict trend: NaN close/ema20/ema50"], STRICT_TREND_EMA_BLOCK
-            if not (c > e5 > e2):
+            if not (c > e2 > e5):
                 return (
                     False,
-                    [f"strict trend failed: close {c:.6g} vs ema50 {e5:.6g}, ema20 {e2:.6g}"],
+                    [f"strict trend failed: close {c:.6g} vs ema20 {e2:.6g}, ema50 {e5:.6g}"],
                     STRICT_TREND_EMA_BLOCK,
                 )
         if cfg.rsi_max_long is not None and np.isfinite(float(rsi_bar)):
@@ -484,10 +484,10 @@ def evaluate_trade_gate(
             e5 = float(ema_50_bar)
             if not np.all(np.isfinite([c, e2, e5])):
                 return False, ["strict trend: NaN close/ema20/ema50"], STRICT_TREND_EMA_BLOCK
-            if not (c < e5 < e2):
+            if not (c < e2 < e5):
                 return (
                     False,
-                    [f"strict trend failed (short): close {c:.6g} vs ema50 {e5:.6g}, ema20 {e2:.6g}"],
+                    [f"strict trend failed (short): close {c:.6g} vs ema20 {e2:.6g}, ema50 {e5:.6g}"],
                     STRICT_TREND_EMA_BLOCK,
                 )
         if cfg.rsi_min_short is not None and np.isfinite(float(rsi_bar)):
@@ -552,10 +552,10 @@ def evaluate_trade_gate(
             e5 = float(ema_50_bar)
             if not np.all(np.isfinite([c, e2, e5])):
                 return False, ["strict trend: NaN close/ema20/ema50"], STRICT_TREND_EMA_BLOCK
-            if not (c > e5 > e2):
+            if not (c > e2 > e5):
                 return (
                     False,
-                    [f"strict trend failed: close {c:.6g} vs ema50 {e5:.6g}, ema20 {e2:.6g}"],
+                    [f"strict trend failed: close {c:.6g} vs ema20 {e2:.6g}, ema50 {e5:.6g}"],
                     STRICT_TREND_EMA_BLOCK,
                 )
         if cfg.rsi_max_long is not None and np.isfinite(float(rsi_bar)):
@@ -607,10 +607,10 @@ def evaluate_trade_gate(
             e5 = float(ema_50_bar)
             if not np.all(np.isfinite([c, e2, e5])):
                 return False, ["strict trend: NaN close/ema20/ema50"], STRICT_TREND_EMA_BLOCK
-            if not (c < e5 < e2):
+            if not (c < e2 < e5):
                 return (
                     False,
-                    [f"strict trend failed (short): close {c:.6g} vs ema50 {e5:.6g}, ema20 {e2:.6g}"],
+                    [f"strict trend failed (short): close {c:.6g} vs ema20 {e2:.6g}, ema50 {e5:.6g}"],
                     STRICT_TREND_EMA_BLOCK,
                 )
         if cfg.rsi_min_short is not None and np.isfinite(float(rsi_bar)):

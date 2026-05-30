@@ -44,6 +44,7 @@ from .futures_account import compute_bot_stats, fetch_futures_account_snapshot
 from .scan_cache import load_scan_history, load_scan_result, report_from_cache
 from .env_config import SETTINGS_META, update_env_values
 from .panel_auth import PANEL_AUTH_DEPS
+from .position_chart import build_position_chart_html
 from .scanner_panel import render_closed_trades_dashboard, render_scanner_dashboard
 from .trade_gate import GateMode, TradeGateConfig, evaluate_trade_gate
 
@@ -1224,6 +1225,8 @@ def trader_status() -> dict:
             "stop_loss_roi_usdt": at.stop_loss_roi_usdt,
             "allow_level_breakout": at.allow_level_breakout,
             "allow_triangle": at.allow_triangle,
+            "allowed_hours": at.allowed_hours,
+            "min_atr_pct": at.min_atr_pct,
         },
         "state": load_trade_state(),
         "trade_history": load_trade_history(40),
@@ -1277,6 +1280,8 @@ def scanner_json(
             "stop_loss_roi_usdt": at.stop_loss_roi_usdt,
             "allow_level_breakout": at.allow_level_breakout,
             "allow_triangle": at.allow_triangle,
+            "allowed_hours": at.allowed_hours,
+            "min_atr_pct": at.min_atr_pct,
         },
         "state": load_trade_state(),
     }
@@ -1344,6 +1349,28 @@ async def trader_close_position(request: Request) -> RedirectResponse:
             msg = f"close_error={html.escape(str(e))}"
     sep = "&" if return_q else ""
     return RedirectResponse(url=f"/scanner?{return_q}{sep}{msg}", status_code=303)
+
+
+@app.get("/trader/chart", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
+def trader_position_chart(
+    symbol: str,
+    timeframe: str = "1h",
+    side: str = "long",
+    bars: int = 120,
+    entry: float | None = None,
+    stop: float | None = None,
+    tp: float | None = None,
+) -> str:
+    """Candlestick chart for an open position (embedded in panel iframe)."""
+    return build_position_chart_html(
+        symbol=symbol,
+        timeframe=timeframe,
+        entry=entry,
+        stop=stop,
+        take_profit=tp,
+        side=side,
+        bars=bars,
+    )
 
 
 @app.get("/scanner", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)

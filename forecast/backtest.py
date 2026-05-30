@@ -107,8 +107,10 @@ def run_simple_backtest(
 
 def _calendar_date_key(ts) -> object:
     t = pd.Timestamp(ts)
-    if t.tzinfo is not None:
-        return t.tz_convert("UTC").date()
+    if t.tzinfo is None:
+        t = t.tz_localize("UTC")
+    else:
+        t = t.tz_convert("UTC")
     return t.date()
 
 

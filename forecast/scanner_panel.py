@@ -5,6 +5,10 @@ from __future__ import annotations
 import html
 from datetime import datetime
 from typing import Any
+from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
+
+MSK = ZoneInfo("Europe/Moscow")
 
 from .auto_trader import AutoTradeConfig, load_closed_trades, load_trade_history, load_trade_state
 from .binance_client import trading_credentials_source
@@ -20,7 +24,10 @@ def _fmt_ts(iso: str | None) -> str:
         return "—"
     try:
         dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        return dt.strftime("%Y-%m-%d %H:%M UTC")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+        dt = dt.astimezone(MSK)
+        return dt.strftime("%Y-%m-%d %H:%M MSK")
     except ValueError:
         return _e(iso)
 
@@ -401,18 +408,18 @@ def _trader_config_cards(at: AutoTradeConfig) -> str:
             "Паттерн triangle",
             "Разрешён" if at.allow_triangle else "Отключён",
         ),
+        (
+            "Часы входа (UTC)",
+            f"{at.allowed_hours[0]}-{at.allowed_hours[1]}" if at.allowed_hours else "Все",
+        ),
+        (
+            "Min ATR",
+            f"{at.min_atr_pct * 100:.2f}%" if at.min_atr_pct > 0 else "Выкл",
+        ),
     ]
     return "".join(
         f'<div class="cfg-card"><span>{_e(k)}</span><strong>{_e(v)}</strong></div>' for k, v in items
     )
-
-
-def _pnl_class(v: float) -> str:
-    if v > 0:
-        return "pnl-pos"
-    if v < 0:
-        return "pnl-neg"
-    return ""
 
 
 def _balance_section(account: dict[str, Any]) -> str:
@@ -562,7 +569,43 @@ def _settings_form_html(*, return_q: str, saved_msg: str | None = None) -> str:
     </section>"""
 
 
-def _open_positions_section(state: dict[str, Any], at: AutoTradeConfig, *, return_q: str) -> str:
+def _position_chart_url(op: dict[str, Any], *, timeframe: str, bars: int = 120) -> str:
+    symbol = str(op.get("symbol") or "").strip()
+    if not symbol:
+        return ""
+    params: dict[str, str | int | float] = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "side": str(op.get("side") or "long"),
+        "bars": max(40, min(int(bars), 500)),
+    }
+    for key, fields in (
+        ("entry", ("entry_price", "entry")),
+        ("stop", ("stop",)),
+        ("tp", ("take_profit",)),
+    ):
+        val = None
+        for f in fields:
+            try:
+                x = float(op.get(f) or 0)
+                if x > 0 and x == x:
+                    val = x
+                    break
+            except (TypeError, ValueError):
+                continue
+        if val is not None:
+            params[key] = val
+    return f"/trader/chart?{urlencode(params)}"
+
+
+def _open_positions_section(
+    state: dict[str, Any],
+    at: AutoTradeConfig,
+    *,
+    return_q: str,
+    timeframe: str = "1h",
+    chart_bars: int = 120,
+) -> str:
     positions = list(state.get("open_positions") or [])
     max_n = int(at.max_open_positions)
     if not positions:
@@ -594,6 +637,15 @@ def _open_positions_section(state: dict[str, Any], at: AutoTradeConfig, *, retur
         elif dry or at.dry_run:
             close_html = '<span class="muted">Dry-run — закрытие недоступно</span>'
 
+        chart_url = _position_chart_url(op, timeframe=timeframe, bars=chart_bars)
+        chart_html = ""
+        if chart_url:
+            chart_html = f"""
+        <div class="pos-chart-wrap">
+          <iframe class="pos-chart-frame" title="График {_e(op.get('symbol'))}"
+            src="{_e(chart_url)}" loading="lazy"></iframe>
+        </div>"""
+
         cards.append(
             f"""
       <div class="pos-card pos-open">
@@ -602,6 +654,7 @@ def _open_positions_section(state: dict[str, Any], at: AutoTradeConfig, *, retur
           {_direction_badge(str(op.get('side', '')))}
           {close_html}
         </div>
+        {chart_html}
         <div class="pos-grid">
           <div><label>Futures</label><strong class="mono">{_e(fsym)}</strong></div>
           <div><label>Открыта</label><span class="mono">{_fmt_ts(op.get('opened_at'))}</span></div>
@@ -854,6 +907,11 @@ def render_scanner_dashboard(
     }}
     .pos-head h3 {{ margin: 0; flex: 1; min-width: 120px; }}
     .pos-close-form {{ margin: 0; }}
+    .pos-chart-wrap {{
+      margin: 0 0 12px; border-radius: 10px; overflow: hidden;
+      border: 1px solid var(--border); background: #0b1020;
+    }}
+    .pos-chart-frame {{ display: block; width: 100%; height: 280px; border: none; }}
     footer {{ text-align: center; color: var(--muted); font-size: 0.78rem; margin-top: 24px; }}
   </style>
 </head>
@@ -910,7 +968,7 @@ def render_scanner_dashboard(
       </section>
       <section>
         <h2>Открытые позиции бота</h2>
-        {_open_positions_section(trade_state, at, return_q=base_q)}
+        {_open_positions_section(trade_state, at, return_q=base_q, timeframe=timeframe, chart_bars=min(int(bars), 200))}
       </section>
     </div>
 

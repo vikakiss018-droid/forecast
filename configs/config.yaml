@@ -85,4 +85,6 @@ auto_trade:
   profit_close_pct: 10
   allow_level_breakout: true
   allow_triangle: true
+  allowed_hours: "8-20"
+  min_atr_pct: 0.008
   stop_loss_roi_usdt: 0

@@ -40,6 +40,8 @@ class AutoTradeConfig:
     stop_loss_roi_usdt: float = 0.0
     allow_level_breakout: bool = True
     allow_triangle: bool = True
+    allowed_hours: tuple[int, int] | None = None
+    min_atr_pct: float = 0.008
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -57,6 +59,30 @@ def _env_float(name: str, default: float) -> float:
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name, "").strip()
     return int(raw) if raw else default
+
+
+def _parse_allowed_hours(raw: str) -> tuple[int, int] | None:
+    """Parse '8-20' UTC window; empty/all = no filter."""
+    text = raw.strip()
+    if not text or text.lower() in ("all", "*", "none", "0-24", "00-24", "24"):
+        return None
+    if "-" not in text:
+        return None
+    start_s, end_s = text.split("-", 1)
+    start = int(start_s.strip())
+    end = int(end_s.strip())
+    if not (0 <= start <= 23 and 0 <= end <= 23):
+        raise ValueError(f"allowed_hours out of range 0-23: {raw}")
+    return start, end
+
+
+def _in_allowed_hours(hour: int, window: tuple[int, int] | None) -> bool:
+    if window is None:
+        return True
+    start, end = window
+    if start <= end:
+        return start <= hour <= end
+    return hour >= start or hour <= end
 
 
 def load_auto_trade_config(yaml_cfg: dict[str, Any] | None = None) -> AutoTradeConfig:
@@ -81,7 +107,11 @@ def load_auto_trade_config(yaml_cfg: dict[str, Any] | None = None) -> AutoTradeC
         stop_loss_roi_usdt=float(y.get("stop_loss_roi_usdt", 0.0)),
         allow_level_breakout=bool(y.get("allow_level_breakout", True)),
         allow_triangle=bool(y.get("allow_triangle", True)),
+        min_atr_pct=float(y.get("min_atr_pct", 0.008)),
     )
+    ah_raw = y.get("allowed_hours")
+    if ah_raw is not None and str(ah_raw).strip():
+        base.allowed_hours = _parse_allowed_hours(str(ah_raw))
     env_map = {
         "AUTO_TRADE_ENABLED": ("enabled", _env_bool),
         "AUTO_TRADE_DRY_RUN": ("dry_run", _env_bool),
@@ -99,10 +129,14 @@ def load_auto_trade_config(yaml_cfg: dict[str, Any] | None = None) -> AutoTradeC
         "AUTO_TRADE_STOP_LOSS_ROI_USDT": ("stop_loss_roi_usdt", _env_float),
         "AUTO_TRADE_ALLOW_LEVEL_BREAKOUT": ("allow_level_breakout", _env_bool),
         "AUTO_TRADE_ALLOW_TRIANGLE": ("allow_triangle", _env_bool),
+        "AUTO_TRADE_MIN_ATR_PCT": ("min_atr_pct", _env_float),
     }
     for env_name, (attr, fn) in env_map.items():
         if os.environ.get(env_name, "").strip():
             setattr(base, attr, fn(env_name, getattr(base, attr)))
+    ah_env = os.environ.get("AUTO_TRADE_ALLOWED_HOURS", "").strip()
+    if ah_env:
+        base.allowed_hours = _parse_allowed_hours(ah_env)
     mm = os.environ.get("AUTO_TRADE_MARGIN_MODE", "").strip().lower()
     if mm:
         base.margin_mode = mm
@@ -175,6 +209,8 @@ def _setup_metadata_from_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         "probability_pct": setup.get("probability_pct"),
         "risk_reward": setup.get("risk_reward"),
         "why_selected": candidate.get("why_selected"),
+        "vol_s_up": candidate.get("vol_s_up"),
+        "vol_s_down": candidate.get("vol_s_down"),
         "trade_rank": candidate.get("_trade_rank"),
     }
 
@@ -356,6 +392,38 @@ def validate_setup(candidate: dict[str, Any], cfg: AutoTradeConfig) -> tuple[boo
         return False, "BAD_STOP_LONG"
     if side == "short" and stop <= entry:
         return False, "BAD_STOP_SHORT"
+
+    vol_up = candidate.get("vol_s_up")
+    vol_down = candidate.get("vol_s_down")
+    if vol_up is not None and vol_down is not None:
+        try:
+            vu = float(vol_up)
+            vd = float(vol_down)
+            if side == "long" and vd > vu + 0.15:
+                return False, "VOLUME_AGAINST_LONG"
+            if side == "short" and vu > vd + 0.15:
+                return False, "VOLUME_AGAINST_SHORT"
+        except (TypeError, ValueError):
+            pass
+    else:
+        print(
+            f"[auto_trade] validate_setup {candidate.get('symbol')}: vol_s_up/down missing, skipping vol check",
+            flush=True,
+        )
+
+    if side == "short" and candidate.get("short_near_support"):
+        return False, "SHORT_NEAR_SUPPORT"
+
+    if cfg.min_atr_pct > 0:
+        atr_pct = candidate.get("atr_pct")
+        if atr_pct is not None:
+            try:
+                ap = float(atr_pct)
+                if ap < cfg.min_atr_pct:
+                    return False, f"LOW_VOLATILITY:{ap:.4f}<{cfg.min_atr_pct}"
+            except (TypeError, ValueError):
+                pass
+
     return True, "OK"
 
 
@@ -387,6 +455,21 @@ def _market_limits(exchange: Any, symbol: str) -> tuple[float, float]:
     min_cost = float(((m.get("limits") or {}).get("cost") or {}).get("min") or 5.0)
     min_amount = float(((m.get("limits") or {}).get("amount") or {}).get("min") or 0.0)
     return min_cost, min_amount
+
+
+def _estimate_entry_price(exchange: Any, futures_symbol: str, fallback: float) -> float:
+    """Last/mark price for sizing before market fill."""
+    try:
+        ticker = exchange.fetch_ticker(futures_symbol)
+        for key in ("last", "close", "mark"):
+            val = ticker.get(key)
+            if val is not None:
+                px = float(val)
+                if px > 0 and px == px:
+                    return px
+    except Exception as e:
+        print(f"[auto_trade] fetch_ticker {futures_symbol} warning: {e}", flush=True)
+    return max(float(fallback), 1e-12)
 
 
 def _notional_usdt(
@@ -477,7 +560,9 @@ def _sync_open_positions(exchange: Any, state: dict[str, Any], cfg: AutoTradeCon
         kept.append(row)
     if len(kept) < len(state.get("open_positions") or []):
         state["last_close_reason"] = "position_closed"
-        state["last_close_at"] = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
+        state["last_close_at"] = now
+        state["last_trade_at"] = now
     state["open_positions"] = kept
     state.pop("open", None)
     return state
@@ -765,7 +850,8 @@ def execute_futures_trade(
     if notional_usdt < min_cost:
         return {"ok": False, "reason": f"NOTIONAL_BELOW_MIN:{notional_usdt:.2f}<{min_cost}"}
 
-    amount_raw = notional_usdt / max(entry, 1e-12)
+    mark_entry = _estimate_entry_price(exchange, fsym, entry)
+    amount_raw = notional_usdt / max(mark_entry, 1e-12)
     amount = float(exchange.amount_to_precision(fsym, amount_raw))
     if amount < min_amount:
         return {"ok": False, "reason": f"AMOUNT_TOO_SMALL:{amount}<{min_amount}"}
@@ -793,10 +879,19 @@ def execute_futures_trade(
 
     entry_order = exchange.create_order(fsym, "market", open_side, amount)
     filled = float(entry_order.get("filled") or amount)
-    entry_price = float(entry_order.get("average") or entry_order.get("price") or entry)
+    entry_price = float(entry_order.get("average") or entry_order.get("price") or mark_entry)
     amount = float(exchange.amount_to_precision(fsym, filled))
     if amount < min_amount:
         return {"ok": False, "reason": "FILLED_TOO_SMALL", "entry_order": entry_order}
+
+    planned_risk = abs(entry - stop) / max(entry, 1e-12)
+    real_risk = abs(entry_price - stop) / max(entry_price, 1e-12)
+    if real_risk > planned_risk * 1.25:
+        print(
+            f"[auto_trade] warn {fsym}: fill risk {real_risk:.2%} vs planned {planned_risk:.2%} "
+            f"(entry {entry_price} plan {entry})",
+            flush=True,
+        )
 
     stop_p = exchange.price_to_precision(fsym, stop)
     tp_p = exchange.price_to_precision(fsym, tp)
@@ -883,7 +978,7 @@ def _try_open_candidate(
 
     notional = _notional_usdt(
         free_usdt=free_usdt,
-        entry=float(setup["entry"]),
+        entry=_estimate_entry_price(exchange, fsym, float(setup["entry"])),
         stop=float(setup["stop"]),
         cfg=cfg,
     )
@@ -1001,6 +1096,20 @@ def maybe_run_auto_trade(
     if report is None:
         cached = load_scan_result()
         report = (cached or {}).get("report") or {}
+
+    now_h = datetime.now(timezone.utc).hour
+    if cfg.allowed_hours is not None and not _in_allowed_hours(now_h, cfg.allowed_hours):
+        start, end = cfg.allowed_hours
+        result = {
+            "action": "skipped",
+            "reason": f"OFF_HOURS:{now_h} not in {start}-{end} UTC",
+            "opened_count": 0,
+            "attempts": [],
+        }
+        print(f"[auto_trade] {result['reason']}", flush=True)
+        _log_trade_attempt(state, cfg, result)
+        save_trade_state(state)
+        return result
 
     candidates, pick_reason = pick_trade_candidates(report, cfg)
     if not candidates:
