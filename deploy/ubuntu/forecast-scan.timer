@@ -1,9 +1,9 @@
 [Unit]
-Description=Run forecast market scan every 15 minutes
+Description=Run forecast trend scan hourly (after 1h candle close)
 
 [Timer]
-OnBootSec=3min
-OnUnitActiveSec=15min
+OnBootSec=5min
+OnCalendar=*:03:00
 AccuracySec=1min
 Persistent=true
 Unit=forecast-scan.service

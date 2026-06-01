@@ -184,9 +184,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--optimize-csv", type=str, default=None)
     parser.add_argument("--optimize-coarse", action="store_true", help="Smaller search grid (faster).")
     parser.add_argument(
+        "--trend-spot",
+        action="store_true",
+        help=(
+            "Основной цикл: скан 50 filtered пар (тренд 1h) + auto_trade на Binance spot. "
+            "То же, что python -m forecast.run_scheduled_scan"
+        ),
+    )
+    parser.add_argument(
         "--market-scan",
         action="store_true",
-        help="Run 4-stage market scan over Binance USDT spot pairs and print top setups.",
+        help="Legacy: kNN market scan over Binance USDT spot pairs.",
     )
     parser.add_argument("--scan-top", type=int, default=5, help="Top setups to return.")
     parser.add_argument("--scan-bars", type=int, default=320, help="Bars per symbol for scan.")
@@ -214,6 +222,11 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    if getattr(args, "trend_spot", False):
+        from .run_scheduled_scan import main as trend_main
+
+        raise SystemExit(trend_main())
+
     if getattr(args, "market_scan", False):
         app_cfg = load_config(args.config)
         rep = scan_market_top_setups(

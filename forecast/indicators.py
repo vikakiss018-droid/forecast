@@ -8,7 +8,7 @@ def add_basic_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Add a basic set of technical indicators using ta."""
     df = df.copy()
 
-    # Trend indicators
+    # Trend indicators (scanner / legacy paths)
     df["ema_20"] = ta.trend.EMAIndicator(close=df["close"], window=20).ema_indicator()
     df["ema_50"] = ta.trend.EMAIndicator(close=df["close"], window=50).ema_indicator()
     df["ema_200"] = ta.trend.EMAIndicator(close=df["close"], window=200).ema_indicator()

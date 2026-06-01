@@ -1,6 +1,5 @@
 exchange: binance
 symbol: BTC/USDT
-# Целевой ТФ стратегии: 4H (BTC/ETH). Здесь 1h — для быстрых локальных прогонов; для продакшена поменять на 4h.
 timeframe: 1h
 limit: 3000
 use_futures: false
@@ -19,13 +18,6 @@ backtest:
   threshold_long: 0.54
   threshold_short: 0.44
 
-# Целевая логика (спецификация): среднесрок 4H, только по тренду; long при close>EMA200 и EMA50>EMA200;
-# вход после пробоя high за 20 свечей с подтверждением объёмом; RSI14 не покупать перегрето; SL 1.5×ATR14;
-# риск 0.5–1% депозита; тейк 2R–3R или trailing; желателен BTC market filter. Ниже — промежуточный trade_gate kNN-пайплайна.
-#
-# Про «нулевые сделки»: S_distance (ликвидность) с σ=0.003 часто даёт малые значения; высокий liq_hard_min
-# отсеивает почти всё первым. Одновременно 1.5× объём + trade_with_trend_only + строгое EMA + EV>0
-# оставляет слишком узкое пересечение — см. gate_reason_distribution в analytics.
 trade_gate:
   use_ev_metrics_in_gate: true
   use_ev_gate: true
@@ -37,13 +29,11 @@ trade_gate:
   rsi_min_short: 30
   max_price_ema50_atr_mult: 2.0
   weak_breakout_edge_ratio: 1.05
-  # Доп. к trade_with_trend_only; при true часто «добивает» оставшиеся кандидаты (см. STRICT_TREND_EMA_BLOCK).
   strict_trend_ema_alignment: false
   trend_ema_drift: null
   cooldown_bars_after_trade: 8
   block_same_direction_reentry_bars: 8
   max_trades_per_calendar_day: 1
-  # Режим: в up/down торгуем по тренду, во флэте разрешаем от уровней.
   trade_with_trend_only: true
   long_only: false
   use_support_resistance_filter: true
@@ -52,7 +42,6 @@ trade_gate:
   prob_edge_min_size: 0.0
   prob_edge_power: 1.0
   comb_prob_min: 0.55
-  # Было 0.095 → ~50% баров только из-за этого; держите согласованно с формулой S_distance в signal_combiner.
   liq_hard_min: 0.03
   expected_move_vs_cost_mult: 1.6
   expected_move_vs_natr_mult: 1.1
@@ -67,24 +56,61 @@ trade_gate:
   min_effective_neighbors_gate: null
   min_ev_vol_ratio: null
 
-# Автоторговля: Binance USDT-M Futures, long/short по direction из сканера.
+# Эталонный прогон (утверждён): python -m forecast.run_multi_symbol_backtest
+# MULTI_BT_USE_FILTERED=1 MULTI_BT_DEPOSIT=300 MULTI_BT_RISK_PCT=0.5 MULTI_BT_TARGET_TRADES=100
+# → ~+16.86 R, win ~87%, PF ~4.3 (long+short, spot/1x, без капа в отчёте PnL)
+reference_backtest:
+  deposit_usdt: 300
+  risk_pct: 0.5
+  target_trades: 100
+  symbols: 50_filtered
+  timeframe: 1h
+  bars: 1000
+  stage1_min_score: 18
+  stage1_relax_score: 12
+  long_short: true
+  leverage: 1
+  fee_r_per_trade: 0.08
+  trend_lookback: 60
+  min_move_pct: 0.008
+  min_rel_volume: 1.2
+  tp_target_pct: 0.04
+  max_hold_bars_1h: 48
+  cooldown_bars_same_symbol: 4
+
+# Live-скан + systemd (каждый час :03 UTC) — максимально как бэктест, spot long only
+trend_scan:
+  timeframe: 1h
+  bars: 1000
+  top_n: 20
+  stage1_min_score: 18
+  use_filtered: true
+  long_only: true
+  use_closed_bar_only: true
+  min_prob_pct: 50
+  lookback: 60
+  min_move_pct: 0.008
+  min_rel_volume: 1.2
+  block_asian_session: false
+
 auto_trade:
   enabled: false
   dry_run: true
-  min_score: 55
-  min_probability_pct: 55
+  market_type: spot
+  spot_allow_short: false
+  min_score: 18
+  min_probability_pct: 50
   min_risk_reward: 1.5
   risk_pct_of_balance: 0.5
   max_notional_usdt: 50
-  cooldown_minutes: 240
-  leverage: 5
-  margin_mode: isolated
+  cooldown_minutes: 0
+  leverage: 1
   use_target_2: true
-  pick_from_top_n: 4
-  max_open_positions: 3
-  profit_close_pct: 10
-  allow_level_breakout: true
-  allow_triangle: true
-  allowed_hours: "8-20"
-  min_atr_pct: 0.008
+  pick_from_top_n: 10
+  max_open_positions: 6
+  profit_close_pct: 0
+  allow_level_breakout: false
+  allow_triangle: false
+  allowed_hours: ""
+  min_atr_pct: 0
   stop_loss_roi_usdt: 0

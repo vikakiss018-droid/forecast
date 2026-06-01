@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from .main import load_config, run_pipeline
@@ -31,7 +31,7 @@ from .signal_combiner import (
 from .orderflow_stream import start_orderbook_stream, get_liquidity_snapshot
 from .backtest_analytics import ev_bucket_label
 from .ev_calibration import load_ev_calibration
-from .market_scanner import ScanConfig, scan_market_top_setups
+from .trend_scanner import TrendScanConfig, scan_trend_filtered_setups, trend_scan_config_from_env
 from .auto_trader import (
     close_position_from_panel,
     load_auto_trade_config,
@@ -45,7 +45,8 @@ from .scan_cache import load_scan_history, load_scan_result, report_from_cache
 from .env_config import SETTINGS_META, update_env_values
 from .panel_auth import PANEL_AUTH_DEPS
 from .position_chart import build_position_chart_html
-from .scanner_panel import render_closed_trades_dashboard, render_scanner_dashboard
+from .scanner_panel import render_closed_trades_dashboard, render_scanner_dashboard, render_tf_backtest_dashboard
+from .tf_backtest import load_tf_backtest_result, run_timeframe_study_background
 from .trade_gate import GateMode, TradeGateConfig, evaluate_trade_gate
 
 
@@ -1154,6 +1155,28 @@ def multi() -> str:
     return html
 
 
+def _trend_scan_cfg_from_request(
+    *,
+    top: int,
+    bars: int,
+    timeframe: str,
+    stage1_min_score: float,
+) -> TrendScanConfig:
+    """Параметры как у run_scheduled_scan (50 filtered, тренд 1h)."""
+    base = trend_scan_config_from_env()
+    return TrendScanConfig(
+        timeframe=(timeframe or base.timeframe).strip() or "1h",
+        bars=int(bars) if bars > 0 else base.bars,
+        top_n=int(top) if top > 0 else base.top_n,
+        stage1_min_score=float(stage1_min_score),
+        min_probability_pct=base.min_probability_pct,
+        trend_params=base.trend_params,
+        use_filtered_symbols=base.use_filtered_symbols,
+        symbols=base.symbols,
+        long_only=base.long_only,
+    )
+
+
 def _scanner_report(
     *,
     top: int,
@@ -1163,7 +1186,8 @@ def _scanner_report(
     max_symbols: int | None,
     live: bool,
 ) -> tuple[dict, str | None, bool]:
-    """Return (report, updated_at, from_cache)."""
+    """Return (report, updated_at, from_cache). Тренд-скан 50 пар (не kNN)."""
+    _ = max_symbols  # legacy query param; список пар из symbol_ranking_filtered_r05_win50.json
     if not live:
         cached = load_scan_result()
         if cached is not None:
@@ -1171,17 +1195,22 @@ def _scanner_report(
             rep["cache_source"] = True
             return rep, updated, True
 
-    cfg = load_config("configs/config.yaml")
-    rep = scan_market_top_setups(
-        similarity_cfg=cfg.similarity,
-        scan_cfg=ScanConfig(
-            timeframe=timeframe,
-            bars=int(bars),
-            top_n=int(top),
-            stage1_min_score=float(stage1_min_score),
-            max_symbols=max_symbols,
-        ),
+    scan_cfg = _trend_scan_cfg_from_request(
+        top=top,
+        bars=bars,
+        timeframe=timeframe,
+        stage1_min_score=stage1_min_score,
     )
+    auto_cfg = load_auto_trade_config(_auto_trade_yaml())
+    rep = scan_trend_filtered_setups(scan_cfg, auto_cfg=auto_cfg)
+    if rep.get("status") == "error":
+        rep = {
+            "mode": "trend_momentum",
+            "top_setups": [],
+            "candidates_found": 0,
+            "error": rep.get("error"),
+            "symbols_scanned": 0,
+        }
     rep["cache_source"] = False
     return rep, None, False
 
@@ -1217,7 +1246,9 @@ def trader_status() -> dict:
             "cooldown_minutes": at.cooldown_minutes,
             "leverage": at.leverage,
             "margin_mode": at.margin_mode,
-            "market": "futures",
+            "market_type": at.market_type,
+            "spot_allow_short": at.spot_allow_short,
+            "market": at.market_type,
             "api_credentials": trading_credentials_source(),
             "pick_from_top_n": at.pick_from_top_n,
             "max_open_positions": at.max_open_positions,
@@ -1239,14 +1270,14 @@ def trader_status() -> dict:
 
 @app.get("/scanner/json", dependencies=PANEL_AUTH_DEPS)
 def scanner_json(
-    top: int = 5,
-    bars: int = 320,
+    top: int = 20,
+    bars: int = 1000,
     timeframe: str = "1h",
-    stage1_min_score: float = 20.0,
-    max_symbols: int | None = 60,
+    stage1_min_score: float = 18.0,
+    max_symbols: int | None = None,
     live: bool = False,
 ) -> dict:
-    """Structured output of 4-stage market scanner (cached unless live=1)."""
+    """Тренд-скан 50 filtered пар (cached unless live=1)."""
     rep, updated_at, from_cache = _scanner_report(
         top=top,
         bars=bars,
@@ -1272,7 +1303,9 @@ def scanner_json(
             "leverage": at.leverage,
             "margin_mode": at.margin_mode,
             "cooldown_minutes": at.cooldown_minutes,
-            "market": "futures",
+            "market_type": at.market_type,
+            "spot_allow_short": at.spot_allow_short,
+            "market": at.market_type,
             "api_credentials": trading_credentials_source(),
             "pick_from_top_n": at.pick_from_top_n,
             "max_open_positions": at.max_open_positions,
@@ -1373,21 +1406,38 @@ def trader_position_chart(
     )
 
 
+@app.post("/scanner/tf-study/run", dependencies=PANEL_AUTH_DEPS)
+async def run_tf_study_endpoint(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    """Start multi-timeframe backtest in background (heavy)."""
+    form = await request.form()
+    return_q = str(form.get("return_q", "")).strip()
+    cur = load_tf_backtest_result()
+    if cur.get("status") == "running":
+        msg = "tf_busy=1"
+    else:
+        background_tasks.add_task(run_timeframe_study_background, _auto_trade_yaml())
+        msg = "tf_started=1"
+    sep = "&" if return_q else ""
+    return RedirectResponse(url=f"/scanner?tab=tfstudy&{return_q}{sep}{msg}", status_code=303)
+
+
 @app.get("/scanner", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
 def scanner_panel(
     tab: str = "scan",
-    top: int = 10,
-    bars: int = 320,
+    top: int = 20,
+    bars: int = 1000,
     timeframe: str = "1h",
-    stage1_min_score: float = 20.0,
-    max_symbols: int | None = 60,
+    stage1_min_score: float = 18.0,
+    max_symbols: int | None = None,
     live: bool = False,
     saved: str | None = None,
     error: str | None = None,
     closed: str | None = None,
     close_error: str | None = None,
+    tf_started: str | None = None,
+    tf_busy: str | None = None,
 ) -> str:
-    """Dashboard: scanner setups, futures auto-trader, history."""
+    """Dashboard: тренд-скан 50 пар, spot auto-trader, history."""
     max_symbols_q = "" if max_symbols is None else str(max_symbols)
     base_q = (
         f"top={int(top)}&bars={int(bars)}&timeframe={html.escape(timeframe)}"
@@ -1408,6 +1458,18 @@ def scanner_panel(
             closed_trades=load_closed_trades(100),
             base_q=base_q,
             saved_msg=saved_msg,
+        )
+
+    if tab.strip().lower() == "tfstudy":
+        tf_msg = saved_msg
+        if tf_started == "1":
+            tf_msg = "Тест таймфреймов запущен в фоне — обновите страницу через 15–40 мин"
+        elif tf_busy == "1":
+            tf_msg = "Тест уже выполняется"
+        return render_tf_backtest_dashboard(
+            result=load_tf_backtest_result(),
+            base_q=base_q,
+            msg=tf_msg,
         )
 
     rep, updated_at, from_cache = _scanner_report(

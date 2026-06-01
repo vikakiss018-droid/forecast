@@ -1,6 +1,6 @@
 # Развёртывание на Ubuntu (VPS 2 CPU / 2 GB)
 
-Сканер работает **в фоне каждые 15 минут** и пишет кэш в `data/processed/market_scan_latest.json`.  
+Сканер работает **в фоне каждый час в :03 UTC** (после закрытия 1h-свечи) и пишет кэш в `data/processed/market_scan_latest.json`.  
 Веб-панель **читает кэш** (быстро), не гоняет полный скан на каждый запрос.
 
 ## 1. Подготовка сервера
@@ -47,7 +47,7 @@ sudo bash deploy/ubuntu/install.sh
 
 Скрипт создаёт пользователя `forecast`, venv, включает:
 - `forecast-api` — uvicorn на порту **8000**
-- `forecast-scan.timer` — скан **каждые 15 минут**
+- `forecast-scan.timer` — тренд-скан **каждый час в :03 UTC**
 
 Настройки скана: `/opt/forecast/deploy/ubuntu/forecast.env` (скопирован из `forecast.env.example`).
 
@@ -103,16 +103,25 @@ sudo ufw enable
 ```bash
 cd /opt/forecast
 source .venv/bin/activate
-export FORECAST_MAX_SYMBOLS=100 FORECAST_TOP=10
+# Параметры — configs/config.yaml (секции reference_backtest, trend_scan, auto_trade)
+# Сверьте .env с .env.example перед запуском
 python -m forecast.run_scheduled_scan
+```
+
+Таймер systemd: **каждый час в :03 UTC** (`forecast-scan.timer`), не каждые 15 мин — как закрытие 1h-свечи в бэктесте.
+
+Перед первым запуском сгенерируйте список 50 пар:
+
+```bash
+python -m forecast.run_symbol_ranking
 ```
 
 ## Автоторговля (опционально)
 
-После скана открывается позиция на **Binance USDT-M Futures**: **Long** или **Short** по полю `direction` лучшего сетапа.
+После тренд-скана открывается позиция на **Binance Spot** (**long only**), топ-N сетапов из 50 filtered пар.
 
-1. В Binance API: **Enable Futures** (без Withdraw).
-2. На фьючерсном счёте переведите USDT (Transfer → Futures).
+1. В Binance API: **Enable Spot & Margin Trading** (без Withdraw).
+2. USDT на спотовом кошельке.
 3. В `/opt/forecast/.env` — **отдельный торговый ключ** (рекомендуется):
 
 ```bash
@@ -127,10 +136,14 @@ BINANCE_TRADE_API_SECRET=ваш_новый_секрет
 ```bash
 AUTO_TRADE_ENABLED=true
 AUTO_TRADE_DRY_RUN=true
-AUTO_TRADE_MAX_NOTIONAL_USDT=30
+AUTO_TRADE_MARKET=spot
+AUTO_TRADE_MIN_SCORE=18
+AUTO_TRADE_MIN_PROB_PCT=50
+AUTO_TRADE_MAX_NOTIONAL_USDT=50
 AUTO_TRADE_RISK_PCT=0.5
-AUTO_TRADE_LEVERAGE=5
-AUTO_TRADE_MARGIN_MODE=isolated
+AUTO_TRADE_LEVERAGE=1
+FORECAST_USE_FILTERED=1
+FORECAST_LONG_ONLY=1
 ```
 
 4. Dry-run: `sudo -u forecast .venv/bin/python -m forecast.run_auto_trade`

@@ -33,12 +33,27 @@ EDITABLE_KEYS: tuple[str, ...] = (
     "FORECAST_BARS",
     "FORECAST_TIMEFRAME",
     "FORECAST_STAGE1_MIN_SCORE",
-    "FORECAST_MAX_SYMBOLS",
+    "FORECAST_USE_FILTERED",
+    "FORECAST_USE_CLOSED_BAR",
+    "FORECAST_LONG_ONLY",
+    "FORECAST_MIN_PROB_PCT",
+    "AUTO_TRADE_MARKET",
+    "AUTO_TRADE_SPOT_ALLOW_SHORT",
+    "TREND_LOOKBACK",
+    "TREND_MIN_MOVE_PCT",
+    "TREND_MIN_REL_VOLUME",
 )
 
 SETTINGS_META: list[dict[str, Any]] = [
     {"key": "AUTO_TRADE_ENABLED", "label": "Автоторговля включена", "type": "bool", "group": "trade"},
     {"key": "AUTO_TRADE_DRY_RUN", "label": "Dry-run (без ордеров)", "type": "bool", "group": "trade"},
+    {"key": "AUTO_TRADE_MARKET", "label": "Рынок (spot / futures)", "type": "str", "group": "trade"},
+    {
+        "key": "AUTO_TRADE_SPOT_ALLOW_SHORT",
+        "label": "Spot: разрешить short (не реализовано)",
+        "type": "bool",
+        "group": "trade",
+    },
     {
         "key": "AUTO_TRADE_ALLOW_LEVEL_BREAKOUT",
         "label": "Вход на пробитие уровня (ретест/пробой)",
@@ -84,7 +99,13 @@ SETTINGS_META: list[dict[str, Any]] = [
     {"key": "FORECAST_BARS", "label": "Скан: bars", "type": "int", "group": "scan"},
     {"key": "FORECAST_TIMEFRAME", "label": "Скан: таймфрейм", "type": "str", "group": "scan"},
     {"key": "FORECAST_STAGE1_MIN_SCORE", "label": "Скан: stage1 min", "type": "float", "group": "scan"},
-    {"key": "FORECAST_MAX_SYMBOLS", "label": "Скан: max symbols (пусто=all)", "type": "str", "group": "scan"},
+    {"key": "FORECAST_USE_FILTERED", "label": "Скан: 50 filtered пар", "type": "bool", "group": "scan"},
+    {"key": "FORECAST_USE_CLOSED_BAR", "label": "Скан: только закрытая 1h свеча", "type": "bool", "group": "scan"},
+    {"key": "FORECAST_LONG_ONLY", "label": "Скан: только long", "type": "bool", "group": "scan"},
+    {"key": "FORECAST_MIN_PROB_PCT", "label": "Скан: min prob %", "type": "float", "group": "scan"},
+    {"key": "TREND_LOOKBACK", "label": "Тренд: lookback баров", "type": "int", "group": "scan"},
+    {"key": "TREND_MIN_MOVE_PCT", "label": "Тренд: min move (0.008)", "type": "float", "group": "scan"},
+    {"key": "TREND_MIN_REL_VOLUME", "label": "Тренд: min rel volume", "type": "float", "group": "scan"},
 ]
 
 _ENV_LINE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")

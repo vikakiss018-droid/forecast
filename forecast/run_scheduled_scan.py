@@ -1,13 +1,18 @@
 """
-Scheduled market scan — run via systemd timer or cron every 15 minutes.
+Основной цикл: тренд 1h по 50 парам (symbol_ranking_filtered_r05_win50.json), торговля на Binance spot.
 
-Environment variables (optional):
-  FORECAST_CONFIG          path to config.yaml (default: configs/config.yaml)
-  FORECAST_TOP             default 10
-  FORECAST_BARS            default 320
-  FORECAST_TIMEFRAME       default from config or 1h
-  FORECAST_STAGE1_MIN_SCORE default 20
-  FORECAST_MAX_SYMBOLS     default 100; set empty for full universe
+Запуск (cron / systemd каждый час :03 UTC):
+  python -m forecast.run_scheduled_scan
+
+Переменные окружения:
+  FORECAST_CONFIG              configs/config.yaml
+  FORECAST_USE_FILTERED=1      50 пар из filtered JSON (по умолчанию)
+  FORECAST_TIMEFRAME=1h
+  FORECAST_BARS=1000
+  FORECAST_TOP=20              сколько сетапов в отчёте
+  FORECAST_STAGE1_MIN_SCORE=18
+  AUTO_TRADE_MARKET=spot
+  AUTO_TRADE_ENABLED / AUTO_TRADE_DRY_RUN
 """
 
 from __future__ import annotations
@@ -18,91 +23,93 @@ from pathlib import Path
 
 import yaml
 
-from .auto_trader import manage_open_positions, maybe_run_auto_trade
-from .main import load_config
-from .market_scanner import ScanConfig, scan_market_top_setups
+from .auto_trader import load_auto_trade_config, manage_open_positions, maybe_run_auto_trade
 from .paths import CONFIGS_DIR, load_project_env
+from .run_symbol_ranking import load_filtered_symbols
 from .scan_cache import save_scan_result
+from .trend_scanner import scan_trend_filtered_setups, trend_scan_config_from_env
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    return int(raw)
-
-
-def _env_max_symbols() -> int | None:
-    raw = os.environ.get("FORECAST_MAX_SYMBOLS", "100").strip()
-    if raw.lower() in ("", "none", "all", "0"):
-        return None
-    return int(raw)
+def _load_auto_trade_yaml(config_path: str) -> dict:
+    cfg_path = Path(config_path)
+    if not cfg_path.is_absolute():
+        cfg_path = CONFIGS_DIR.parent / config_path
+    if not cfg_path.is_file():
+        return {}
+    with cfg_path.open(encoding="utf-8") as f:
+        return (yaml.safe_load(f) or {}).get("auto_trade") or {}
 
 
 def main() -> int:
     load_project_env(force=True)
     config_path = os.environ.get("FORECAST_CONFIG", "configs/config.yaml")
-    cfg = load_config(config_path)
+    scan_cfg = trend_scan_config_from_env()
+    auto_yaml = _load_auto_trade_yaml(config_path)
+    auto_cfg = load_auto_trade_config(auto_yaml)
 
-    timeframe = os.environ.get("FORECAST_TIMEFRAME", "").strip() or cfg.timeframe
-    top_n = _env_int("FORECAST_TOP", 10)
-    bars = _env_int("FORECAST_BARS", 320)
-    stage1 = float(os.environ.get("FORECAST_STAGE1_MIN_SCORE", "20"))
-    max_sym = _env_max_symbols()
+    symbols = scan_cfg.symbols or ()
+    if not symbols and scan_cfg.use_filtered_symbols:
+        symbols = load_filtered_symbols()
 
-    scan_cfg = ScanConfig(
-        timeframe=timeframe,
-        bars=bars,
-        top_n=top_n,
-        stage1_min_score=stage1,
-        max_symbols=max_sym,
-    )
+    if not symbols:
+        print(
+            "[trend] ERROR: нет символов. Запустите run_symbol_ranking или задайте FORECAST_SYMBOLS",
+            flush=True,
+        )
+        return 1
 
     print(
-        f"[scan] starting timeframe={timeframe} bars={bars} top={top_n} "
-        f"stage1>={stage1} max_symbols={max_sym or 'ALL'}",
+        f"[trend] scan {len(symbols)} pairs ({'filtered R>0.5 win>50%' if scan_cfg.use_filtered_symbols else 'custom'}), "
+        f"{scan_cfg.timeframe} stage1>={scan_cfg.stage1_min_score} "
+        f"TP=4% rel_vol>={scan_cfg.trend_params.min_rel_volume if scan_cfg.trend_params else 1.2}; "
+        f"trade market={auto_cfg.market_type} dry_run={auto_cfg.dry_run}",
         flush=True,
     )
-    report = scan_market_top_setups(similarity_cfg=cfg.similarity, scan_cfg=scan_cfg)
+
+    report = scan_trend_filtered_setups(scan_cfg, auto_cfg=auto_cfg)
+    if report.get("status") == "error":
+        print(f"[trend] scan failed: {report.get('error')}", flush=True)
+        return 1
+
     path = save_scan_result(
         report,
         scan_config={
-            "timeframe": timeframe,
-            "bars": bars,
-            "top_n": top_n,
-            "stage1_min_score": stage1,
-            "max_symbols": max_sym,
+            "mode": "trend_momentum",
+            "timeframe": scan_cfg.timeframe,
+            "bars": scan_cfg.bars or None,
+            "top_n": scan_cfg.top_n,
+            "stage1_min_score": scan_cfg.stage1_min_score,
+            "symbols_count": len(symbols),
+            "use_filtered": scan_cfg.use_filtered_symbols,
             "scan_duration_sec": report.get("scan_duration_sec"),
-            "symbols_scanned": report.get("symbols_scanned"),
+            "candidates_found": report.get("candidates_found"),
         },
     )
-    n = len(report.get("top_setups", []))
-    dur = report.get("scan_duration_sec")
-    sym_n = report.get("symbols_scanned", report.get("universe_size"))
+    n_top = len(report.get("top_setups") or [])
     print(
-        f"[scan] done candidates={report.get('candidates_found')} "
-        f"top={n} pairs={sym_n} duration_sec={dur} saved={path}",
+        f"[trend] done candidates={report.get('candidates_found')} top={n_top} "
+        f"duration_sec={report.get('scan_duration_sec')} saved={path}",
         flush=True,
     )
+    for row in (report.get("top_setups") or [])[:5]:
+        plan = row.get("setup") or {}
+        print(
+            f"  · {row.get('symbol')} {plan.get('direction')} score={row.get('score')} "
+            f"RR={plan.get('risk_reward')}",
+            flush=True,
+        )
 
-    auto_yaml: dict = {}
-    cfg_path = Path(config_path)
-    if not cfg_path.is_absolute():
-        cfg_path = CONFIGS_DIR.parent / config_path
-    if cfg_path.is_file():
-        with open(cfg_path, encoding="utf-8") as f:
-            auto_yaml = (yaml.safe_load(f) or {}).get("auto_trade") or {}
     pos_result = manage_open_positions(yaml_cfg=auto_yaml)
     print(
-        f"[scan] positions open={pos_result.get('open_count')} "
+        f"[trend] positions open={pos_result.get('open_count')} "
         f"profit_closed={len(pos_result.get('profit_closed') or [])} "
         f"loss_closed={len(pos_result.get('loss_closed') or [])}",
         flush=True,
     )
+
     trade_result = maybe_run_auto_trade(report, yaml_cfg=auto_yaml)
-    opened_n = trade_result.get("opened_count", 0)
     print(
-        f"[scan] auto_trade: {trade_result.get('action')} opened={opened_n} "
+        f"[trend] auto_trade: {trade_result.get('action')} opened={trade_result.get('opened_count', 0)} "
         f"{trade_result.get('reason', '')}",
         flush=True,
     )

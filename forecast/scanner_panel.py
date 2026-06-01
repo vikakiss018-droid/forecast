@@ -59,6 +59,300 @@ def _direction_badge(direction: str) -> str:
     return _badge(direction or "—", "muted")
 
 
+def _panel_fonts_link() -> str:
+    return (
+        '<link rel="preconnect" href="https://fonts.googleapis.com">'
+        '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+        '<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800'
+        '&family=Quicksand:wght@500;600;700&display=swap" rel="stylesheet">'
+    )
+
+
+def _panel_theme_css(*, full: bool = False) -> str:
+    """Сисси / аниме / feminine — общие стили панели."""
+    extra = ""
+    if full:
+        extra = """
+    .balance-section h2 .hint { font-size: 0.72rem; color: var(--muted); font-weight: 400; }
+    .balance-error { color: #ffb4d0; margin: 0; }
+    .balance-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px;
+    }
+    .balance-card {
+      background: var(--glass); border: 1px solid var(--border); border-radius: 18px; padding: 16px;
+      box-shadow: var(--shadow-soft);
+    }
+    .balance-card label { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; }
+    .balance-card strong { font-size: 1.35rem; display: block; margin-top: 6px; }
+    .balance-card small { font-size: 0.75rem; color: var(--muted); font-weight: 400; }
+    .balance-total {
+      background: linear-gradient(145deg, rgba(255, 158, 207, 0.22) 0%, rgba(167, 139, 250, 0.12) 100%);
+      border-color: rgba(255, 182, 220, 0.45);
+    }
+    .balance-total strong { font-size: 1.6rem; color: var(--accent2); }
+    .chip {
+      display: inline-block; background: var(--glass); border: 1px solid var(--border);
+      padding: 3px 10px; border-radius: 999px; font-size: 0.75rem; margin: 2px 4px 2px 0;
+    }
+    .skip-reasons { margin: 12px 0 0; font-size: 0.82rem; }
+    .hero {
+      background: linear-gradient(135deg, rgba(255, 182, 220, 0.18) 0%, rgba(196, 181, 253, 0.14) 55%, rgba(255, 240, 248, 0.06) 100%);
+      border: 1px solid rgba(255, 182, 220, 0.35); border-radius: 20px; padding: 18px 20px;
+      box-shadow: var(--shadow-soft), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+    }
+    .hero.empty { color: var(--muted); text-align: center; padding: 32px; }
+    .hero-top { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 14px; }
+    .hero-symbol {
+      font-size: 1.65rem; font-weight: 800; font-family: var(--font-display);
+      background: linear-gradient(90deg, #fff0f8, #ffc4e8, #e9d5ff);
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+    .hero-score { margin-left: auto; color: var(--accent2); font-weight: 700; }
+    .hero-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 12px;
+    }
+    .hero-grid label { font-size: 0.7rem; color: var(--muted); text-transform: uppercase; }
+    .hero-why { margin: 14px 0 0; color: var(--muted); font-size: 0.88rem; }
+    .hero-note { margin: 8px 0 0; font-size: 0.82rem; color: var(--accent); }
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
+    .cfg-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px;
+    }
+    .cfg-card {
+      background: var(--glass); border-radius: 14px; padding: 10px 12px; border: 1px solid var(--border);
+    }
+    .cfg-card span { display: block; font-size: 0.68rem; color: var(--muted); text-transform: uppercase; }
+    .cfg-card strong { font-size: 0.9rem; margin-top: 4px; display: block; }
+    .pos-card { border-radius: 18px; padding: 14px; border: 1px solid var(--border); }
+    .pos-open {
+      background: linear-gradient(145deg, rgba(255, 182, 220, 0.12) 0%, rgba(167, 139, 250, 0.08) 100%);
+      border-color: rgba(255, 158, 207, 0.45);
+      box-shadow: 0 0 28px rgba(255, 158, 207, 0.12);
+    }
+    .pos-empty { background: var(--glass); color: var(--muted); }
+    .pos-card h3 { margin: 0 0 10px; font-size: 0.95rem; font-family: var(--font-display); }
+    .pos-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px;
+    }
+    .pos-grid label { font-size: 0.68rem; color: var(--muted); display: block; }
+    .pos-stack { display: flex; flex-direction: column; gap: 12px; }
+    .pos-summary { margin: 0 0 4px; font-size: 0.85rem; color: var(--muted); }
+    .pos-head {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 10px;
+    }
+    .pos-head h3 { margin: 0; flex: 1; min-width: 120px; }
+    .pos-close-form { margin: 0; }
+    .settings-section .settings-hint { color: var(--muted); font-size: 0.85rem; margin: 0 0 14px; }
+    .save-banner { padding: 10px 14px; border-radius: 14px; margin-bottom: 14px; font-size: 0.9rem; }
+    .save-banner.ok {
+      background: rgba(255, 182, 220, 0.15); border: 1px solid rgba(255, 158, 207, 0.4); color: #ffd6ec;
+    }
+    .settings-form .form-group-title { margin: 16px 0 10px; font-size: 0.9rem; color: var(--muted); }
+    .field-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px;
+    }
+    .field { display: flex; flex-direction: column; gap: 6px; }
+    .field span { font-size: 0.75rem; color: var(--muted); }
+    .field input[type="text"] {
+      background: rgba(20, 10, 28, 0.55); border: 1px solid var(--border); border-radius: 12px;
+      color: var(--text); padding: 8px 10px; font-size: 0.88rem;
+    }
+    .bool-field { flex-direction: row; align-items: center; gap: 8px; }
+    .bool-field input { width: auto; accent-color: var(--accent); }
+    .btn-save { margin-top: 16px; cursor: pointer; border: none; }
+    .btn-close {
+      background: rgba(255, 120, 160, 0.18); border-color: rgba(255, 158, 207, 0.5); color: #ffd0e4;
+      cursor: pointer; font-size: 0.8rem; padding: 6px 12px; border-radius: 999px;
+    }
+    .btn-close:hover { background: rgba(255, 120, 160, 0.32); box-shadow: 0 0 16px rgba(255, 120, 160, 0.25); }
+"""
+    return f"""
+    :root {{
+      --bg: #140a18;
+      --bg2: #1f0f28;
+      --surface: rgba(42, 22, 52, 0.72);
+      --surface2: rgba(58, 30, 72, 0.55);
+      --glass: rgba(255, 240, 248, 0.05);
+      --border: rgba(255, 182, 220, 0.28);
+      --text: #fff0f8;
+      --muted: #c9a8d4;
+      --accent: #ff9ecf;
+      --accent2: #e9b8ff;
+      --long: #b8f5d4;
+      --short: #ff9eb8;
+      --warn: #ffd89a;
+      --shadow-soft: 0 8px 32px rgba(255, 120, 180, 0.12);
+      --font-body: "Nunito", "Segoe UI", system-ui, sans-serif;
+      --font-display: "Quicksand", "Nunito", sans-serif;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: var(--font-body);
+      background:
+        radial-gradient(ellipse 900px 520px at 8% -5%, rgba(255, 158, 207, 0.28) 0%, transparent 55%),
+        radial-gradient(ellipse 700px 480px at 95% 0%, rgba(167, 139, 250, 0.22) 0%, transparent 50%),
+        radial-gradient(ellipse 600px 400px at 50% 100%, rgba(255, 182, 220, 0.1) 0%, transparent 45%),
+        linear-gradient(165deg, var(--bg2) 0%, var(--bg) 45%, #0f0812 100%);
+      color: var(--text);
+      line-height: 1.5;
+      min-height: 100vh;
+    }}
+    body::before {{
+      content: "";
+      position: fixed; inset: 0; pointer-events: none; z-index: 0;
+      background-image:
+        radial-gradient(circle at 20% 30%, rgba(255, 255, 255, 0.04) 0 1px, transparent 2px),
+        radial-gradient(circle at 70% 60%, rgba(255, 182, 220, 0.06) 0 1px, transparent 2px);
+      background-size: 48px 48px, 64px 64px;
+      opacity: 0.5;
+    }}
+    .wrap {{ position: relative; z-index: 1; max-width: 1440px; margin: 0 auto; padding: 20px 16px 48px; }}
+    header {{
+      display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between;
+      gap: 16px; margin-bottom: 24px;
+      padding: 18px 20px;
+      border-radius: 22px;
+      border: 1px solid rgba(255, 182, 220, 0.25);
+      background: linear-gradient(135deg, rgba(255, 182, 220, 0.1) 0%, rgba(167, 139, 250, 0.08) 100%);
+      box-shadow: var(--shadow-soft);
+    }}
+    h1 {{
+      margin: 0;
+      font-family: var(--font-display);
+      font-size: 1.85rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      background: linear-gradient(92deg, #fff8fc, #ffc8e8 40%, #e9d5ff 85%);
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+    }}
+    h1::after {{ content: " ✦"; font-size: 0.85em; opacity: 0.85; -webkit-text-fill-color: #ffc8e8; }}
+    .subtitle {{ color: var(--muted); font-size: 0.9rem; margin-top: 6px; }}
+    .pills {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
+    .badge {{
+      display: inline-block; padding: 4px 12px; border-radius: 999px;
+      font-size: 0.72rem; font-weight: 700; letter-spacing: 0.05em;
+      font-family: var(--font-display);
+    }}
+    .badge-long {{
+      background: rgba(184, 245, 212, 0.15); color: var(--long);
+      border: 1px solid rgba(184, 245, 212, 0.45);
+      box-shadow: 0 0 12px rgba(184, 245, 212, 0.15);
+    }}
+    .badge-short {{
+      background: rgba(255, 158, 184, 0.18); color: var(--short);
+      border: 1px solid rgba(255, 158, 184, 0.45);
+    }}
+    .badge-ok {{
+      background: rgba(233, 184, 255, 0.18); color: var(--accent2);
+      border: 1px solid rgba(233, 184, 255, 0.4);
+    }}
+    .badge-warn {{
+      background: rgba(255, 216, 154, 0.15); color: var(--warn);
+      border: 1px solid rgba(255, 216, 154, 0.4);
+    }}
+    .badge-bad {{
+      background: rgba(255, 120, 160, 0.2); color: #ffd0e4;
+      border: 1px solid rgba(255, 158, 184, 0.5);
+    }}
+    .badge-muted {{ background: var(--glass); color: var(--muted); border: 1px solid var(--border); }}
+    .actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }}
+    .btn {{
+      border: 1px solid var(--border); background: var(--glass); color: var(--text);
+      padding: 8px 16px; border-radius: 999px; text-decoration: none; font-size: 0.85rem;
+      font-weight: 600; transition: transform 0.15s, box-shadow 0.15s, border-color 0.15s;
+    }}
+    .btn:hover {{
+      transform: translateY(-1px);
+      border-color: var(--accent);
+      box-shadow: 0 4px 20px rgba(255, 158, 207, 0.2);
+    }}
+    .btn-primary {{
+      background: linear-gradient(135deg, #ff9ecf 0%, #c4b5fd 50%, #ffbce8 100%);
+      border-color: transparent; color: #2a1020;
+      box-shadow: 0 4px 24px rgba(255, 158, 207, 0.35);
+    }}
+    .stats {{
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+      gap: 12px; margin-bottom: 20px;
+    }}
+    .stat {{
+      background: var(--glass); border: 1px solid var(--border); border-radius: 18px;
+      padding: 14px 16px; backdrop-filter: blur(8px);
+      box-shadow: var(--shadow-soft);
+    }}
+    .stat label {{
+      display: block; font-size: 0.68rem; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600;
+    }}
+    .stat strong {{ font-size: 1.2rem; display: block; margin-top: 4px; font-family: var(--font-display); }}
+    .pnl-pos {{ color: var(--long) !important; }}
+    .pnl-neg {{ color: var(--short) !important; }}
+    .muted {{ color: var(--muted); }}
+    section {{
+      background: var(--surface); border: 1px solid var(--border); border-radius: 20px;
+      padding: 18px 20px; margin-bottom: 20px;
+      backdrop-filter: blur(10px);
+      box-shadow: var(--shadow-soft);
+    }}
+    section h2 {{
+      margin: 0 0 14px; font-size: 1.05rem; font-weight: 700;
+      font-family: var(--font-display);
+      display: flex; align-items: center; gap: 8px; color: #ffe4f4;
+    }}
+    section h2::before {{
+      content: "♡"; font-size: 0.85em; color: var(--accent); line-height: 1;
+    }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; }}
+    .stop {{ color: var(--short); }}
+    .tp {{ color: var(--long); }}
+    .table-wrap {{
+      overflow-x: auto; border-radius: 14px; border: 1px solid var(--border);
+      background: rgba(15, 8, 20, 0.35);
+    }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 0.8rem; }}
+    th, td {{ padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); }}
+    th {{
+      background: rgba(58, 30, 72, 0.65); color: var(--muted); font-weight: 700;
+      font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em;
+      position: sticky; top: 0;
+    }}
+    tr:hover td {{ background: rgba(255, 158, 207, 0.06); }}
+    tr.rank-1 td {{ background: rgba(255, 182, 220, 0.1); }}
+    td.sym {{ font-weight: 700; color: var(--accent); font-family: var(--font-display); }}
+    td.why {{ max-width: 220px; color: var(--muted); }}
+    td.reason {{ color: var(--muted); max-width: 200px; }}
+    .trend-up {{ color: var(--long); }}
+    .trend-down {{ color: var(--short); }}
+    .trend-range {{ color: var(--warn); }}
+    .empty-cell {{ text-align: center; color: var(--muted); padding: 24px !important; }}
+    .dash-tabs {{ display: flex; gap: 8px; margin: 0 0 20px; flex-wrap: wrap; }}
+    .tab {{
+      padding: 10px 18px; border-radius: 999px; border: 1px solid var(--border);
+      background: var(--glass); color: var(--text); text-decoration: none; font-size: 0.88rem;
+      font-weight: 600; transition: all 0.15s;
+    }}
+    .tab:hover {{ border-color: var(--accent); color: #fff8fc; }}
+    .tab.active {{
+      background: linear-gradient(135deg, #ff9ecf, #c4b5fd);
+      border-color: transparent; color: #2a1020;
+      box-shadow: 0 4px 20px rgba(255, 158, 207, 0.3);
+    }}
+    footer {{
+      text-align: center; color: var(--muted); font-size: 0.78rem; margin-top: 24px;
+    }}
+    footer a {{ color: var(--accent); text-decoration: none; }}
+    footer a:hover {{ text-decoration: underline; color: var(--accent2); }}
+    .save-banner.warn {{
+      background: rgba(255, 216, 154, 0.12); border: 1px solid rgba(255, 216, 154, 0.35); color: var(--warn);
+    }}
+    .save-banner.err {{
+      background: rgba(255, 120, 160, 0.15); border: 1px solid rgba(255, 158, 184, 0.4); color: #ffd0e4;
+    }}
+    {extra}"""
+
+
 def _action_badge(action: str) -> str:
     a = (action or "").lower()
     if a in ("executed", "dry_run"):
@@ -219,10 +513,12 @@ def _pnl_class(v: float | None) -> str:
 def _dashboard_tabs(*, active: str, base_q: str) -> str:
     scan_cls = "tab active" if active == "scan" else "tab"
     closed_cls = "tab active" if active == "closed" else "tab"
+    tf_cls = "tab active" if active == "tfstudy" else "tab"
     return f"""
     <nav class="dash-tabs">
       <a class="{scan_cls}" href="/scanner?{base_q}">Сканер и торговля</a>
       <a class="{closed_cls}" href="/scanner?tab=closed&amp;{base_q}">Закрытые сделки</a>
+      <a class="{tf_cls}" href="/scanner?tab=tfstudy&amp;{base_q}">Тест таймфреймов</a>
     </nav>"""
 
 
@@ -293,55 +589,10 @@ def render_closed_trades_dashboard(
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="refresh" content="900" />
+  <meta http-equiv="refresh" content="3600" />
   <title>Forecast — Закрытые сделки</title>
-  <style>
-    :root {{
-      --bg: #070b14; --surface: #0f1628; --surface2: #141e34; --border: #24304d;
-      --text: #e8edff; --muted: #8b96b8; --accent: #5b8cff; --accent2: #22d3a8;
-      --long: #22c55e; --short: #ef4444;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: var(--bg); color: var(--text); line-height: 1.45;
-    }}
-    .wrap {{ max-width: 1600px; margin: 0 auto; padding: 20px 16px 48px; }}
-    h1 {{ margin: 0; font-size: 1.75rem; }}
-    .subtitle {{ color: var(--muted); font-size: 0.9rem; margin-top: 4px; }}
-    .dash-tabs {{ display: flex; gap: 8px; margin: 16px 0 20px; flex-wrap: wrap; }}
-    .tab {{
-      padding: 10px 16px; border-radius: 10px; border: 1px solid var(--border);
-      background: var(--surface2); color: var(--text); text-decoration: none; font-size: 0.88rem;
-    }}
-    .tab:hover {{ border-color: var(--accent); }}
-    .tab.active {{ background: linear-gradient(135deg, #4f7cff, #3b5bdb); border-color: transparent; }}
-    section {{
-      background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
-      padding: 18px 20px; margin-bottom: 20px;
-    }}
-    section h2 {{ margin: 0 0 14px; font-size: 1.05rem; }}
-    .stats {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; margin-bottom: 20px; }}
-    .stat {{ background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 14px; }}
-    .stat label {{ display: block; font-size: 0.72rem; color: var(--muted); text-transform: uppercase; }}
-    .stat strong {{ font-size: 1.2rem; display: block; margin-top: 4px; }}
-    .table-wrap {{ overflow-x: auto; border-radius: 10px; border: 1px solid var(--border); }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 0.78rem; }}
-    th, td {{ padding: 10px 10px; text-align: left; border-bottom: 1px solid var(--border); }}
-    th {{ background: var(--surface2); color: var(--muted); font-size: 0.68rem; text-transform: uppercase; }}
-    td.sym {{ font-weight: 600; color: var(--accent); }}
-    td.why {{ max-width: 200px; color: var(--muted); }}
-    .empty-cell {{ text-align: center; color: var(--muted); padding: 28px !important; }}
-    .pnl-pos {{ color: var(--long); }} .pnl-neg {{ color: var(--short); }}
-    .trend-up {{ color: var(--long); }} .trend-down {{ color: var(--short); }}
-    .badge {{ display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 0.7rem; font-weight: 600; }}
-    .badge-long {{ background: rgba(34,197,94,.15); color: var(--long); }}
-    .badge-short {{ background: rgba(239,68,68,.15); color: var(--short); }}
-    .badge-muted {{ background: var(--surface2); color: var(--muted); }}
-    .save-banner.ok {{ padding: 10px 14px; border-radius: 10px; margin-bottom: 14px;
-      background: rgba(34,211,168,.12); border: 1px solid rgba(34,211,168,.35); color: var(--accent2); }}
-    footer {{ text-align: center; color: var(--muted); font-size: 0.78rem; margin-top: 24px; }}
-  </style>
+  {_panel_fonts_link()}
+  <style>{_panel_theme_css(full=False)}</style>
 </head>
 <body>
   <div class="wrap">
@@ -368,6 +619,119 @@ def render_closed_trades_dashboard(
       </div>
     </section>
     <footer>Данные: auto_trade_state.json → closed_trades · <a href="/scanner?{base_q}" style="color:var(--accent)">← Сканер</a></footer>
+  </div>
+</body>
+</html>"""
+
+
+def _tf_study_rows(ranking: list[dict[str, Any]]) -> str:
+    if not ranking:
+        return '<tr><td colspan="8" class="empty-cell">Нет данных — запустите тест</td></tr>'
+    rows: list[str] = []
+    for i, r in enumerate(ranking, start=1):
+        pf = r.get("profit_factor")
+        pf_s = _fmt_num(pf, 2) if pf is not None else "—"
+        target_ok = "да" if r.get("target_reached") else "нет"
+        rows.append(
+            f"""
+        <tr class="{'rank-1' if i == 1 else ''}">
+          <td>{i}</td>
+          <td class="sym">{_e(r.get('timeframe'))}</td>
+          <td>{int(r.get('trades') or 0)} / {int(r.get('target') or 100)}</td>
+          <td>{target_ok}</td>
+          <td>{_fmt_num(r.get('win_rate_pct'), 1)}%</td>
+          <td class="{_pnl_class(float(r.get('avg_r') or 0))}">{_fmt_num(r.get('avg_r'), 3)}</td>
+          <td class="{_pnl_class(float(r.get('total_r') or 0))}">{_fmt_num(r.get('total_r'), 2)}</td>
+          <td>{pf_s}</td>
+          <td class="muted">{_e(r.get('best_symbol') or '—')}</td>
+        </tr>"""
+        )
+    return "".join(rows)
+
+
+def render_tf_backtest_dashboard(
+    *,
+    result: dict[str, Any],
+    base_q: str,
+    msg: str | None = None,
+) -> str:
+    status = str(result.get("status") or "idle")
+    ranking = list(result.get("ranking") or [])
+    symbols = ", ".join(result.get("symbols") or [])
+    tfs = ", ".join(result.get("timeframes") or [])
+    best = result.get("best_timeframe") or "—"
+    dur = result.get("duration_sec")
+    finished = _fmt_ts(result.get("finished_at"))
+    started = _fmt_ts(result.get("started_at"))
+
+    banner = ""
+    if msg:
+        banner = f'<p class="save-banner ok">{_e(msg)}</p>'
+    elif status == "running":
+        banner = '<p class="save-banner warn">Тест выполняется… обновите страницу через несколько минут.</p>'
+    elif status == "error":
+        banner = f'<p class="save-banner err">Ошибка: {_e(result.get("error"))}</p>'
+
+    run_disabled = "disabled" if status == "running" else ""
+    note = _e(result.get("note") or "")
+
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Forecast — Тест таймфреймов</title>
+  {_panel_fonts_link()}
+  <style>
+    {_panel_theme_css(full=False)}
+    .wrap {{ max-width: 1100px; }}
+    .hint {{ color: var(--muted); font-size: 0.85rem; margin: 12px 0 20px; line-height: 1.5; }}
+    .btn {{ cursor: pointer; border: none; color: #2a1020; }}
+    .btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Тест таймфреймов</h1>
+      <p class="subtitle">10 волатильных альтов · walk-forward · логика сканера · цель 100 сделок на TF</p>
+    </header>
+    {_dashboard_tabs(active="tfstudy", base_q=base_q)}
+    {banner}
+    <form method="post" action="/scanner/tf-study/run" style="margin-bottom: 12px;">
+      <input type="hidden" name="return_q" value="{_e(base_q)}" />
+      <button type="submit" class="btn" {run_disabled}>Запустить тест (долго, 15–40 мин)</button>
+    </form>
+    <p class="hint">
+      Монеты: {_e(symbols)}.<br/>
+      Таймфреймы: {_e(tfs)}.<br/>
+      {note}<br/>
+      CLI: <code>python -m forecast.run_tf_backtest</code>
+    </p>
+    <div class="stats">
+      <div class="stat"><label>Статус</label><strong>{_e(status)}</strong></div>
+      <div class="stat"><label>Лучший TF</label><strong>{_e(best)}</strong></div>
+      <div class="stat"><label>Завершён</label><strong>{finished}</strong></div>
+      <div class="stat"><label>Длительность</label><strong>{_fmt_num(dur, 0) if dur is not None else '—'} с</strong></div>
+    </div>
+    <section>
+      <h2 style="font-size:1.05rem;margin:0 0 12px;">Рейтинг таймфреймов (по total R)</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th><th>TF</th><th>Сделок</th><th>100?</th><th>Win%</th>
+              <th>Avg R</th><th>Total R</th><th>PF</th><th>Лучшая монета</th>
+            </tr>
+          </thead>
+          <tbody>{_tf_study_rows(ranking)}</tbody>
+        </table>
+      </div>
+    </section>
+    <footer>
+      Кэш: data/processed/tf_backtest_latest.json ·
+      <a href="/scanner?{base_q}" style="color:var(--accent)">← Сканер</a>
+    </footer>
   </div>
 </body>
 </html>"""
@@ -604,7 +968,6 @@ def _open_positions_section(
     *,
     return_q: str,
     timeframe: str = "1h",
-    chart_bars: int = 120,
 ) -> str:
     positions = list(state.get("open_positions") or [])
     max_n = int(at.max_open_positions)
@@ -615,9 +978,12 @@ def _open_positions_section(
           <p>Нет активных позиций в state</p>
         </div>"""
 
+    mkt_label = "Spot" if str(getattr(at, "market_type", "futures")).lower() == "spot" else "Futures"
     cards: list[str] = []
     for op in positions:
         fsym = str(op.get("futures_symbol") or "")
+        spot_sym = str(op.get("symbol") or "")
+        close_key = spot_sym if mkt_label == "Spot" else fsym
         upnl = float(op.get("unrealized_pnl") or 0.0)
         notional = float(op.get("notional_usdt") or 0.0)
         lev = max(1, int(op.get("leverage") or 1))
@@ -626,25 +992,16 @@ def _open_positions_section(
         loss_lim = float(op.get("loss_limit_usdt") or at.stop_loss_roi_usdt or 0.0)
         dry = bool(op.get("dry_run"))
         close_html = ""
-        if fsym and not dry and not at.dry_run:
-            sym_label = _e(op.get("symbol") or fsym)
+        if close_key and not dry and not at.dry_run:
+            sym_label = _e(op.get("symbol") or close_key)
             close_html = f"""
         <form method="post" action="/trader/close" class="pos-close-form" onsubmit="return confirm('Закрыть {sym_label} по рынку?');">
-          <input type="hidden" name="futures_symbol" value="{_e(fsym)}" />
+          <input type="hidden" name="futures_symbol" value="{_e(close_key)}" />
           <input type="hidden" name="return_q" value="{_e(return_q)}" />
           <button type="submit" class="btn btn-close">Закрыть</button>
         </form>"""
         elif dry or at.dry_run:
             close_html = '<span class="muted">Dry-run — закрытие недоступно</span>'
-
-        chart_url = _position_chart_url(op, timeframe=timeframe, bars=chart_bars)
-        chart_html = ""
-        if chart_url:
-            chart_html = f"""
-        <div class="pos-chart-wrap">
-          <iframe class="pos-chart-frame" title="График {_e(op.get('symbol'))}"
-            src="{_e(chart_url)}" loading="lazy"></iframe>
-        </div>"""
 
         cards.append(
             f"""
@@ -654,9 +1011,8 @@ def _open_positions_section(
           {_direction_badge(str(op.get('side', '')))}
           {close_html}
         </div>
-        {chart_html}
         <div class="pos-grid">
-          <div><label>Futures</label><strong class="mono">{_e(fsym)}</strong></div>
+          <div><label>{mkt_label}</label><strong class="mono">{_e(fsym or spot_sym)}</strong></div>
           <div><label>Открыта</label><span class="mono">{_fmt_ts(op.get('opened_at'))}</span></div>
           <div><label>Notional</label><span>{_fmt_num(op.get('notional_usdt'), 1)} USDT</span></div>
           <div><label>Плечо</label><span>{_e(op.get('leverage'))}x</span></div>
@@ -720,212 +1076,31 @@ def render_scanner_dashboard(
     last_close = trade_state.get("last_close_at")
     sym_scanned = int(report.get("symbols_scanned") or report.get("universe_size") or 0)
     scan_dur = report.get("scan_duration_sec")
+    market_label = "Spot 1x" if str(getattr(at, "market_type", "futures")).lower() == "spot" else "Futures"
+    scan_mode = str(report.get("mode") or "scanner")
+    scan_hint = "тренд 50 пар" if scan_mode == "trend_momentum" else "сканер"
 
     return f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="refresh" content="900" />
+  <meta http-equiv="refresh" content="3600" />
   <title>Forecast — Сканер и торговля</title>
-  <style>
-    :root {{
-      --bg: #070b14;
-      --surface: #0f1628;
-      --surface2: #141e34;
-      --border: #24304d;
-      --text: #e8edff;
-      --muted: #8b96b8;
-      --accent: #5b8cff;
-      --accent2: #22d3a8;
-      --long: #22c55e;
-      --short: #ef4444;
-      --warn: #f59e0b;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      font-family: "SF Pro Text", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: radial-gradient(1200px 600px at 10% -10%, #1a2450 0%, transparent 50%),
-                  radial-gradient(900px 500px at 90% 0%, #0d3d35 0%, transparent 45%),
-                  var(--bg);
-      color: var(--text);
-      line-height: 1.45;
-    }}
-    .wrap {{ max-width: 1440px; margin: 0 auto; padding: 20px 16px 48px; }}
-    header {{
-      display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between;
-      gap: 16px; margin-bottom: 24px;
-    }}
-    h1 {{ margin: 0; font-size: 1.75rem; font-weight: 700; letter-spacing: -0.02em; }}
-    .subtitle {{ color: var(--muted); font-size: 0.9rem; margin-top: 4px; }}
-    .pills {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
-    .badge {{
-      display: inline-block; padding: 4px 10px; border-radius: 999px;
-      font-size: 0.72rem; font-weight: 600; letter-spacing: 0.04em;
-    }}
-    .badge-long {{ background: rgba(34,197,94,.15); color: var(--long); border: 1px solid rgba(34,197,94,.35); }}
-    .badge-short {{ background: rgba(239,68,68,.15); color: var(--short); border: 1px solid rgba(239,68,68,.35); }}
-    .badge-ok {{ background: rgba(34,211,168,.12); color: var(--accent2); border: 1px solid rgba(34,211,168,.3); }}
-    .badge-warn {{ background: rgba(245,158,11,.12); color: var(--warn); border: 1px solid rgba(245,158,11,.35); }}
-    .badge-bad {{ background: rgba(239,68,68,.15); color: #fca5a5; border: 1px solid rgba(239,68,68,.4); }}
-    .badge-muted {{ background: var(--surface2); color: var(--muted); border: 1px solid var(--border); }}
-    .actions {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }}
-    .btn {{
-      border: 1px solid var(--border); background: var(--surface2); color: var(--text);
-      padding: 8px 14px; border-radius: 10px; text-decoration: none; font-size: 0.85rem;
-      transition: background .15s, border-color .15s;
-    }}
-    .btn:hover {{ background: #1c2844; border-color: var(--accent); }}
-    .btn-primary {{ background: linear-gradient(135deg, #4f7cff, #3b5bdb); border-color: transparent; }}
-    .stats {{
-      display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
-      gap: 12px; margin-bottom: 20px;
-    }}
-    .stat {{
-      background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
-      padding: 14px 16px;
-    }}
-    .stat label {{ display: block; font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }}
-    .stat strong {{ font-size: 1.25rem; display: block; margin-top: 4px; }}
-    .balance-section h2 .hint {{ font-size: 0.72rem; color: var(--muted); font-weight: 400; }}
-    .balance-error {{ color: #fca5a5; margin: 0; }}
-    .balance-grid {{
-      display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px;
-    }}
-    .balance-card {{
-      background: var(--surface2); border: 1px solid var(--border); border-radius: 14px; padding: 16px;
-    }}
-    .balance-card label {{ font-size: 0.72rem; color: var(--muted); text-transform: uppercase; }}
-    .balance-card strong {{ font-size: 1.35rem; display: block; margin-top: 6px; }}
-    .balance-card small {{ font-size: 0.75rem; color: var(--muted); font-weight: 400; }}
-    .balance-total {{
-      background: linear-gradient(145deg, #1a2d5c 0%, #141e34 100%);
-      border-color: #3d5a9f;
-    }}
-    .balance-total strong {{ font-size: 1.6rem; color: var(--accent2); }}
-    .pnl-pos {{ color: var(--long) !important; }}
-    .pnl-neg {{ color: var(--short) !important; }}
-    .chip {{
-      display: inline-block; background: var(--surface2); border: 1px solid var(--border);
-      padding: 3px 8px; border-radius: 6px; font-size: 0.75rem; margin: 2px 4px 2px 0;
-    }}
-    .skip-reasons {{ margin: 12px 0 0; font-size: 0.82rem; }}
-    .muted {{ color: var(--muted); }}
-    section {{
-      background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
-      padding: 18px 20px; margin-bottom: 20px;
-    }}
-    section h2 {{
-      margin: 0 0 14px; font-size: 1.05rem; font-weight: 600;
-      display: flex; align-items: center; gap: 8px;
-    }}
-    section h2::before {{
-      content: ""; width: 4px; height: 1.1em; background: var(--accent); border-radius: 2px;
-    }}
-    .hero {{
-      background: linear-gradient(145deg, #152040 0%, #0f1628 60%);
-      border: 1px solid #2a3f6f; border-radius: 14px; padding: 18px 20px;
-    }}
-    .hero.empty {{ color: var(--muted); text-align: center; padding: 32px; }}
-    .hero-top {{ display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 14px; }}
-    .hero-symbol {{ font-size: 1.6rem; font-weight: 700; }}
-    .hero-score {{ margin-left: auto; color: var(--accent2); font-weight: 600; }}
-    .hero-grid {{
-      display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
-      gap: 12px;
-    }}
-    .hero-grid label {{ font-size: 0.7rem; color: var(--muted); text-transform: uppercase; }}
-    .hero-why {{ margin: 14px 0 0; color: var(--muted); font-size: 0.88rem; }}
-    .hero-note {{ margin: 8px 0 0; font-size: 0.82rem; color: var(--accent2); }}
-    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; }}
-    .stop {{ color: var(--short); }}
-    .tp {{ color: var(--long); }}
-    .two-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
-    @media (max-width: 900px) {{ .two-col {{ grid-template-columns: 1fr; }} }}
-    .cfg-grid {{
-      display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px;
-    }}
-    .cfg-card {{
-      background: var(--surface2); border-radius: 10px; padding: 10px 12px; border: 1px solid var(--border);
-    }}
-    .cfg-card span {{ display: block; font-size: 0.68rem; color: var(--muted); text-transform: uppercase; }}
-    .cfg-card strong {{ font-size: 0.9rem; margin-top: 4px; display: block; }}
-    .pos-card {{ border-radius: 12px; padding: 14px; border: 1px solid var(--border); }}
-    .pos-open {{ background: rgba(34,211,168,.06); border-color: rgba(34,211,168,.25); }}
-    .pos-empty {{ background: var(--surface2); color: var(--muted); }}
-    .pos-card h3 {{ margin: 0 0 10px; font-size: 0.95rem; }}
-    .pos-grid {{
-      display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px;
-    }}
-    .pos-grid label {{ font-size: 0.68rem; color: var(--muted); display: block; }}
-    .table-wrap {{ overflow-x: auto; border-radius: 10px; border: 1px solid var(--border); }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 0.8rem; }}
-    th, td {{ padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); }}
-    th {{ background: var(--surface2); color: var(--muted); font-weight: 600; font-size: 0.72rem; text-transform: uppercase; letter-spacing: .04em; position: sticky; top: 0; }}
-    tr:hover td {{ background: rgba(91,140,255,.06); }}
-    tr.rank-1 td {{ background: rgba(91,140,255,.08); }}
-    td.sym {{ font-weight: 600; color: var(--accent); }}
-    td.why {{ max-width: 220px; color: var(--muted); }}
-    td.reason {{ color: var(--muted); max-width: 200px; }}
-    .trend-up {{ color: var(--long); }}
-    .trend-down {{ color: var(--short); }}
-    .trend-range {{ color: var(--warn); }}
-    .empty-cell {{ text-align: center; color: var(--muted); padding: 24px !important; }}
-    .settings-section .settings-hint {{ color: var(--muted); font-size: 0.85rem; margin: 0 0 14px; }}
-    .save-banner {{ padding: 10px 14px; border-radius: 10px; margin-bottom: 14px; font-size: 0.9rem; }}
-    .save-banner.ok {{ background: rgba(34,211,168,.12); border: 1px solid rgba(34,211,168,.35); color: var(--accent2); }}
-    .settings-form .form-group-title {{ margin: 16px 0 10px; font-size: 0.9rem; color: var(--muted); }}
-    .field-grid {{
-      display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px;
-    }}
-    .field {{ display: flex; flex-direction: column; gap: 6px; }}
-    .field span {{ font-size: 0.75rem; color: var(--muted); }}
-    .field input[type="text"] {{
-      background: var(--surface2); border: 1px solid var(--border); border-radius: 8px;
-      color: var(--text); padding: 8px 10px; font-size: 0.88rem;
-    }}
-    .bool-field {{ flex-direction: row; align-items: center; gap: 8px; }}
-    .bool-field input {{ width: auto; }}
-    .btn-save {{ margin-top: 16px; cursor: pointer; border: none; }}
-    .dash-tabs {{ display: flex; gap: 8px; margin: 0 0 20px; flex-wrap: wrap; }}
-    .tab {{
-      padding: 10px 16px; border-radius: 10px; border: 1px solid var(--border);
-      background: var(--surface2); color: var(--text); text-decoration: none; font-size: 0.88rem;
-    }}
-    .tab:hover {{ border-color: var(--accent); }}
-    .tab.active {{ background: linear-gradient(135deg, #4f7cff, #3b5bdb); border-color: transparent; }}
-    .btn-close {{
-      background: rgba(239,68,68,.15); border-color: rgba(239,68,68,.45); color: #fca5a5;
-      cursor: pointer; font-size: 0.8rem; padding: 6px 12px;
-    }}
-    .btn-close:hover {{ background: rgba(239,68,68,.28); }}
-    .pos-stack {{ display: flex; flex-direction: column; gap: 12px; }}
-    .pos-summary {{ margin: 0 0 4px; font-size: 0.85rem; color: var(--muted); }}
-    .pos-head {{
-      display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 10px;
-    }}
-    .pos-head h3 {{ margin: 0; flex: 1; min-width: 120px; }}
-    .pos-close-form {{ margin: 0; }}
-    .pos-chart-wrap {{
-      margin: 0 0 12px; border-radius: 10px; overflow: hidden;
-      border: 1px solid var(--border); background: #0b1020;
-    }}
-    .pos-chart-frame {{ display: block; width: 100%; height: 280px; border: none; }}
-    footer {{ text-align: center; color: var(--muted); font-size: 0.78rem; margin-top: 24px; }}
-  </style>
+  {_panel_fonts_link()}
+  <style>{_panel_theme_css(full=True)}</style>
 </head>
 <body>
   <div class="wrap">
     <header>
       <div>
         <h1>Forecast Dashboard</h1>
-        <p class="subtitle">Сканер рынка · Futures auto-trade · обновление каждые 15 мин</p>
+        <p class="subtitle">{scan_hint} · {market_label} · long only · обновление каждые 15 мин</p>
       </div>
       <div class="pills">
         {status_scan}
         {status_trade}
-        {_badge("Futures", "ok")}
+        {_badge(market_label, "ok")}
       </div>
     </header>
 
@@ -968,7 +1143,7 @@ def render_scanner_dashboard(
       </section>
       <section>
         <h2>Открытые позиции бота</h2>
-        {_open_positions_section(trade_state, at, return_q=base_q, timeframe=timeframe, chart_bars=min(int(bars), 200))}
+        {_open_positions_section(trade_state, at, return_q=base_q, timeframe=timeframe)}
       </section>
     </div>
 
@@ -1011,7 +1186,8 @@ def render_scanner_dashboard(
 
     <footer>
       Кэш: market_scan_latest.json · История: scan_history.jsonl · Торги: auto_trade_state.json
-      · <a href="/scanner?tab=closed&amp;{base_q}" style="color:var(--accent)">Закрытые сделки</a>
+      · <a href="/scanner?tab=closed&amp;{base_q}" style="color:var(--accent)">Закрытые</a>
+      · <a href="/scanner?tab=tfstudy&amp;{base_q}" style="color:var(--accent)">Тест TF</a>
       · <a class="btn" href="/legacy" style="display:inline-block;margin-top:8px">Старый forecast UI</a>
     </footer>
   </div>
