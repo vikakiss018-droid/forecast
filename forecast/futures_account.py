@@ -1,4 +1,4 @@
-"""Futures account balance and bot statistics for the dashboard."""
+"""Binance account balance (spot or futures) and bot statistics for the dashboard."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ from .binance_client import create_trading_client, trading_credentials_source
 
 _CACHE: dict[str, Any] | None = None
 _CACHE_AT: float = 0.0
+_CACHE_SPOT: dict[str, Any] | None = None
+_CACHE_SPOT_AT: float = 0.0
 _CACHE_TTL_SEC = 50.0
 
 
@@ -48,6 +50,7 @@ def fetch_futures_account_snapshot(*, force: bool = False) -> dict[str, Any]:
     empty: dict[str, Any] = {
         "ok": False,
         "error": None,
+        "market": "futures",
         "updated_at": None,
         "usdt": {"free": 0.0, "used": 0.0, "total": 0.0},
         "unrealized_pnl": 0.0,
@@ -100,6 +103,7 @@ def fetch_futures_account_snapshot(*, force: bool = False) -> dict[str, Any]:
         snap = {
             "ok": True,
             "error": None,
+            "market": "futures",
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "usdt": {"free": free, "used": used, "total": total},
             "unrealized_pnl": unrealized,
@@ -119,3 +123,116 @@ def fetch_futures_account_snapshot(*, force: bool = False) -> dict[str, Any]:
         _CACHE = err
         _CACHE_AT = now
         return err
+
+
+def fetch_spot_account_snapshot(*, force: bool = False) -> dict[str, Any]:
+    global _CACHE_SPOT, _CACHE_SPOT_AT
+
+    empty: dict[str, Any] = {
+        "ok": False,
+        "error": None,
+        "market": "spot",
+        "updated_at": None,
+        "usdt": {"free": 0.0, "used": 0.0, "total": 0.0},
+        "unrealized_pnl": 0.0,
+        "positions": [],
+        "positions_count": 0,
+    }
+
+    if trading_credentials_source() == "none":
+        empty["error"] = "Задайте BINANCE_TRADE_API_KEY и BINANCE_TRADE_API_SECRET в .env"
+        return empty
+
+    now = time.time()
+    if not force and _CACHE_SPOT is not None and (now - _CACHE_SPOT_AT) < _CACHE_TTL_SEC:
+        return _CACHE_SPOT
+
+    try:
+        ex = create_trading_client(use_futures=False)
+        bal = ex.fetch_balance()
+        usdt_row = bal.get("USDT") or {}
+        if isinstance(usdt_row, dict):
+            free = float(usdt_row.get("free") or 0.0)
+            used = float(usdt_row.get("used") or 0.0)
+            total = float(usdt_row.get("total") or (free + used))
+        else:
+            free = float((bal.get("free") or {}).get("USDT", 0.0) or 0.0)
+            used = float((bal.get("used") or {}).get("USDT", 0.0) or 0.0)
+            total = float((bal.get("total") or {}).get("USDT", 0.0) or (free + used))
+
+        skip_keys = frozenset(
+            {"info", "timestamp", "datetime", "free", "used", "total", "USDT", "BUSD", "FDUSD"}
+        )
+        holdings: list[dict[str, Any]] = []
+        for currency, row in bal.items():
+            if currency in skip_keys or not isinstance(row, dict):
+                continue
+            amount = float(row.get("total") or row.get("free") or 0.0)
+            if amount < 1e-8:
+                continue
+            sym = f"{currency}/USDT"
+            try:
+                ticker = ex.fetch_ticker(sym)
+                px = float(ticker.get("last") or ticker.get("close") or 0.0)
+            except Exception:
+                px = 0.0
+            notional = amount * px if px > 0 else 0.0
+            if notional < 1.0 and currency not in ("BTC", "ETH", "BNB"):
+                continue
+            holdings.append(
+                {
+                    "symbol": sym,
+                    "side": "long",
+                    "contracts": amount,
+                    "notional_usdt": notional,
+                    "entry_price": px,
+                    "unrealized_pnl": 0.0,
+                    "leverage": 1,
+                }
+            )
+
+        snap = {
+            "ok": True,
+            "error": None,
+            "market": "spot",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "usdt": {"free": free, "used": used, "total": total},
+            "unrealized_pnl": 0.0,
+            "positions": holdings,
+            "positions_count": len(holdings),
+            "api_source": trading_credentials_source(),
+        }
+        _CACHE_SPOT = snap
+        _CACHE_SPOT_AT = now
+        return snap
+    except Exception as e:
+        err = {
+            **empty,
+            "error": str(e),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _CACHE_SPOT = err
+        _CACHE_SPOT_AT = now
+        return err
+
+
+def fetch_trading_account_snapshot(
+    *,
+    force: bool = False,
+    market_type: str | None = None,
+) -> dict[str, Any]:
+    """Spot or futures balance for dashboard / auto-trade (from AUTO_TRADE_MARKET if omitted)."""
+    mkt = (market_type or "").strip().lower()
+    if not mkt:
+        try:
+            from .auto_trader import load_auto_trade_config
+
+            mkt = str(load_auto_trade_config().market_type or "futures").strip().lower()
+        except Exception:
+            mkt = "futures"
+    if mkt == "spot":
+        return fetch_spot_account_snapshot(force=force)
+    snap = fetch_futures_account_snapshot(force=force)
+    if isinstance(snap, dict):
+        snap = {**snap, "market": "futures"}
+    return snap

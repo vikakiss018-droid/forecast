@@ -787,11 +787,14 @@ def _trader_config_cards(at: AutoTradeConfig) -> str:
 
 
 def _balance_section(account: dict[str, Any]) -> str:
+    is_spot = str(account.get("market") or "").lower() == "spot"
+    title = "Spot — баланс USDT" if is_spot else "Futures — баланс USDT"
+    used_label = "В ордерах" if is_spot else "В марже"
     if not account.get("ok"):
         err = _e(account.get("error") or "Нет данных")
         return f"""
     <section class="balance-section">
-      <h2>Futures — баланс USDT</h2>
+      <h2>{title}</h2>
       <p class="balance-error">{err}</p>
     </section>"""
     usdt = account.get("usdt") or {}
@@ -799,7 +802,7 @@ def _balance_section(account: dict[str, Any]) -> str:
     updated = _fmt_ts(account.get("updated_at"))
     return f"""
     <section class="balance-section">
-      <h2>Futures — баланс USDT <span class="hint">обновлено {updated}</span></h2>
+      <h2>{title} <span class="hint">обновлено {updated}</span></h2>
       <div class="balance-grid">
         <div class="balance-card balance-total">
           <label>Капитал (total)</label>
@@ -810,7 +813,7 @@ def _balance_section(account: dict[str, Any]) -> str:
           <strong>{_fmt_num(usdt.get('free'), 2)}</strong>
         </div>
         <div class="balance-card">
-          <label>В марже</label>
+          <label>{used_label}</label>
           <strong>{_fmt_num(usdt.get('used'), 2)}</strong>
         </div>
         <div class="balance-card">
@@ -846,7 +849,7 @@ def _exchange_positions_table(account: dict[str, Any]) -> str:
         )
     return f"""
     <section>
-      <h2>Позиции на бирже (Futures)</h2>
+      <h2>Позиции на бирже ({'Spot' if str(account.get('market') or '').lower() == 'spot' else 'Futures'})</h2>
       <div class="table-wrap">
         <table>
           <thead>

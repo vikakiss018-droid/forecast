@@ -40,7 +40,12 @@ from .auto_trader import (
     load_trade_state,
 )
 from .binance_client import trading_credentials_source
-from .futures_account import compute_bot_stats, fetch_futures_account_snapshot
+from .futures_account import (
+    compute_bot_stats,
+    fetch_futures_account_snapshot,
+    fetch_spot_account_snapshot,
+    fetch_trading_account_snapshot,
+)
 from .scan_cache import load_scan_history, load_scan_result, report_from_cache
 from .env_config import SETTINGS_META, update_env_values
 from .panel_auth import PANEL_AUTH_DEPS
@@ -1224,11 +1229,22 @@ def _auto_trade_yaml() -> dict:
 
 @app.get("/futures/account", dependencies=PANEL_AUTH_DEPS)
 def futures_account_json(force: bool = False) -> dict:
-    """Futures USDT balance, positions, bot stats (cached ~50s)."""
+    """USDT balance (spot or futures per AUTO_TRADE_MARKET), bot stats (cached ~50s)."""
     trade_hist = load_trade_history(40)
     scan_hist = load_scan_history(30)
     return {
-        "account": fetch_futures_account_snapshot(force=force),
+        "account": fetch_trading_account_snapshot(force=force),
+        "bot_stats": compute_bot_stats(trade_hist, scan_hist),
+    }
+
+
+@app.get("/spot/account", dependencies=PANEL_AUTH_DEPS)
+def spot_account_json(force: bool = False) -> dict:
+    """Spot USDT balance and holdings (cached ~50s)."""
+    trade_hist = load_trade_history(40)
+    scan_hist = load_scan_history(30)
+    return {
+        "account": fetch_spot_account_snapshot(force=force),
         "bot_stats": compute_bot_stats(trade_hist, scan_hist),
     }
 
@@ -1263,7 +1279,8 @@ def trader_status() -> dict:
         "trade_history": load_trade_history(40),
         "closed_trades": load_closed_trades(100),
         "scan_history": load_scan_history(30),
-        "futures_account": fetch_futures_account_snapshot(),
+        "account": fetch_trading_account_snapshot(),
+        "futures_account": fetch_trading_account_snapshot(),
         "bot_stats": compute_bot_stats(load_trade_history(40), load_scan_history(30)),
     }
 
@@ -1321,7 +1338,8 @@ def scanner_json(
     rep["scan_history"] = load_scan_history(30)
     rep["trade_history"] = load_trade_history(40)
     rep["closed_trades"] = load_closed_trades(100)
-    rep["futures_account"] = fetch_futures_account_snapshot()
+    rep["futures_account"] = fetch_trading_account_snapshot()
+    rep["account"] = rep["futures_account"]
     rep["bot_stats"] = compute_bot_stats(rep["trade_history"], rep["scan_history"])
     if cached_full:
         rep["scan_config"] = cached_full.get("scan_config") or {}
@@ -1493,7 +1511,7 @@ def scanner_panel(
         trade_state=load_trade_state(),
         scan_history=scan_hist,
         trade_history=trade_hist,
-        account=fetch_futures_account_snapshot(),
+        account=fetch_trading_account_snapshot(),
         bot_stats=compute_bot_stats(trade_hist, scan_hist),
         top=top,
         bars=bars,
