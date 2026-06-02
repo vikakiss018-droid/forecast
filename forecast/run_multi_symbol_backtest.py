@@ -17,6 +17,7 @@ def main() -> int:
     deposit = float(os.environ.get("MULTI_BT_DEPOSIT", "1000"))
     risk = float(os.environ.get("MULTI_BT_RISK_PCT", "0.5"))
     target = int(os.environ.get("MULTI_BT_TARGET_TRADES", "100"))
+    target_label = "all signals" if target <= 0 else str(target)
     leverage = int(os.environ.get("MULTI_BT_LEVERAGE", "1"))
     max_notional = float(os.environ.get("MULTI_BT_MAX_NOTIONAL", "50"))
     use_leverage_sizing = os.environ.get("MULTI_BT_USE_LEVERAGE", "0").strip().lower() in (
@@ -29,6 +30,12 @@ def main() -> int:
         "true",
         "yes",
     )
+    entry_start = os.environ.get("MULTI_BT_START", "").strip() or os.environ.get(
+        "MULTI_BT_ENTRY_START", ""
+    ).strip()
+    entry_end = os.environ.get("MULTI_BT_END", "").strip() or os.environ.get(
+        "MULTI_BT_ENTRY_END", ""
+    ).strip()
 
     symbols_env = os.environ.get("MULTI_BT_SYMBOLS", "").strip()
     use_filtered = os.environ.get("MULTI_BT_USE_FILTERED", "1").strip().lower() not in (
@@ -51,7 +58,8 @@ def main() -> int:
         f"move>={os.environ.get('TREND_MIN_MOVE_PCT', '0.008')} vol>={os.environ.get('TREND_MIN_REL_VOLUME', '1.2')}, "
         f"{'lev=' + str(leverage) + 'x ' if use_leverage_sizing else 'spot/1x '}"
         f"{'long-only ' if long_only else ''}"
-        f"target={target}...",
+        f"{'window ' + entry_start + '..' + entry_end + ' ' if entry_start and entry_end else ''}"
+        f"target={target_label}...",
         flush=True,
     )
     min_vol = float(os.environ.get("TREND_MIN_REL_VOLUME", str(DEFAULT_TREND_PARAMS.min_rel_volume)))
@@ -76,6 +84,8 @@ def main() -> int:
             max_notional_usdt=max_notional,
             use_leverage_sizing=use_leverage_sizing,
             long_only=long_only,
+            entry_window_start=entry_start or None,
+            entry_window_end=entry_end or None,
         ),
         deposit_usdt=deposit,
         risk_pct=risk,

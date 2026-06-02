@@ -1,5 +1,5 @@
 [Unit]
-Description=Forecast market scan (oneshot, writes cache)
+Description=Forecast combined scan (trend + range, writes cache)
 After=network-online.target
 Wants=network-online.target
 

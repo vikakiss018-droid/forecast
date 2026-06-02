@@ -19,6 +19,7 @@ from .auto_trader import AutoTradeConfig, load_auto_trade_config, validate_setup
 from .trend_rules import (
     DEFAULT_TREND_PARAMS,
     TrendPullbackParams,
+    build_range_plan,
     build_trend_plan,
     htf_trend_aligned,
     trend_only_stats,
@@ -36,18 +37,53 @@ from .tf_backtest import (
     MAX_HOLD_BARS_BY_TF,
     STEP_BY_TF,
     _fetch_df,
+    _fetch_df_date_window,
     _simulate_exit,
     _trade_r,
 )
 
 RESULT_PATH = PROCESSED_DATA_DIR / "single_symbol_backtest_latest.json"
 MULTI_RESULT_PATH = PROCESSED_DATA_DIR / "multi_symbol_backtest_latest.json"
+RANGE_MULTI_RESULT_PATH = PROCESSED_DATA_DIR / "range_multi_backtest_latest.json"
+COMBINED_MULTI_RESULT_PATH = PROCESSED_DATA_DIR / "combined_multi_backtest_latest.json"
 
 DEFAULT_SYMBOL = "SOL/USDT"
 DEFAULT_TIMEFRAME = "1h"
 DEFAULT_BARS = 1000
 TARGET_TRADES = 100
+UNLIMITED_TARGET_TRADES = 0  # target_trades <= 0 → все сигналы за окно bars
 COOLDOWN_BARS = 4
+
+
+def _trade_target_unlimited(target_trades: int) -> bool:
+    return int(target_trades) <= 0
+
+
+def _parse_bt_timestamp(raw: str) -> pd.Timestamp:
+    ts = pd.Timestamp(raw.strip())
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts
+
+
+def _filter_trades_entry_window(
+    trades: list[dict[str, Any]],
+    *,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> list[dict[str, Any]]:
+    start = _parse_bt_timestamp(str(start))
+    end = _parse_bt_timestamp(str(end))
+    if end.hour == 0 and end.minute == 0 and end.second == 0:
+        end = end + pd.Timedelta(hours=23, minutes=59, seconds=59)
+    out: list[dict[str, Any]] = []
+    for t in trades:
+        et = _parse_bt_timestamp(str(t["entry_time"]))
+        if start <= et <= end:
+            out.append(t)
+    return out
 DEFAULT_LEVERAGE = 1
 DEFAULT_MAX_NOTIONAL_USDT = 50.0
 
@@ -125,6 +161,8 @@ class MultiSymbolBacktestConfig:
     max_notional_usdt: float = DEFAULT_MAX_NOTIONAL_USDT
     use_leverage_sizing: bool = False
     long_only: bool = False
+    entry_window_start: str | None = None  # YYYY-MM-DD, UTC
+    entry_window_end: str | None = None
 
 
 @dataclass(frozen=True)
@@ -259,6 +297,430 @@ def _peek_trend_entry(
     )
 
 
+def _peek_range_entry(
+    df: pd.DataFrame,
+    next_i: int,
+    *,
+    symbol: str,
+    timeframe: str,
+    auto_cfg: AutoTradeConfig,
+    stage1_min: float,
+    step: int,
+    max_hold: int,
+    cooldown_bars: int,
+    trend_params: TrendPullbackParams,
+    long_only: bool = False,
+) -> TrendEntryCandidate | None:
+    sub = df.iloc[: next_i + 1]
+    snap = _stage1_snapshot(sub)
+    plan = build_range_plan(sub, snap, trend_params)
+    if plan is None:
+        return None
+    if long_only and str(plan.get("direction", "")).strip().lower() == "short":
+        return None
+
+    support = float(plan["trend_support"])
+    resistance = float(plan["trend_resistance"])
+    last = sub.iloc[-1]
+    close = float(last["close"])
+    candle_bullish = close > float(last["open"])
+    rel_vol = float(snap["context"]["rel_volume"])
+    vol_up, vol_down = compute_volume_scores(sub)
+    stage1 = _adjust_stage1_for_direction(
+        max(float(snap["stage1_score"]), 10.0),
+        direction=str(plan["direction"]),
+        rel_vol=rel_vol,
+        candle_bullish=candle_bullish,
+        close=close,
+        support=support,
+        resistance=resistance,
+        vol_up=vol_up,
+        vol_down=vol_down,
+    )
+    if stage1 < stage1_min:
+        return None
+
+    cand = _build_candidate(symbol=symbol, snap=snap, plan=plan, stage1=stage1, df=sub)
+    cand["pattern"] = "range bounce"
+    ok, _reason = validate_setup(cand, auto_cfg)
+    if not ok:
+        return None
+
+    side = str(plan["direction"]).lower()
+    entry = close
+    stop = float(plan["stop"])
+    tp = float(plan["target_2"])
+    exit_px, exit_reason, exit_i = _simulate_exit(
+        df,
+        next_i,
+        side=side,
+        entry=entry,
+        stop=stop,
+        tp=tp,
+        max_bars=max_hold,
+    )
+    r_mult = _trade_r(side, entry, exit_px, stop)
+    entry_time = sub.index[-1]
+    trade = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "side": side,
+        "pattern": "range bounce",
+        "trend": "range",
+        "htf_trend": None,
+        "entry_style": plan.get("entry_style"),
+        "range_position_pct": plan.get("range_position_pct"),
+        "rel_volume": plan.get("rel_volume"),
+        "atr_pct": plan.get("atr_pct"),
+        "trend_support": support,
+        "trend_resistance": resistance,
+        "entry_time": str(entry_time),
+        "exit_time": str(df.index[exit_i]),
+        "entry": entry,
+        "exit": exit_px,
+        "stop": stop,
+        "tp": tp,
+        "exit_reason": exit_reason,
+        "r_multiple": round(r_mult, 3),
+        "win": r_mult > 0,
+        "stage1_score": round(stage1, 1),
+        "rr_plan": float(plan["risk_reward"]),
+    }
+    return TrendEntryCandidate(
+        trade=trade,
+        entry_time=entry_time,
+        side=side,
+        stage1_score=stage1,
+        exit_i=exit_i,
+        next_i_skip=next_i + step,
+        next_i_accept=exit_i + cooldown_bars,
+    )
+
+
+def backtest_range_single_symbol(
+    df: pd.DataFrame,
+    *,
+    symbol: str,
+    timeframe: str,
+    auto_cfg: AutoTradeConfig,
+    stage1_min: float,
+    target_trades: int = UNLIMITED_TARGET_TRADES,
+    step: int | None = None,
+    max_hold_bars: int | None = None,
+    cooldown_bars: int = COOLDOWN_BARS,
+    trend_params: TrendPullbackParams | None = None,
+    long_only: bool = False,
+) -> list[dict[str, Any]]:
+    params = trend_params or DEFAULT_TREND_PARAMS
+    step = step if step is not None else STEP_BY_TF.get(timeframe, 2)
+    max_hold = max_hold_bars if max_hold_bars is not None else MAX_HOLD_BARS_BY_TF.get(timeframe, 48)
+    trades: list[dict[str, Any]] = []
+    next_i = 72
+    end = len(df) - max_hold - 1
+
+    while next_i < end and (
+        _trade_target_unlimited(target_trades) or len(trades) < target_trades
+    ):
+        cand = _peek_range_entry(
+            df,
+            next_i,
+            symbol=symbol,
+            timeframe=timeframe,
+            auto_cfg=auto_cfg,
+            stage1_min=stage1_min,
+            step=step,
+            max_hold=max_hold,
+            cooldown_bars=cooldown_bars,
+            trend_params=params,
+            long_only=long_only,
+        )
+        if cand is None:
+            next_i += step
+            continue
+        trades.append(cand.trade)
+        next_i = cand.next_i_accept
+
+    return trades
+
+
+def backtest_combined_single_symbol(
+    df: pd.DataFrame,
+    *,
+    symbol: str,
+    timeframe: str,
+    auto_cfg: AutoTradeConfig,
+    stage1_min: float,
+    target_trades: int = UNLIMITED_TARGET_TRADES,
+    step: int | None = None,
+    max_hold_bars: int | None = None,
+    cooldown_bars: int = COOLDOWN_BARS,
+    trend_params: TrendPullbackParams | None = None,
+    df_htf: pd.DataFrame | None = None,
+    long_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Тренд + флет в одном walk-forward (режимы взаимоисключающие на баре)."""
+    params = trend_params or DEFAULT_TREND_PARAMS
+    step = step if step is not None else STEP_BY_TF.get(timeframe, 2)
+    max_hold = max_hold_bars if max_hold_bars is not None else MAX_HOLD_BARS_BY_TF.get(timeframe, 48)
+    trades: list[dict[str, Any]] = []
+    next_i = 72
+    end = len(df) - max_hold - 1
+
+    while next_i < end and (
+        _trade_target_unlimited(target_trades) or len(trades) < target_trades
+    ):
+        cand = _peek_trend_entry(
+            df,
+            next_i,
+            symbol=symbol,
+            timeframe=timeframe,
+            auto_cfg=auto_cfg,
+            stage1_min=stage1_min,
+            step=step,
+            max_hold=max_hold,
+            cooldown_bars=cooldown_bars,
+            trend_only=True,
+            trend_params=params,
+            df_htf=df_htf,
+            long_only=long_only,
+        )
+        regime = "trend"
+        if cand is None:
+            cand = _peek_range_entry(
+                df,
+                next_i,
+                symbol=symbol,
+                timeframe=timeframe,
+                auto_cfg=auto_cfg,
+                stage1_min=stage1_min,
+                step=step,
+                max_hold=max_hold,
+                cooldown_bars=cooldown_bars,
+                trend_params=params,
+                long_only=long_only,
+            )
+            regime = "range"
+        if cand is None:
+            next_i += step
+            continue
+        trade = dict(cand.trade)
+        trade["regime"] = regime
+        trades.append(trade)
+        next_i = cand.next_i_accept
+
+    return trades
+
+
+def run_combined_multi_symbol_backtest(
+    *,
+    cfg: MultiSymbolBacktestConfig | None = None,
+    deposit_usdt: float = 1000.0,
+    risk_pct: float | None = None,
+    result_path: Path | None = None,
+) -> dict[str, Any]:
+    cfg = cfg or MultiSymbolBacktestConfig()
+    cfg.bars = cfg.bars or BARS_BY_TF.get(cfg.timeframe, DEFAULT_BARS)
+    htf_bars = cfg.htf_bars or BARS_BY_TF.get(cfg.htf_timeframe, 800)
+    trend_params = _effective_trend_params(cfg)
+    from .strategy_config import yaml_section
+
+    at_yaml = yaml_section("auto_trade")
+    auto_cfg = load_auto_trade_config(at_yaml)
+    auto_cfg.min_probability_pct = float(at_yaml.get("min_probability_pct", 50))
+    auto_cfg.min_score = float(at_yaml.get("min_score", 18))
+    auto_cfg.allow_level_breakout = bool(at_yaml.get("allow_level_breakout", False))
+    auto_cfg.allow_triangle = bool(at_yaml.get("allow_triangle", False))
+    if risk_pct is None:
+        risk_pct = float(auto_cfg.risk_pct_of_balance)
+    if risk_pct <= 0:
+        risk_pct = 0.5
+
+    exchange = ccxt.binance({"enableRateLimit": True})
+    t0 = time.perf_counter()
+    all_trades: list[dict[str, Any]] = []
+    win_start = _parse_bt_timestamp(cfg.entry_window_start) if cfg.entry_window_start else None
+    win_end = _parse_bt_timestamp(cfg.entry_window_end) if cfg.entry_window_end else None
+
+    def _load_df(symbol: str) -> pd.DataFrame | None:
+        if win_start is not None and win_end is not None:
+            return _fetch_df_date_window(
+                exchange, symbol, cfg.timeframe, start=win_start, end=win_end
+            )
+        return _fetch_df(exchange, symbol, cfg.timeframe, cfg.bars)
+
+    for symbol in cfg.symbols:
+        df = _load_df(symbol)
+        if df is None:
+            print(f"[combined_bt] skip {symbol}: no data", flush=True)
+            continue
+        df_htf = None
+        if trend_params.require_htf_align and cfg.timeframe == "1h":
+            df_htf = _fetch_df(exchange, symbol, cfg.htf_timeframe, htf_bars)
+            if df_htf is None:
+                print(f"[combined_bt] skip {symbol}: no {cfg.htf_timeframe} data", flush=True)
+                continue
+        sym_trades = backtest_combined_single_symbol(
+            df,
+            symbol=symbol,
+            timeframe=cfg.timeframe,
+            auto_cfg=auto_cfg,
+            stage1_min=cfg.stage1_min_score,
+            target_trades=UNLIMITED_TARGET_TRADES,
+            trend_params=trend_params,
+            df_htf=df_htf,
+            long_only=cfg.long_only,
+        )
+        all_trades.extend(sym_trades)
+        n_t = sum(1 for t in sym_trades if t.get("regime") == "trend")
+        n_r = len(sym_trades) - n_t
+        print(
+            f"[combined_bt] {symbol}: +{len(sym_trades)} (trend {n_t}, range {n_r}, total {len(all_trades)})",
+            flush=True,
+        )
+
+    if win_start is not None and win_end is not None:
+        all_trades = _filter_trades_entry_window(all_trades, start=win_start, end=win_end)
+
+    trend_trades = [t for t in all_trades if t.get("regime") == "trend"]
+    range_trades = [t for t in all_trades if t.get("regime") == "range"]
+
+    stats = _summarize(all_trades, deposit_usdt=deposit_usdt, risk_pct=risk_pct, leverage=1)
+    stats_trend = _summarize(trend_trades, deposit_usdt=deposit_usdt, risk_pct=risk_pct, leverage=1)
+    stats_range = _summarize(range_trades, deposit_usdt=deposit_usdt, risk_pct=risk_pct, leverage=1)
+    by_symbol = _aggregate_by_symbol(all_trades)
+    long_n = sum(1 for t in all_trades if str(t.get("side")) == "long")
+    short_n = len(all_trades) - long_n
+
+    payload = {
+        "status": "done",
+        "mode": "trend_plus_range",
+        "long_only": cfg.long_only,
+        "rule": (
+            "на каждом баре: тренд (up/down) или флет (range); "
+            f"rel_volume>={trend_params.min_rel_volume}; stage1>=18; validate_setup RR>=1.5"
+            + ("; long only" if cfg.long_only else "")
+        ),
+        "min_rel_volume": trend_params.min_rel_volume,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "duration_sec": round(time.perf_counter() - t0, 1),
+        "symbols": list(cfg.symbols),
+        "timeframe": cfg.timeframe,
+        "entry_window_start": cfg.entry_window_start,
+        "entry_window_end": cfg.entry_window_end,
+        "summary": stats,
+        "summary_by_regime": {
+            "trend": stats_trend,
+            "range": stats_range,
+        },
+        "summary_sides": {"long": long_n, "short": short_n},
+        "by_symbol": by_symbol,
+        "trades": all_trades[-50:],
+        "trades_sample_note": "последние 50 сделок в JSON",
+    }
+    ensure_directories()
+    out = result_path or COMBINED_MULTI_RESULT_PATH
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return payload
+
+
+def run_range_multi_symbol_backtest(
+    *,
+    cfg: MultiSymbolBacktestConfig | None = None,
+    deposit_usdt: float = 1000.0,
+    risk_pct: float | None = None,
+    result_path: Path | None = None,
+) -> dict[str, Any]:
+    cfg = cfg or MultiSymbolBacktestConfig()
+    cfg.bars = cfg.bars or BARS_BY_TF.get(cfg.timeframe, DEFAULT_BARS)
+    trend_params = cfg.trend_params or DEFAULT_TREND_PARAMS
+    from .strategy_config import yaml_section
+
+    at_yaml = yaml_section("auto_trade")
+    auto_cfg = load_auto_trade_config(at_yaml)
+    auto_cfg.min_probability_pct = float(at_yaml.get("min_probability_pct", 50))
+    auto_cfg.min_score = float(at_yaml.get("min_score", 18))
+    auto_cfg.allow_level_breakout = bool(at_yaml.get("allow_level_breakout", False))
+    auto_cfg.allow_triangle = bool(at_yaml.get("allow_triangle", False))
+    if risk_pct is None:
+        risk_pct = float(auto_cfg.risk_pct_of_balance)
+    if risk_pct <= 0:
+        risk_pct = 0.5
+
+    exchange = ccxt.binance({"enableRateLimit": True})
+    t0 = time.perf_counter()
+    all_trades: list[dict[str, Any]] = []
+    win_start = _parse_bt_timestamp(cfg.entry_window_start) if cfg.entry_window_start else None
+    win_end = _parse_bt_timestamp(cfg.entry_window_end) if cfg.entry_window_end else None
+
+    def _load_df(symbol: str) -> pd.DataFrame | None:
+        if win_start is not None and win_end is not None:
+            return _fetch_df_date_window(
+                exchange, symbol, cfg.timeframe, start=win_start, end=win_end
+            )
+        return _fetch_df(exchange, symbol, cfg.timeframe, cfg.bars)
+
+    for symbol in cfg.symbols:
+        df = _load_df(symbol)
+        if df is None:
+            print(f"[range_bt] skip {symbol}: no data", flush=True)
+            continue
+        sym_trades = backtest_range_single_symbol(
+            df,
+            symbol=symbol,
+            timeframe=cfg.timeframe,
+            auto_cfg=auto_cfg,
+            stage1_min=cfg.stage1_min_score,
+            target_trades=UNLIMITED_TARGET_TRADES,
+            trend_params=trend_params,
+            long_only=cfg.long_only,
+        )
+        all_trades.extend(sym_trades)
+        print(f"[range_bt] {symbol}: +{len(sym_trades)} (total {len(all_trades)})", flush=True)
+
+    if win_start is not None and win_end is not None:
+        all_trades = _filter_trades_entry_window(all_trades, start=win_start, end=win_end)
+
+    stats = _summarize(
+        all_trades,
+        deposit_usdt=deposit_usdt,
+        risk_pct=risk_pct,
+        leverage=1,
+    )
+    by_symbol = _aggregate_by_symbol(all_trades)
+    long_n = sum(1 for t in all_trades if str(t.get("side")) == "long")
+    short_n = len(all_trades) - long_n
+
+    payload = {
+        "status": "done",
+        "mode": "range_bounce",
+        "entry_style": "range_bounce",
+        "long_only": cfg.long_only,
+        "rule": (
+            f"флет detect_price_trend=range; отскок от S/R (зона {20}%); "
+            f"rel_volume>={trend_params.min_rel_volume}; stage1>=18; validate_setup RR>=1.5"
+            + ("; long only" if cfg.long_only else "")
+        ),
+        "min_rel_volume": trend_params.min_rel_volume,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "duration_sec": round(time.perf_counter() - t0, 1),
+        "symbols": list(cfg.symbols),
+        "timeframe": cfg.timeframe,
+        "entry_window_start": cfg.entry_window_start,
+        "entry_window_end": cfg.entry_window_end,
+        "summary": stats,
+        "summary_sides": {"long": long_n, "short": short_n},
+        "by_symbol": by_symbol,
+        "trades": all_trades[-50:],
+        "trades_sample_note": "последние 50 сделок в JSON",
+    }
+    ensure_directories()
+    out = result_path or RANGE_MULTI_RESULT_PATH
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return payload
+
+
 def _build_candidate(
     *,
     symbol: str,
@@ -310,7 +772,9 @@ def backtest_single_symbol(
     next_i = 72
     end = len(df) - max_hold - 1
 
-    while next_i < end and len(trades) < target_trades:
+    while next_i < end and (
+        _trade_target_unlimited(target_trades) or len(trades) < target_trades
+    ):
         cand = _peek_trend_entry(
             df,
             next_i,
@@ -389,8 +853,14 @@ def run_multi_symbol_backtest(
     cfg.bars = cfg.bars or BARS_BY_TF.get(cfg.timeframe, DEFAULT_BARS)
     htf_bars = cfg.htf_bars or BARS_BY_TF.get(cfg.htf_timeframe, 800)
     trend_params = _effective_trend_params(cfg)
-    auto_cfg = load_auto_trade_config()
-    auto_cfg.min_probability_pct = 50.0
+    from .strategy_config import yaml_section
+
+    at_yaml = yaml_section("auto_trade")
+    auto_cfg = load_auto_trade_config(at_yaml)
+    auto_cfg.min_probability_pct = float(at_yaml.get("min_probability_pct", 50))
+    auto_cfg.min_score = float(at_yaml.get("min_score", 18))
+    auto_cfg.allow_level_breakout = bool(at_yaml.get("allow_level_breakout", False))
+    auto_cfg.allow_triangle = bool(at_yaml.get("allow_triangle", False))
     if risk_pct is None:
         risk_pct = float(auto_cfg.risk_pct_of_balance)
     if risk_pct <= 0:
@@ -399,11 +869,21 @@ def run_multi_symbol_backtest(
     exchange = ccxt.binance({"enableRateLimit": True})
     t0 = time.perf_counter()
     all_trades: list[dict[str, Any]] = []
+    unlimited = _trade_target_unlimited(cfg.target_trades)
+    win_start = _parse_bt_timestamp(cfg.entry_window_start) if cfg.entry_window_start else None
+    win_end = _parse_bt_timestamp(cfg.entry_window_end) if cfg.entry_window_end else None
+
+    def _load_df(symbol: str) -> pd.DataFrame | None:
+        if win_start is not None and win_end is not None:
+            return _fetch_df_date_window(
+                exchange, symbol, cfg.timeframe, start=win_start, end=win_end
+            )
+        return _fetch_df(exchange, symbol, cfg.timeframe, cfg.bars)
 
     for symbol in cfg.symbols:
-        if len(all_trades) >= cfg.target_trades:
+        if not unlimited and len(all_trades) >= cfg.target_trades:
             break
-        df = _fetch_df(exchange, symbol, cfg.timeframe, cfg.bars)
+        df = _load_df(symbol)
         if df is None:
             print(f"[multi_bt] skip {symbol}: no data", flush=True)
             continue
@@ -413,7 +893,7 @@ def run_multi_symbol_backtest(
             if df_htf is None:
                 print(f"[multi_bt] skip {symbol}: no {cfg.htf_timeframe} data", flush=True)
                 continue
-        need = cfg.target_trades - len(all_trades)
+        need = UNLIMITED_TARGET_TRADES if unlimited else cfg.target_trades - len(all_trades)
         sym_trades = backtest_single_symbol(
             df,
             symbol=symbol,
@@ -428,15 +908,15 @@ def run_multi_symbol_backtest(
         )
         all_trades.extend(sym_trades)
         print(f"[multi_bt] {symbol}: +{len(sym_trades)} (total {len(all_trades)})", flush=True)
-        if len(all_trades) >= cfg.target_trades:
+        if not unlimited and len(all_trades) >= cfg.target_trades:
             all_trades = all_trades[: cfg.target_trades]
             break
 
-    if len(all_trades) < cfg.target_trades:
+    if unlimited or len(all_trades) < cfg.target_trades:
         for symbol in cfg.symbols:
-            if len(all_trades) >= cfg.target_trades:
+            if not unlimited and len(all_trades) >= cfg.target_trades:
                 break
-            df = _fetch_df(exchange, symbol, cfg.timeframe, cfg.bars)
+            df = _load_df(symbol)
             if df is None:
                 continue
             df_htf = None
@@ -444,7 +924,7 @@ def run_multi_symbol_backtest(
                 df_htf = _fetch_df(exchange, symbol, cfg.htf_timeframe, htf_bars)
                 if df_htf is None:
                     continue
-            need = cfg.target_trades - len(all_trades)
+            need = UNLIMITED_TARGET_TRADES if unlimited else cfg.target_trades - len(all_trades)
             extra = backtest_single_symbol(
                 df,
                 symbol=symbol,
@@ -463,9 +943,12 @@ def run_multi_symbol_backtest(
                 if key not in seen:
                     all_trades.append(t)
                     seen.add(key)
-                if len(all_trades) >= cfg.target_trades:
+                if not unlimited and len(all_trades) >= cfg.target_trades:
                     all_trades = all_trades[: cfg.target_trades]
                     break
+
+    if win_start is not None and win_end is not None:
+        all_trades = _filter_trades_entry_window(all_trades, start=win_start, end=win_end)
 
     if cfg.use_leverage_sizing and cfg.leverage > 1:
         enrich_trades_sizing(
@@ -481,7 +964,8 @@ def run_multi_symbol_backtest(
         risk_pct=risk_pct,
         leverage=cfg.leverage if cfg.use_leverage_sizing else 1,
     )
-    stats["target_reached"] = len(all_trades) >= cfg.target_trades
+    stats["target_reached"] = unlimited or len(all_trades) >= cfg.target_trades
+    stats["unlimited_trades"] = unlimited
     by_symbol = _aggregate_by_symbol(all_trades)
 
     payload = {
@@ -512,12 +996,16 @@ def run_multi_symbol_backtest(
         "symbols": list(cfg.symbols),
         "timeframe": cfg.timeframe,
         "bars_per_symbol": cfg.bars,
+        "entry_window_start": cfg.entry_window_start,
+        "entry_window_end": cfg.entry_window_end,
         "target_trades": cfg.target_trades,
+        "unlimited_trades": unlimited,
         "summary": stats,
         "by_symbol": by_symbol,
         "note": (
             f"{len(cfg.symbols)} монет, TF {cfg.timeframe}, импульсный вход (DEFAULT_TREND_PARAMS), без kNN. "
-            "Прибыль USDT = total_R × (депозит × risk%)."
+            + ("Все сигналы за окно bars (без лимита сделок). " if unlimited else "")
+            + "Прибыль USDT = total_R × (депозит × risk%)."
         ),
         "trades": all_trades[-30:],
         "trades_sample_note": "последние 30 сделок в JSON",

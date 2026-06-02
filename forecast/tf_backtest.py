@@ -126,6 +126,9 @@ MAX_HOLD_BARS_BY_TF: dict[str, int] = {
     "4h": 24,
 }
 
+# ema_200 + rolling 48 в features — прогрев для коротких окон (MULTI_BT_START/END)
+INDICATOR_WARMUP_BARS_1H = 220
+
 
 @dataclass
 class TfBacktestConfig:
@@ -150,18 +153,117 @@ def save_tf_backtest_result(payload: dict[str, Any]) -> None:
     TF_BACKTEST_PATH.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def _min_bars_for_backtest(timeframe: str, *, date_window: bool = False) -> int:
+    """Минимум баров для индикаторов + walk-forward."""
+    need = MAX_HOLD_BARS_BY_TF.get(timeframe, 48) + 72
+    if date_window:
+        return max(72, need - 24)
+    return max(120, need)
+
+
+def _add_backtest_min_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Минимальный набор фич для trend backtest (short window friendly).
+    Избегаем ret_48 / volatility_48 и временных синусов, которые сильно режут короткие окна.
+    """
+    out = df.copy()
+    c = out["close"].replace(0.0, np.nan)
+    out["ret_24"] = out["close"].pct_change(24)
+    out["range"] = (out["high"] - out["low"]) / c
+    out["volatility_24"] = out["close"].pct_change().rolling(24).std()
+    ve = out["volume_ema_20"].replace(0.0, np.nan)
+    out["rel_volume"] = (out["volume"] / ve).clip(lower=0.0, upper=10.0)
+    required = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "ema_20",
+        "ema_50",
+        "ema_200",
+        "atr_14",
+        "ret_24",
+        "range",
+        "volatility_24",
+        "rel_volume",
+    ]
+    out = out.dropna(subset=required)
+    return out
+
+
 def _fetch_df(exchange: ccxt.Exchange, symbol: str, timeframe: str, bars: int) -> pd.DataFrame | None:
     try:
         rows = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=bars)
     except Exception:
         return None
-    if not rows or len(rows) < 280:
+    min_len = _min_bars_for_backtest(timeframe)
+    if not rows or len(rows) < min_len:
         return None
     df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df = df.set_index("datetime")
     try:
         return add_basic_features(add_basic_indicators(df))
+    except Exception:
+        return None
+
+
+def _fetch_df_date_window(
+    exchange: ccxt.Exchange,
+    symbol: str,
+    timeframe: str,
+    *,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    warmup_bars: int | None = None,
+) -> pd.DataFrame | None:
+    """OHLCV с прогревом до start; end включительно (конец дня UTC)."""
+    try:
+        start = pd.Timestamp(start).tz_convert("UTC")
+        end = pd.Timestamp(end).tz_convert("UTC")
+        short_window = (end - start) <= pd.Timedelta(days=5)
+        if end.hour == 0 and end.minute == 0 and end.second == 0:
+            end = end + pd.Timedelta(hours=23, minutes=59, seconds=59)
+        tf_ms = int(exchange.parse_timeframe(timeframe) * 1000)
+        warm = warmup_bars
+        if warm is None:
+            # Для коротких окон нужен дополнительный прогрев из-за ema_200 + rolling статистики.
+            if short_window:
+                warm = 360 if timeframe == "1h" else max(300, MAX_HOLD_BARS_BY_TF.get(timeframe, 48) + 220)
+            else:
+                warm = INDICATOR_WARMUP_BARS_1H if timeframe == "1h" else max(220, MAX_HOLD_BARS_BY_TF.get(timeframe, 48) + 172)
+        since_ms = int(start.timestamp() * 1000) - int(warm) * tf_ms
+        until_ms = int(end.timestamp() * 1000) + tf_ms
+        rows: list[list] = []
+        since = since_ms
+        params = {"endTime": until_ms}
+        for _ in range(20):
+            chunk = exchange.fetch_ohlcv(
+                symbol, timeframe, since=since, limit=1000, params=params
+            )
+            if not chunk:
+                break
+            rows.extend(chunk)
+            last_ms = int(chunk[-1][0])
+            if last_ms >= until_ms - tf_ms or len(chunk) < 1000:
+                break
+            since = last_ms + 1
+        if not rows:
+            return None
+        df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+        df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df = df.set_index("datetime")
+        df = df[(df.index >= pd.Timestamp(since_ms, unit="ms", tz="UTC")) & (df.index <= pd.Timestamp(until_ms, unit="ms", tz="UTC"))]
+        min_len = _min_bars_for_backtest(timeframe, date_window=True)
+        if len(df) < min_len:
+            return None
+        base = add_basic_indicators(df)
+        if short_window:
+            out = _add_backtest_min_features(base)
+        else:
+            out = add_basic_features(base)
+        return out if len(out) >= min_len else None
     except Exception:
         return None
 

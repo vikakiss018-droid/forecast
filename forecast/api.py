@@ -1167,7 +1167,7 @@ def _trend_scan_cfg_from_request(
     timeframe: str,
     stage1_min_score: float,
 ) -> TrendScanConfig:
-    """Параметры как у run_scheduled_scan (50 filtered, тренд 1h)."""
+    """Параметры как у run_scheduled_scan (50 filtered, тренд + флет 1h)."""
     base = trend_scan_config_from_env()
     return TrendScanConfig(
         timeframe=(timeframe or base.timeframe).strip() or "1h",
@@ -1191,7 +1191,7 @@ def _scanner_report(
     max_symbols: int | None,
     live: bool,
 ) -> tuple[dict, str | None, bool]:
-    """Return (report, updated_at, from_cache). Тренд-скан 50 пар (не kNN)."""
+    """Return (report, updated_at, from_cache). Combined scan 50 пар (не kNN)."""
     _ = max_symbols  # legacy query param; список пар из symbol_ranking_filtered_r05_win50.json
     if not live:
         cached = load_scan_result()
@@ -1210,7 +1210,7 @@ def _scanner_report(
     rep = scan_trend_filtered_setups(scan_cfg, auto_cfg=auto_cfg)
     if rep.get("status") == "error":
         rep = {
-            "mode": "trend_momentum",
+            "mode": "trend_plus_range",
             "top_setups": [],
             "candidates_found": 0,
             "error": rep.get("error"),

@@ -1,5 +1,5 @@
 [Unit]
-Description=Run forecast trend scan hourly (after 1h candle close)
+Description=Run forecast combined scan hourly (trend + range, 1h)
 
 [Timer]
 OnBootSec=5min

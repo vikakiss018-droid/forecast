@@ -1,5 +1,7 @@
 """
-Скан 50 отфильтрованных пар: тренд 1h, импульс, rel_volume — как multi-symbol backtest (без kNN).
+Скан 50 отфильтрованных пар: тренд + флет на 1h (как combined backtest, без kNN).
+
+На каждой паре: сначала тренд (up/down), иначе отскок от S/R во флете (range).
 """
 
 from __future__ import annotations
@@ -7,25 +9,27 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import ccxt
 import pandas as pd
 
 from .auto_trader import load_auto_trade_config, validate_setup
-from .indicators import add_basic_indicators
-from .features import add_basic_features
-from .market_scanner import (
-    _adjust_stage1_for_direction,
-    _level_proximity,
-    _stage1_snapshot,
-)
+from .market_scanner import _adjust_stage1_for_direction, _stage1_snapshot
 from .run_symbol_ranking import load_filtered_symbols
 from .signal_combiner import compute_volume_scores
 from .single_symbol_backtest import _build_candidate
-from .tf_backtest import BARS_BY_TF, _fetch_df
 from .strategy_config import env_bool, env_float, env_int, env_str, yaml_section
-from .trend_rules import DEFAULT_TREND_PARAMS, TrendPullbackParams, build_trend_plan
+from .tf_backtest import BARS_BY_TF, _fetch_df
+from .trend_rules import (
+    DEFAULT_TREND_PARAMS,
+    TrendPullbackParams,
+    build_range_plan,
+    build_trend_plan,
+)
+
+Regime = Literal["trend", "range"]
+SCAN_MODE = "trend_plus_range"
 
 
 def df_closed_only(df: pd.DataFrame) -> pd.DataFrame:
@@ -37,8 +41,10 @@ def df_closed_only(df: pd.DataFrame) -> pd.DataFrame:
 
 @dataclass
 class TrendScanConfig:
+    """Конфиг live-скана (секция trend_scan в config.yaml)."""
+
     timeframe: str = "1h"
-    bars: int = 0  # 0 → BARS_BY_TF[timeframe]
+    bars: int = 0
     top_n: int = 20
     stage1_min_score: float = 18.0
     min_probability_pct: float = 50.0
@@ -47,6 +53,8 @@ class TrendScanConfig:
     symbols: tuple[str, ...] | None = None
     long_only: bool = True
     use_closed_bar_only: bool = True
+    allow_trend: bool = True
+    allow_range: bool = True
 
 
 def trend_params_from_yaml() -> TrendPullbackParams:
@@ -83,6 +91,8 @@ def trend_scan_config_from_env() -> TrendScanConfig:
         symbols = load_filtered_symbols() or None
     long_only = env_bool("FORECAST_LONG_ONLY", bool(y.get("long_only", True)))
     use_closed = env_bool("FORECAST_USE_CLOSED_BAR", bool(y.get("use_closed_bar_only", True)))
+    allow_trend = env_bool("FORECAST_ALLOW_TREND", bool(y.get("allow_trend", True)))
+    allow_range = env_bool("FORECAST_ALLOW_RANGE", bool(y.get("allow_range", True)))
     return TrendScanConfig(
         timeframe=tf,
         bars=bars,
@@ -94,21 +104,55 @@ def trend_scan_config_from_env() -> TrendScanConfig:
         symbols=symbols,
         long_only=long_only,
         use_closed_bar_only=use_closed,
+        allow_trend=allow_trend,
+        allow_range=allow_range,
     )
 
 
-def scan_trend_setups(
+def _resolve_plan(
+    work: pd.DataFrame,
+    snap: dict[str, Any],
+    params: TrendPullbackParams,
+    *,
+    allow_trend: bool,
+    allow_range: bool,
+) -> tuple[dict[str, Any], Regime] | None:
+    if allow_trend:
+        plan = build_trend_plan(work, snap, params)
+        if plan is not None:
+            return plan, "trend"
+    if allow_range:
+        plan = build_range_plan(work, snap, params)
+        if plan is not None:
+            return plan, "range"
+    return None
+
+
+def _why_selected(plan: dict[str, Any], regime: Regime, rel_vol: float, params: TrendPullbackParams) -> str:
+    if regime == "range":
+        return (
+            f"range bounce 1h; pos={plan.get('range_position_pct')}% "
+            f"rel_vol={rel_vol:.2f}; RR={plan.get('risk_reward', 0):.2f}"
+        )
+    return (
+        f"trend {plan.get('trend')} momentum 1h; rel_vol={rel_vol:.2f}; "
+        f"TP {params.tp_target_pct * 100:.0f}%"
+    )
+
+
+def scan_combined_setups(
     symbols: tuple[str, ...],
     *,
     scan_cfg: TrendScanConfig | None = None,
     auto_cfg: Any | None = None,
 ) -> dict[str, Any]:
-    """Возвращает report в формате, совместимом с auto_trader (top_setups)."""
+    """Отчёт для auto_trader и панели (top_setups)."""
     scan_cfg = scan_cfg or TrendScanConfig()
     params = scan_cfg.trend_params or trend_params_from_yaml()
     bars = scan_cfg.bars or BARS_BY_TF.get(scan_cfg.timeframe, 1000)
     auto_cfg = auto_cfg or load_auto_trade_config()
     auto_cfg.min_probability_pct = scan_cfg.min_probability_pct
+    auto_cfg.min_score = max(float(auto_cfg.min_score), scan_cfg.stage1_min_score)
     auto_cfg.allow_level_breakout = False
     auto_cfg.allow_triangle = False
 
@@ -116,6 +160,7 @@ def scan_trend_setups(
     t0 = time.perf_counter()
     candidates: list[dict[str, Any]] = []
     skipped: list[str] = []
+    regime_counts: dict[str, int] = {"trend": 0, "range": 0}
 
     for symbol in symbols:
         df = _fetch_df(ex, symbol, scan_cfg.timeframe, bars)
@@ -129,19 +174,27 @@ def scan_trend_setups(
             continue
 
         snap = _stage1_snapshot(work)
-        plan = build_trend_plan(work, snap, params)
-        if plan is None:
+        resolved = _resolve_plan(
+            work,
+            snap,
+            params,
+            allow_trend=scan_cfg.allow_trend,
+            allow_range=scan_cfg.allow_range,
+        )
+        if resolved is None:
             continue
+
+        plan, regime = resolved
         if scan_cfg.long_only and str(plan.get("direction", "")).strip().lower() == "short":
             continue
 
-        last = df.iloc[-1]
+        last = work.iloc[-1]
         close = float(last["close"])
         candle_bullish = close > float(last["open"])
         rel_vol = float(snap["context"]["rel_volume"])
         support = float(plan["trend_support"])
         resistance = float(plan["trend_resistance"])
-        vol_up, vol_down = compute_volume_scores(df)
+        vol_up, vol_down = compute_volume_scores(work)
 
         stage1 = _adjust_stage1_for_direction(
             max(float(snap["stage1_score"]), 10.0),
@@ -158,34 +211,38 @@ def scan_trend_setups(
             continue
 
         cand = _build_candidate(symbol=symbol, snap=snap, plan=plan, stage1=stage1, df=work)
+        cand["regime"] = regime
         cand["trend"] = plan.get("trend")
         cand["entry_style"] = plan.get("entry_style")
         cand["rel_volume"] = plan.get("rel_volume")
-        cand["why_selected"] = (
-            f"trend {plan.get('trend')} momentum 1h; rel_vol={rel_vol:.2f}; "
-            f"TP {params.tp_target_pct * 100:.0f}%"
-        )
+        cand["pattern"] = "range bounce" if regime == "range" else f"trend {plan.get('trend', '')}"
+        cand["why_selected"] = _why_selected(plan, regime, rel_vol, params)
 
         ok, reason = validate_setup(cand, auto_cfg)
         if not ok:
-            print(f"[trend_scan] skip {symbol}: {reason}", flush=True)
+            print(f"[combined_scan] skip {symbol} ({regime}): {reason}", flush=True)
             continue
 
+        regime_counts[regime] = regime_counts.get(regime, 0) + 1
         candidates.append(cand)
 
-    candidates.sort(key=lambda c: -float(c.get("score") or 0))
+    candidates.sort(key=lambda c: (-float(c.get("score") or 0), str(c.get("regime"))))
     top = candidates[: max(1, scan_cfg.top_n)]
 
     return {
-        "mode": "trend_momentum",
-        "entry_style": "momentum",
+        "mode": SCAN_MODE,
+        "entry_style": "trend_momentum_and_range_bounce",
         "timeframe": scan_cfg.timeframe,
         "symbols_universe": list(symbols),
         "symbols_scanned": len(symbols),
         "skipped_no_data": skipped,
         "candidates_found": len(candidates),
+        "candidates_by_regime": regime_counts,
         "top_setups": top,
         "scan_duration_sec": round(time.perf_counter() - t0, 1),
+        "long_only": scan_cfg.long_only,
+        "allow_trend": scan_cfg.allow_trend,
+        "allow_range": scan_cfg.allow_range,
         "trend_params": {
             "lookback": params.trend_lookback,
             "min_move_pct": params.min_trend_move_pct,
@@ -193,10 +250,14 @@ def scan_trend_setups(
             "tp_target_pct": params.tp_target_pct,
             "block_asian_session": params.block_asian_session,
         },
+        "rule": (
+            "тренд (up/down) или флет (range) у S/R; "
+            f"stage1>={scan_cfg.stage1_min_score}; RR>={auto_cfg.min_risk_reward}"
+        ),
     }
 
 
-def scan_trend_filtered_setups(
+def scan_combined_filtered_setups(
     scan_cfg: TrendScanConfig | None = None,
     *,
     auto_cfg: Any | None = None,
@@ -212,4 +273,9 @@ def scan_trend_filtered_setups(
                 "error": "no_symbols: run symbol ranking or set FORECAST_SYMBOLS",
                 "top_setups": [],
             }
-    return scan_trend_setups(symbols, scan_cfg=scan_cfg, auto_cfg=auto_cfg)
+    return scan_combined_setups(symbols, scan_cfg=scan_cfg, auto_cfg=auto_cfg)
+
+
+# Совместимость со старыми импортами
+scan_trend_setups = scan_combined_setups
+scan_trend_filtered_setups = scan_combined_filtered_setups

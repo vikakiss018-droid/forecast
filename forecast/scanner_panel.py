@@ -1081,7 +1081,12 @@ def render_scanner_dashboard(
     scan_dur = report.get("scan_duration_sec")
     market_label = "Spot 1x" if str(getattr(at, "market_type", "futures")).lower() == "spot" else "Futures"
     scan_mode = str(report.get("mode") or "scanner")
-    scan_hint = "тренд 50 пар" if scan_mode == "trend_momentum" else "сканер"
+    if scan_mode == "trend_plus_range":
+        scan_hint = "тренд + флет · 50 пар"
+    elif scan_mode == "trend_momentum":
+        scan_hint = "тренд 50 пар"
+    else:
+        scan_hint = "сканер"
 
     return f"""<!DOCTYPE html>
 <html lang="ru">
@@ -1098,7 +1103,7 @@ def render_scanner_dashboard(
     <header>
       <div>
         <h1>Forecast Dashboard</h1>
-        <p class="subtitle">{scan_hint} · {market_label} · long only · обновление каждые 15 мин</p>
+        <p class="subtitle">{scan_hint} · {market_label} · обновление каждые 15 мин</p>
       </div>
       <div class="pills">
         {status_scan}

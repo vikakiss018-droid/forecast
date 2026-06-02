@@ -103,7 +103,7 @@ sudo ufw enable
 ```bash
 cd /opt/forecast
 source .venv/bin/activate
-# Параметры — configs/config.yaml (секции reference_backtest, trend_scan, auto_trade)
+# Combined: тренд + флет — configs/config.yaml (trend_scan.allow_trend/range, auto_trade)
 # Сверьте .env с .env.example перед запуском
 python -m forecast.run_scheduled_scan
 ```
@@ -118,7 +118,7 @@ python -m forecast.run_symbol_ranking
 
 ## Автоторговля (опционально)
 
-После тренд-скана открывается позиция на **Binance Spot** (**long only**), топ-N сетапов из 50 filtered пар.
+После combined-скана (тренд или флет) открывается позиция на **Binance Spot** (**long only**), топ-N сетапов из 50 filtered пар.
 
 1. В Binance API: **Enable Spot & Margin Trading** (без Withdraw).
 2. USDT на спотовом кошельке.
@@ -144,6 +144,8 @@ AUTO_TRADE_RISK_PCT=0.5
 AUTO_TRADE_LEVERAGE=1
 FORECAST_USE_FILTERED=1
 FORECAST_LONG_ONLY=1
+FORECAST_ALLOW_TREND=1
+FORECAST_ALLOW_RANGE=1
 ```
 
 4. Dry-run: `sudo -u forecast .venv/bin/python -m forecast.run_auto_trade`

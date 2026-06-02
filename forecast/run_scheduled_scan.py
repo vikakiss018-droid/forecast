@@ -1,18 +1,12 @@
 """
-Основной цикл: тренд 1h по 50 парам (symbol_ranking_filtered_r05_win50.json), торговля на Binance spot.
+Основной цикл: тренд + флет на 1h по 50 парам (symbol_ranking_filtered_r05_win50.json).
 
 Запуск (cron / systemd каждый час :03 UTC):
   python -m forecast.run_scheduled_scan
 
-Переменные окружения:
-  FORECAST_CONFIG              configs/config.yaml
-  FORECAST_USE_FILTERED=1      50 пар из filtered JSON (по умолчанию)
-  FORECAST_TIMEFRAME=1h
-  FORECAST_BARS=1000
-  FORECAST_TOP=20              сколько сетапов в отчёте
-  FORECAST_STAGE1_MIN_SCORE=18
-  AUTO_TRADE_MARKET=spot
-  AUTO_TRADE_ENABLED / AUTO_TRADE_DRY_RUN
+Параметры: configs/config.yaml → trend_scan, auto_trade
+Переменные: FORECAST_USE_FILTERED, FORECAST_ALLOW_TREND, FORECAST_ALLOW_RANGE,
+  FORECAST_LONG_ONLY, TREND_MIN_REL_VOLUME, AUTO_TRADE_* …
 """
 
 from __future__ import annotations
@@ -27,7 +21,11 @@ from .auto_trader import load_auto_trade_config, manage_open_positions, maybe_ru
 from .paths import CONFIGS_DIR, load_project_env
 from .run_symbol_ranking import load_filtered_symbols
 from .scan_cache import save_scan_result
-from .trend_scanner import scan_trend_filtered_setups, trend_scan_config_from_env
+from .trend_scanner import (
+    SCAN_MODE,
+    scan_combined_filtered_setups,
+    trend_scan_config_from_env,
+)
 
 
 def _load_auto_trade_yaml(config_path: str) -> dict:
@@ -46,6 +44,7 @@ def main() -> int:
     scan_cfg = trend_scan_config_from_env()
     auto_yaml = _load_auto_trade_yaml(config_path)
     auto_cfg = load_auto_trade_config(auto_yaml)
+    params = scan_cfg.trend_params
 
     symbols = scan_cfg.symbols or ()
     if not symbols and scan_cfg.use_filtered_symbols:
@@ -53,55 +52,74 @@ def main() -> int:
 
     if not symbols:
         print(
-            "[trend] ERROR: нет символов. Запустите run_symbol_ranking или задайте FORECAST_SYMBOLS",
+            "[combined] ERROR: нет символов. Запустите run_symbol_ranking или задайте FORECAST_SYMBOLS",
             flush=True,
         )
         return 1
 
+    regimes = []
+    if scan_cfg.allow_trend:
+        regimes.append("trend")
+    if scan_cfg.allow_range:
+        regimes.append("range")
+    if not regimes:
+        print("[combined] ERROR: отключены и trend, и range (FORECAST_ALLOW_TREND/RANGE)", flush=True)
+        return 1
+
+    min_vol = params.min_rel_volume if params else 1.2
     print(
-        f"[trend] scan {len(symbols)} pairs ({'filtered R>0.5 win>50%' if scan_cfg.use_filtered_symbols else 'custom'}), "
-        f"{scan_cfg.timeframe} stage1>={scan_cfg.stage1_min_score} "
-        f"TP=4% rel_vol>={scan_cfg.trend_params.min_rel_volume if scan_cfg.trend_params else 1.2}; "
-        f"trade market={auto_cfg.market_type} dry_run={auto_cfg.dry_run}",
+        f"[combined] scan {len(symbols)} pairs "
+        f"({'filtered R>0.5 win>50%' if scan_cfg.use_filtered_symbols else 'custom'}), "
+        f"{scan_cfg.timeframe} regimes={'+'.join(regimes)} "
+        f"stage1>={scan_cfg.stage1_min_score} rel_vol>={min_vol} "
+        f"RR>={auto_cfg.min_risk_reward} "
+        f"{'long-only ' if scan_cfg.long_only else ''}"
+        f"market={auto_cfg.market_type} dry_run={auto_cfg.dry_run}",
         flush=True,
     )
 
-    report = scan_trend_filtered_setups(scan_cfg, auto_cfg=auto_cfg)
+    report = scan_combined_filtered_setups(scan_cfg, auto_cfg=auto_cfg)
     if report.get("status") == "error":
-        print(f"[trend] scan failed: {report.get('error')}", flush=True)
+        print(f"[combined] scan failed: {report.get('error')}", flush=True)
         return 1
 
+    by_regime = report.get("candidates_by_regime") or {}
     path = save_scan_result(
         report,
         scan_config={
-            "mode": "trend_momentum",
+            "mode": SCAN_MODE,
             "timeframe": scan_cfg.timeframe,
             "bars": scan_cfg.bars or None,
             "top_n": scan_cfg.top_n,
             "stage1_min_score": scan_cfg.stage1_min_score,
             "symbols_count": len(symbols),
             "use_filtered": scan_cfg.use_filtered_symbols,
+            "allow_trend": scan_cfg.allow_trend,
+            "allow_range": scan_cfg.allow_range,
+            "long_only": scan_cfg.long_only,
             "scan_duration_sec": report.get("scan_duration_sec"),
             "candidates_found": report.get("candidates_found"),
+            "candidates_by_regime": by_regime,
         },
     )
     n_top = len(report.get("top_setups") or [])
     print(
-        f"[trend] done candidates={report.get('candidates_found')} top={n_top} "
-        f"duration_sec={report.get('scan_duration_sec')} saved={path}",
+        f"[combined] done candidates={report.get('candidates_found')} "
+        f"(trend={by_regime.get('trend', 0)} range={by_regime.get('range', 0)}) "
+        f"top={n_top} duration_sec={report.get('scan_duration_sec')} saved={path}",
         flush=True,
     )
-    for row in (report.get("top_setups") or [])[:5]:
+    for row in (report.get("top_setups") or [])[:8]:
         plan = row.get("setup") or {}
         print(
-            f"  · {row.get('symbol')} {plan.get('direction')} score={row.get('score')} "
-            f"RR={plan.get('risk_reward')}",
+            f"  · {row.get('symbol')} [{row.get('regime', '?')}] "
+            f"{plan.get('direction')} score={row.get('score')} RR={plan.get('risk_reward')}",
             flush=True,
         )
 
     pos_result = manage_open_positions(yaml_cfg=auto_yaml)
     print(
-        f"[trend] positions open={pos_result.get('open_count')} "
+        f"[combined] positions open={pos_result.get('open_count')} "
         f"profit_closed={len(pos_result.get('profit_closed') or [])} "
         f"loss_closed={len(pos_result.get('loss_closed') or [])}",
         flush=True,
@@ -109,8 +127,8 @@ def main() -> int:
 
     trade_result = maybe_run_auto_trade(report, yaml_cfg=auto_yaml)
     print(
-        f"[trend] auto_trade: {trade_result.get('action')} opened={trade_result.get('opened_count', 0)} "
-        f"{trade_result.get('reason', '')}",
+        f"[combined] auto_trade: {trade_result.get('action')} "
+        f"opened={trade_result.get('opened_count', 0)} {trade_result.get('reason', '')}",
         flush=True,
     )
     return 0

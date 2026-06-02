@@ -78,7 +78,7 @@ reference_backtest:
   max_hold_bars_1h: 48
   cooldown_bars_same_symbol: 4
 
-# Live-скан + systemd (каждый час :03 UTC) — максимально как бэктест, spot long only
+# Live-скан + systemd (:03 UTC): тренд + флет, как combined backtest, spot long only
 trend_scan:
   timeframe: 1h
   bars: 1000
@@ -87,6 +87,8 @@ trend_scan:
   use_filtered: true
   long_only: true
   use_closed_bar_only: true
+  allow_trend: true
+  allow_range: true
   min_prob_pct: 50
   lookback: 60
   min_move_pct: 0.008

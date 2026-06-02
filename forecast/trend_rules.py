@@ -11,7 +11,7 @@ from typing import Any, Literal
 import numpy as np
 import pandas as pd
 
-from .market_scanner import LEVEL_PROXIMITY_FRAC, _level_proximity
+from .market_scanner import LEVEL_PROXIMITY_FRAC, RANGE_ENTRY_ZONE_FRAC, _level_proximity
 
 TREND_LOOKBACK = 60
 MIN_TREND_MOVE_PCT = 0.008
@@ -317,6 +317,79 @@ def build_trend_plan(
         "risk_reward": float(rr),
         "trend": trend,
         "entry_style": style,
+        "range_position_pct": round(100.0 * range_pos, 1),
+        "trend_support": support,
+        "trend_resistance": resistance,
+        "rel_volume": round(rel_vol, 3),
+        "atr_pct": round(atr_pct, 5),
+    }
+
+
+def build_range_plan(
+    df: pd.DataFrame,
+    snap: dict[str, Any],
+    params: TrendPullbackParams | None = None,
+) -> dict[str, Any] | None:
+    """Отскок от S/R во флете (detect_price_trend == range), логика как market_scanner."""
+    params = params or DEFAULT_PULLBACK_PARAMS
+    if detect_price_trend(df, params) != "range":
+        return None
+
+    rel_vol = float(snap.get("context", {}).get("rel_volume", 0.0))
+    if params.min_rel_volume > 0 and rel_vol < params.min_rel_volume:
+        return None
+
+    last = df.iloc[-1]
+    close = float(last["close"])
+    atr = max(float(last.get("atr_14", 0.0)), 1e-9)
+    atr_pct = atr / max(close, 1e-12)
+    if params.min_atr_pct > 0 and atr_pct < params.min_atr_pct:
+        return None
+
+    support = float(snap["support_level"])
+    resistance = float(snap["resistance_level"])
+    span = max(resistance - support, 1e-9)
+    range_pos = _range_position(close, support, resistance)
+
+    if abs(close - support) <= abs(resistance - close):
+        if abs(close - support) / span >= RANGE_ENTRY_ZONE_FRAC:
+            return None
+        direction = "Long"
+        entry = close
+        stop = support - 1.2 * atr
+    else:
+        if abs(close - resistance) / span >= RANGE_ENTRY_ZONE_FRAC:
+            return None
+        direction = "Short"
+        entry = close
+        stop = resistance + 1.2 * atr
+
+    risk = max(abs(entry - stop), atr * 0.5)
+    if risk <= 0:
+        return None
+
+    if direction == "Long":
+        if stop >= entry:
+            return None
+        tp1 = entry + 1.0 * risk
+        tp2 = entry + RR_TARGET * risk
+    else:
+        if stop <= entry:
+            return None
+        tp1 = entry - 1.0 * risk
+        tp2 = entry - RR_TARGET * risk
+
+    rr = abs(tp2 - entry) / risk
+    return {
+        "direction": direction,
+        "probability_pct": 55.0,
+        "entry": float(entry),
+        "stop": float(stop),
+        "target_1": float(tp1),
+        "target_2": float(tp2),
+        "risk_reward": float(rr),
+        "trend": "range",
+        "entry_style": "range_bounce",
         "range_position_pct": round(100.0 * range_pos, 1),
         "trend_support": support,
         "trend_resistance": resistance,
