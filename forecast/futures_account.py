@@ -227,9 +227,9 @@ def fetch_trading_account_snapshot(
         try:
             from .auto_trader import load_auto_trade_config
 
-            mkt = str(load_auto_trade_config().market_type or "futures").strip().lower()
+            mkt = str(load_auto_trade_config().market_type or "spot").strip().lower()
         except Exception:
-            mkt = "futures"
+            mkt = "spot"
     if mkt == "spot":
         return fetch_spot_account_snapshot(force=force)
     snap = fetch_futures_account_snapshot(force=force)

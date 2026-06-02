@@ -737,6 +737,10 @@ def render_tf_backtest_dashboard(
 </html>"""
 
 
+def _market_display_name(market_type: str) -> str:
+    return "Binance Spot" if str(market_type).strip().lower() == "spot" else "Binance USDT-M Futures"
+
+
 def _trader_config_cards(at: AutoTradeConfig) -> str:
     api_src = trading_credentials_source()
     api_label = {
@@ -744,9 +748,11 @@ def _trader_config_cards(at: AutoTradeConfig) -> str:
         "BINANCE_*": "Общий ключ (BINANCE_*)",
         "none": "Ключи не заданы",
     }.get(api_src, api_src)
+    mkt = str(getattr(at, "market_type", "spot")).strip().lower()
     items = [
         ("API торговли", api_label),
-        ("Рынок", "Binance USDT-M Futures"),
+        ("Рынок (торговля)", _market_display_name(mkt)),
+        ("Скан OHLCV", "Binance Spot (всегда)"),
         ("Включено", "Да" if at.enabled else "Нет"),
         ("Режим", "Dry-run" if at.dry_run else "LIVE"),
         ("Min score", _fmt_num(at.min_score, 1)),
@@ -965,20 +971,48 @@ def _position_chart_url(op: dict[str, Any], *, timeframe: str, bars: int = 120) 
     return f"/trader/chart?{urlencode(params)}"
 
 
+def _exchange_holdings_as_positions(account: dict[str, Any]) -> list[dict[str, Any]]:
+    if not account.get("ok") or str(account.get("market") or "").lower() != "spot":
+        return []
+    out: list[dict[str, Any]] = []
+    for p in account.get("positions") or []:
+        sym = str(p.get("symbol") or "")
+        if not sym or sym == "USDT/USDT":
+            continue
+        out.append(
+            {
+                "symbol": sym,
+                "side": str(p.get("side") or "long"),
+                "amount": p.get("contracts"),
+                "entry_price": p.get("entry_price"),
+                "notional_usdt": p.get("notional_usdt"),
+                "unrealized_pnl": p.get("unrealized_pnl"),
+                "leverage": 1,
+                "from_exchange_only": True,
+            }
+        )
+    return out
+
+
 def _open_positions_section(
     state: dict[str, Any],
     at: AutoTradeConfig,
     *,
     return_q: str,
     timeframe: str = "1h",
+    account: dict[str, Any] | None = None,
 ) -> str:
     positions = list(state.get("open_positions") or [])
+    exchange_only = False
+    if not positions and account:
+        positions = _exchange_holdings_as_positions(account)
+        exchange_only = bool(positions)
     max_n = int(at.max_open_positions)
     if not positions:
         return f"""
         <div class="pos-card pos-empty">
           <h3>Открытые позиции (0/{max_n})</h3>
-          <p>Нет активных позиций в state</p>
+          <p>Нет активных позиций в state. Если сделка есть на Binance Spot — обновите страницу после деплоя fix или проверьте «Позиции на бирже» ниже.</p>
         </div>"""
 
     mkt_label = "Spot" if str(getattr(at, "market_type", "futures")).lower() == "spot" else "Futures"
@@ -994,8 +1028,11 @@ def _open_positions_section(
         target = float(op.get("profit_target_usdt") or 0.0)
         loss_lim = float(op.get("loss_limit_usdt") or at.stop_loss_roi_usdt or 0.0)
         dry = bool(op.get("dry_run"))
+        ex_only = bool(op.get("from_exchange_only"))
         close_html = ""
-        if close_key and not dry and not at.dry_run:
+        if ex_only:
+            close_html = '<span class="muted">С биржи (state пуст) — закройте вручную или дождитесь sync</span>'
+        elif close_key and not dry and not at.dry_run:
             sym_label = _e(op.get("symbol") or close_key)
             close_html = f"""
         <form method="post" action="/trader/close" class="pos-close-form" onsubmit="return confirm('Закрыть {sym_label} по рынку?');">
@@ -1030,9 +1067,13 @@ def _open_positions_section(
       </div>"""
         )
 
+    hint = ""
+    if exchange_only:
+        hint = '<p class="pos-summary muted">Показаны holdings с биржи (в state бота записи нет — будет восстановлено после sync)</p>'
     return f"""
     <div class="pos-stack">
       <p class="pos-summary">Открыто <strong>{len(positions)}/{max_n}</strong> — новые сделки не откроются при лимите</p>
+      {hint}
       {"".join(cards)}
     </div>"""
 
@@ -1151,7 +1192,7 @@ def render_scanner_dashboard(
       </section>
       <section>
         <h2>Открытые позиции бота</h2>
-        {_open_positions_section(trade_state, at, return_q=base_q, timeframe=timeframe)}
+        {_open_positions_section(trade_state, at, return_q=base_q, timeframe=timeframe, account=account)}
       </section>
     </div>
 

@@ -1499,7 +1499,14 @@ def scanner_panel(
         live=live,
     )
     cached = load_scan_result() or {}
-    at = load_auto_trade_config(_auto_trade_yaml())
+    at_yaml = _auto_trade_yaml()
+    at = load_auto_trade_config(at_yaml)
+    try:
+        from .auto_trader import manage_open_positions
+
+        manage_open_positions(yaml_cfg=at_yaml)
+    except Exception as e:
+        print(f"[scanner] manage_open_positions warning: {e}", flush=True)
     trade_hist = load_trade_history(30)
     scan_hist = load_scan_history(25)
     return render_scanner_dashboard(
@@ -1511,7 +1518,7 @@ def scanner_panel(
         trade_state=load_trade_state(),
         scan_history=scan_hist,
         trade_history=trade_hist,
-        account=fetch_trading_account_snapshot(),
+        account=fetch_trading_account_snapshot(market_type=at.market_type),
         bot_stats=compute_bot_stats(trade_hist, scan_hist),
         top=top,
         bars=bars,

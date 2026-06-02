@@ -91,9 +91,9 @@ def load_auto_trade_config(yaml_cfg: dict[str, Any] | None = None) -> AutoTradeC
     load_project_env(force=True)
     y = yaml_cfg or {}
     max_n = float(y.get("max_notional_usdt", y.get("max_quote_usdt", 50.0)))
-    market = str(y.get("market_type", y.get("market", "futures"))).strip().lower()
+    market = str(y.get("market_type", y.get("market", "spot"))).strip().lower()
     if market not in ("spot", "futures"):
-        market = "futures"
+        market = "spot"
     lev_default = 1 if market == "spot" else 5
     base = AutoTradeConfig(
         enabled=bool(y.get("enabled", False)),
@@ -500,11 +500,22 @@ def _spot_base_currency(symbol: str) -> str:
     return symbol.split("/")[0].strip()
 
 
-def _spot_free_base(exchange: Any, symbol: str) -> float:
+def _spot_base_amount(exchange: Any, symbol: str) -> float:
+    """free + used: после OCO sell база часто в used, не в free."""
     base = _spot_base_currency(symbol)
     bal = exchange.fetch_balance()
+    row = bal.get(base)
+    if isinstance(row, dict):
+        total = float(row.get("total") or 0.0)
+        if total > 0:
+            return total
+        return float(row.get("free") or 0.0) + float(row.get("used") or 0.0)
+    total_map = bal.get("total") or {}
+    if isinstance(total_map, dict) and base in total_map:
+        return float(total_map.get(base) or 0.0)
     free = bal.get("free") or {}
-    return float(free.get(base) or 0.0)
+    used = bal.get("used") or {}
+    return float(free.get(base) or 0.0) + float(used.get(base) or 0.0)
 
 
 def _spot_unrealized_pnl(rec: dict[str, Any], mark: float) -> float:
@@ -529,7 +540,7 @@ def _sync_open_positions_spot(exchange: Any, state: dict[str, Any], cfg: AutoTra
             min_cost, min_amount = _market_limits(exchange, symbol)
         except Exception:
             min_amount = 1e-8
-        amount = _spot_free_base(exchange, symbol)
+        amount = _spot_resolve_amount(exchange, symbol, rec, min_amount=min_amount)
         if amount < min_amount * 0.25:
             if not cfg.dry_run:
                 cancel_symbol_open_orders(exchange, symbol, order_ids=_order_ids_from_rec(rec))
@@ -696,11 +707,39 @@ def _order_ids_from_rec(rec: dict[str, Any] | None) -> list[str]:
         return []
     orders = rec.get("orders") or {}
     ids: list[str] = []
-    for key in ("stop", "tp", "entry"):
+    for key in ("stop", "tp", "entry", "oco"):
         oid = orders.get(key)
         if oid is not None and str(oid).strip():
             ids.append(str(oid))
     return ids
+
+
+def _spot_has_open_sell_orders(exchange: Any, symbol: str) -> bool:
+    try:
+        for order in exchange.fetch_open_orders(symbol) or []:
+            if str(order.get("side", "")).lower() == "sell":
+                return True
+    except Exception as e:
+        print(f"[auto_trade] fetch_open_orders {symbol} warning: {e}", flush=True)
+    return False
+
+
+def _spot_resolve_amount(
+    exchange: Any,
+    symbol: str,
+    rec: dict[str, Any],
+    *,
+    min_amount: float,
+) -> float:
+    """Баланс базы на spot; при OCO монета в used — не считать позицию закрытой."""
+    on_exchange = _spot_base_amount(exchange, symbol)
+    stored = float(rec.get("amount") or 0.0)
+    threshold = min_amount * 0.25
+    if on_exchange >= threshold:
+        return on_exchange
+    if _spot_has_open_sell_orders(exchange, symbol):
+        return max(on_exchange, stored)
+    return on_exchange
 
 
 def cancel_symbol_open_orders(
@@ -749,7 +788,7 @@ def close_spot_position_market(
         return {"ok": True, "dry_run": True, "symbol": symbol, "reason": reason}
 
     cancel_symbol_open_orders(exchange, symbol, order_ids=order_ids)
-    amount = _spot_free_base(exchange, symbol)
+    amount = _spot_base_amount(exchange, symbol)
     min_cost, min_amount = _market_limits(exchange, symbol)
     if amount < min_amount:
         return {"ok": False, "reason": "NO_POSITION", "symbol": symbol}
@@ -940,13 +979,55 @@ def _apply_auto_closes(exchange: Any, state: dict[str, Any], cfg: AutoTradeConfi
     return {"profit_closed": profit, "loss_closed": loss}
 
 
+def _reconcile_spot_into_state(
+    exchange: Any, state: dict[str, Any], cfg: AutoTradeConfig
+) -> dict[str, Any]:
+    """Если сделка live есть на бирже, но запись пропала из state — восстановить."""
+    if cfg.dry_run or not is_spot_market(cfg):
+        return state
+    state = _normalize_state(state)
+    known = {str(r.get("symbol")) for r in state.get("open_positions") or []}
+    last = state.get("last_trade") or {}
+    if not isinstance(last, dict) or last.get("dry_run"):
+        return state
+    sym = str(last.get("symbol") or "").strip()
+    if not sym or sym in known:
+        return state
+    try:
+        _min_cost, min_amount = _market_limits(exchange, sym)
+    except Exception:
+        min_amount = 1e-8
+    stub: dict[str, Any] = {
+        "symbol": sym,
+        "market": "spot",
+        "side": str(last.get("side") or "long"),
+        "opened_at": last.get("at"),
+        "amount": float(last.get("amount") or 0.0),
+        "reconciled_from_exchange": True,
+    }
+    amount = _spot_resolve_amount(exchange, sym, stub, min_amount=min_amount)
+    if amount < min_amount * 0.25:
+        return state
+    stub["amount"] = amount
+    try:
+        stub["entry_price"] = _estimate_entry_price(exchange, sym, float(stub.get("entry") or 0.0))
+    except Exception:
+        stub["entry_price"] = stub.get("entry")
+    state.setdefault("open_positions", []).append(stub)
+    print(f"[auto_trade] reconciled spot position {sym} into state", flush=True)
+    return state
+
+
 def manage_open_positions(*, yaml_cfg: dict[str, Any] | None = None) -> dict[str, Any]:
     """Sync positions, apply profit/loss ROI closes. Call each scan cycle."""
     cfg = load_auto_trade_config(yaml_cfg)
     state = load_trade_state()
     exchange = exchange_for_config(cfg)
+    state = _reconcile_spot_into_state(exchange, state, cfg)
+    state = ensure_spot_exit_orders(exchange, state, cfg)
     state = _sync_open_positions(exchange, state, cfg)
     closed = _apply_auto_closes(exchange, state, cfg)
+    state = ensure_spot_exit_orders(exchange, state, cfg)
     state = _sync_open_positions(exchange, state, cfg)
     save_trade_state(state)
     return {
@@ -1117,6 +1198,182 @@ def execute_futures_trade(
     }
 
 
+def _place_spot_oco_exit(
+    exchange: Any,
+    symbol: str,
+    *,
+    amount: float,
+    entry_price: float,
+    stop: float,
+    take_profit: float,
+) -> dict[str, Any]:
+    """Binance spot OCO (TP limit + stop). create_order('OCO') не поддерживается — только private API."""
+    exchange.load_markets()
+    market = exchange.market(symbol)
+    amount_s = exchange.amount_to_precision(symbol, amount)
+    if float(amount_s) <= 0:
+        return {"ok": False, "reason": "ZERO_AMOUNT"}
+
+    entry_px = max(float(entry_price), 1e-12)
+    tp_f = float(take_profit)
+    stop_f = float(stop)
+    if tp_f <= entry_px:
+        tp_f = entry_px * 1.002
+    if stop_f >= entry_px:
+        stop_f = entry_px * 0.998
+
+    tp_p = exchange.price_to_precision(symbol, tp_f)
+    stop_p = exchange.price_to_precision(symbol, stop_f)
+    stop_limit_p = exchange.price_to_precision(symbol, float(stop_p) * 0.995)
+
+    if float(tp_p) <= float(stop_p):
+        return {"ok": False, "reason": f"INVALID_OCO_PRICES:tp={tp_p}<=stop={stop_p}"}
+
+    try:
+        resp = exchange.private_post_order_oco(
+            {
+                "symbol": market["id"],
+                "side": "SELL",
+                "quantity": amount_s,
+                "price": tp_p,
+                "stopPrice": stop_p,
+                "stopLimitPrice": stop_limit_p,
+                "stopLimitTimeInForce": "GTC",
+            }
+        )
+    except Exception as e:
+        print(f"[auto_trade] OCO failed {symbol}: {e}", flush=True)
+        return _place_spot_exit_fallback(
+            exchange,
+            symbol,
+            amount_s=amount_s,
+            stop_p=stop_p,
+            stop_limit_p=stop_limit_p,
+            tp_p=tp_p,
+            oco_error=str(e),
+        )
+
+    order_ids: list[str] = []
+    oco_id = resp.get("orderListId")
+    for part in resp.get("orders") or []:
+        oid = part.get("orderId") if isinstance(part, dict) else None
+        if oid is not None:
+            order_ids.append(str(oid))
+
+    print(
+        f"[auto_trade] OCO placed {symbol} qty={amount_s} TP={tp_p} stop={stop_p}",
+        flush=True,
+    )
+    return {
+        "ok": True,
+        "method": "oco",
+        "oco_order_id": oco_id,
+        "orders": {"entry": None, "oco": oco_id, "oco_all": order_ids},
+        "stop": float(stop_p),
+        "take_profit": float(tp_p),
+    }
+
+
+def _place_spot_exit_fallback(
+    exchange: Any,
+    symbol: str,
+    *,
+    amount_s: str,
+    stop_p: str,
+    stop_limit_p: str,
+    tp_p: str,
+    oco_error: str,
+) -> dict[str, Any]:
+    """Стоп + тейк отдельными ордерами, если OCO недоступен."""
+    try:
+        stop_order = exchange.create_order(
+            symbol,
+            "STOP_LOSS_LIMIT",
+            "sell",
+            amount_s,
+            stop_limit_p,
+            {"stopPrice": stop_p, "timeInForce": "GTC"},
+        )
+        tp_order = None
+        try:
+            tp_order = exchange.create_order(symbol, "limit", "sell", amount_s, tp_p)
+        except Exception as tp_err:
+            print(f"[auto_trade] TP limit failed {symbol}: {tp_err}", flush=True)
+        orders = {"stop": stop_order.get("id"), "tp": tp_order.get("id") if tp_order else None}
+        print(
+            f"[auto_trade] exit fallback {symbol} stop={orders.get('stop')} tp={orders.get('tp')} "
+            f"(OCO err: {oco_error})",
+            flush=True,
+        )
+        return {
+            "ok": True,
+            "method": "separate",
+            "oco_error": oco_error,
+            "orders": orders,
+            "stop": float(stop_p),
+            "take_profit": float(tp_p),
+        }
+    except Exception as e:
+        return {"ok": False, "reason": f"EXIT_ORDERS_FAILED:{e}", "oco_error": oco_error}
+
+
+def ensure_spot_exit_orders(
+    exchange: Any, state: dict[str, Any], cfg: AutoTradeConfig
+) -> dict[str, Any]:
+    """Доставить TP/стоп, если покупка прошла, а OCO не встал (старый баг или сбой API)."""
+    if cfg.dry_run or not is_spot_market(cfg):
+        return state
+    state = _normalize_state(state)
+    updated: list[dict[str, Any]] = []
+    for rec in state.get("open_positions") or []:
+        row = dict(rec)
+        sym = str(row.get("symbol") or "")
+        if not sym or str(row.get("side", "long")).lower() != "long":
+            updated.append(row)
+            continue
+        if _spot_has_open_sell_orders(exchange, sym):
+            row["exit_orders_placed"] = True
+            updated.append(row)
+            continue
+
+        amount = float(row.get("amount") or 0.0)
+        if amount <= 0:
+            try:
+                _mc, min_amt = _market_limits(exchange, sym)
+            except Exception:
+                min_amt = 1e-8
+            amount = _spot_resolve_amount(exchange, sym, row, min_amount=min_amt)
+        entry_px = float(row.get("entry_price") or row.get("entry") or 0.0)
+        stop = float(row.get("stop") or 0.0)
+        tp = float(row.get("take_profit") or 0.0)
+        if amount > 0 and entry_px > 0 and stop > 0 and tp > 0:
+            placed = _place_spot_oco_exit(
+                exchange,
+                sym,
+                amount=amount,
+                entry_price=entry_px,
+                stop=stop,
+                take_profit=tp,
+            )
+            if placed.get("ok"):
+                row["exit_orders_placed"] = True
+                row["exit_method"] = placed.get("method")
+                row["orders"] = {**(row.get("orders") or {}), **(placed.get("orders") or {})}
+                if placed.get("oco_order_id") is not None:
+                    row["orders"]["oco"] = placed.get("oco_order_id")
+                print(f"[auto_trade] exit orders recovered for {sym}", flush=True)
+            else:
+                row["exit_orders_placed"] = False
+                row["exit_error"] = placed.get("reason")
+                print(
+                    f"[auto_trade] CRITICAL: no exit orders on {sym}: {placed.get('reason')}",
+                    flush=True,
+                )
+        updated.append(row)
+    state["open_positions"] = updated
+    return state
+
+
 def execute_spot_trade(
     exchange: Any,
     *,
@@ -1174,31 +1431,24 @@ def execute_spot_trade(
     if amount < min_amount:
         return {"ok": False, "reason": "FILLED_TOO_SMALL", "entry_order": entry_order}
 
-    tp_p = exchange.price_to_precision(symbol, tp)
-    stop_p = exchange.price_to_precision(symbol, stop)
-    stop_limit = float(stop_p) * 0.995
-    stop_limit_p = exchange.price_to_precision(symbol, stop_limit)
-
-    oco = exchange.create_order(
+    exit_res = _place_spot_oco_exit(
+        exchange,
         symbol,
-        "OCO",
-        "sell",
-        amount,
-        tp_p,
-        {
-            "stopPrice": stop_p,
-            "stopLimitPrice": stop_limit_p,
-            "stopLimitTimeInForce": "GTC",
-        },
+        amount=amount,
+        entry_price=entry_price,
+        stop=stop,
+        take_profit=tp,
     )
-    oco_ids: list[str] = []
-    for part in oco.get("orders") or []:
-        oid = part.get("id") if isinstance(part, dict) else None
-        if oid is not None:
-            oco_ids.append(str(oid))
-    oco_id = oco.get("id")
-    if oco_id is not None:
-        oco_ids.append(str(oco_id))
+    exit_ok = bool(exit_res.get("ok"))
+    if not exit_ok:
+        print(
+            f"[auto_trade] CRITICAL {symbol}: bought on spot but TP/SL not placed: "
+            f"{exit_res.get('reason')}. Will retry on next sync.",
+            flush=True,
+        )
+
+    orders = {"entry": entry_order.get("id")}
+    orders.update(exit_res.get("orders") or {})
 
     return {
         "ok": True,
@@ -1210,12 +1460,15 @@ def execute_spot_trade(
         "amount": amount,
         "leverage": 1,
         "entry_order_id": entry_order.get("id"),
-        "oco_order_id": oco_id,
+        "oco_order_id": exit_res.get("oco_order_id"),
         "entry": entry,
         "entry_price": entry_price,
-        "stop": stop,
-        "take_profit": tp,
-        "orders": {"entry": entry_order.get("id"), "oco": oco_id, "oco_all": oco_ids},
+        "stop": exit_res.get("stop", stop),
+        "take_profit": exit_res.get("take_profit", tp),
+        "exit_orders_placed": exit_ok,
+        "exit_method": exit_res.get("method"),
+        "exit_error": None if exit_ok else exit_res.get("reason"),
+        "orders": orders,
         "profit_target_usdt": _profit_target_usdt(
             {"notional_usdt": notional_usdt, "leverage": 1},
             cfg,
@@ -1269,7 +1522,7 @@ def _try_open_candidate(
                 "trade_rank": trade_rank,
             }
         _min_cost, min_amount = _market_limits(exchange, symbol)
-        if _spot_free_base(exchange, symbol) >= min_amount * 0.25:
+        if _spot_base_amount(exchange, symbol) >= min_amount * 0.25:
             return {
                 "action": "skipped",
                 "reason": "SPOT_BALANCE_OPEN",
@@ -1359,6 +1612,9 @@ def _try_open_candidate(
             "loss_limit_usdt": _loss_limit_usdt(cfg),
             **meta,
         }
+        pos_rec["exit_orders_placed"] = bool(exec_result.get("exit_orders_placed", True))
+        pos_rec["exit_method"] = exec_result.get("exit_method")
+        pos_rec["exit_error"] = exec_result.get("exit_error")
         if is_spot_market(cfg):
             pos_rec["orders"] = exec_result.get("orders") or {
                 "entry": exec_result.get("entry_order_id"),
@@ -1372,6 +1628,7 @@ def _try_open_candidate(
                 "tp": exec_result.get("tp_order_id"),
             }
         state.setdefault("open_positions", []).append(pos_rec)
+        save_trade_state(state)
     else:
         dry_rec: dict[str, Any] = {
             "symbol": symbol,
@@ -1384,13 +1641,17 @@ def _try_open_candidate(
         if not is_spot_market(cfg):
             dry_rec["futures_symbol"] = trade_sym
         state.setdefault("open_positions", []).append(dry_rec)
+        save_trade_state(state)
     state["last_trade_at"] = now
     state["last_trade"] = {
         "symbol": symbol,
         "side": side,
         "dry_run": cfg.dry_run,
         "at": now,
+        "amount": exec_result.get("amount"),
+        "market": "spot" if is_spot_market(cfg) else "futures",
     }
+    save_trade_state(state)
     action = "dry_run" if cfg.dry_run else "executed"
     print(f"[auto_trade] done {action} {side} {symbol}", flush=True)
     return {
@@ -1417,8 +1678,11 @@ def maybe_run_auto_trade(
 
     state = load_trade_state()
     exchange = exchange_for_config(cfg)
+    state = _reconcile_spot_into_state(exchange, state, cfg)
+    state = ensure_spot_exit_orders(exchange, state, cfg)
     state = _sync_open_positions(exchange, state, cfg)
     _apply_auto_closes(exchange, state, cfg)
+    state = ensure_spot_exit_orders(exchange, state, cfg)
     state = _sync_open_positions(exchange, state, cfg)
     save_trade_state(state)
 
