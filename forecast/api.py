@@ -1518,7 +1518,7 @@ def scanner_panel(
         trade_state=load_trade_state(),
         scan_history=scan_hist,
         trade_history=trade_hist,
-        account=fetch_trading_account_snapshot(market_type=at.market_type),
+        account=fetch_trading_account_snapshot(market_type=at.market_type, force=True),
         bot_stats=compute_bot_stats(trade_hist, scan_hist),
         top=top,
         bars=bars,

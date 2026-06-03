@@ -541,10 +541,19 @@ def _sync_open_positions_spot(exchange: Any, state: dict[str, Any], cfg: AutoTra
         except Exception:
             min_amount = 1e-8
         amount = _spot_resolve_amount(exchange, symbol, rec, min_amount=min_amount)
-        if amount < min_amount * 0.25:
+        if not _spot_position_open(exchange, symbol, min_amount=min_amount):
             if not cfg.dry_run:
                 cancel_symbol_open_orders(exchange, symbol, order_ids=_order_ids_from_rec(rec))
-                record_closed_trade(state, rec, close_reason="EXCHANGE_CLOSED")
+                record_closed_trade(
+                    state,
+                    rec,
+                    close_reason="MANUAL_OR_EXCHANGE_CLOSED",
+                )
+                _clear_last_trade_if_symbol(state, symbol)
+                print(
+                    f"[auto_trade] spot position gone on exchange, removed from state: {symbol}",
+                    flush=True,
+                )
             continue
         try:
             mark = _estimate_entry_price(exchange, symbol, float(rec.get("entry") or 0.0))
@@ -669,7 +678,16 @@ def _sync_futures_positions(exchange: Any, state: dict[str, Any], cfg: AutoTrade
                     fsym,
                     order_ids=_order_ids_from_rec(rec),
                 )
-                record_closed_trade(state, rec, close_reason="EXCHANGE_CLOSED")
+                record_closed_trade(
+                    state,
+                    rec,
+                    close_reason="MANUAL_OR_EXCHANGE_CLOSED",
+                )
+                _clear_last_trade_if_symbol(state, spot)
+                print(
+                    f"[auto_trade] futures position gone on exchange, removed from state: {spot or fsym}",
+                    flush=True,
+                )
             continue
         upnl = float(p.get("unrealizedPnl") or p.get("unrealisedPnl") or 0.0)
         row = dict(rec)
@@ -693,6 +711,31 @@ def _sync_futures_positions(exchange: Any, state: dict[str, Any], cfg: AutoTrade
 
 def _open_positions_count(state: dict[str, Any]) -> int:
     return len(state.get("open_positions") or [])
+
+
+def open_positions_for_panel(
+    state: dict[str, Any],
+    account: dict[str, Any] | None,
+    cfg: AutoTradeConfig,
+) -> list[dict[str, Any]]:
+    """Скрыть в панели позиции, которых уже нет на бирже (ручное закрытие и т.п.)."""
+    positions = list(state.get("open_positions") or [])
+    if not account or not account.get("ok"):
+        return positions
+    if is_spot_market(cfg):
+        live = {str(p.get("symbol") or "") for p in account.get("positions") or []}
+        return [p for p in positions if str(p.get("symbol") or "") in live]
+    live = {str(p.get("symbol") or "") for p in account.get("positions") or []}
+    kept: list[dict[str, Any]] = []
+    for p in positions:
+        fsym = str(p.get("futures_symbol") or "")
+        if fsym and fsym in live:
+            kept.append(p)
+            continue
+        spot = str(p.get("symbol") or "")
+        if any(lf == spot or lf.startswith(f"{spot}:") for lf in live):
+            kept.append(p)
+    return kept
 
 
 def _has_symbol_open(state: dict[str, Any], trade_key: str) -> bool:
@@ -731,15 +774,23 @@ def _spot_resolve_amount(
     *,
     min_amount: float,
 ) -> float:
-    """Баланс базы на spot; при OCO монета в used — не считать позицию закрытой."""
-    on_exchange = _spot_base_amount(exchange, symbol)
-    stored = float(rec.get("amount") or 0.0)
-    threshold = min_amount * 0.25
-    if on_exchange >= threshold:
-        return on_exchange
-    if _spot_has_open_sell_orders(exchange, symbol):
-        return max(on_exchange, stored)
-    return on_exchange
+    """Фактический баланс базы (free+used). Ручное закрытие на бирже → 0, без «залипания» по старому amount."""
+    return _spot_base_amount(exchange, symbol)
+
+
+def _spot_position_open(
+    exchange: Any,
+    symbol: str,
+    *,
+    min_amount: float,
+) -> bool:
+    return _spot_base_amount(exchange, symbol) >= min_amount * 0.25
+
+
+def _clear_last_trade_if_symbol(state: dict[str, Any], symbol: str) -> None:
+    last = state.get("last_trade")
+    if isinstance(last, dict) and str(last.get("symbol") or "").strip() == symbol.strip():
+        state.pop("last_trade", None)
 
 
 def cancel_symbol_open_orders(
@@ -1005,9 +1056,9 @@ def _reconcile_spot_into_state(
         "amount": float(last.get("amount") or 0.0),
         "reconciled_from_exchange": True,
     }
-    amount = _spot_resolve_amount(exchange, sym, stub, min_amount=min_amount)
-    if amount < min_amount * 0.25:
+    if not _spot_position_open(exchange, sym, min_amount=min_amount):
         return state
+    amount = _spot_base_amount(exchange, sym)
     stub["amount"] = amount
     try:
         stub["entry_price"] = _estimate_entry_price(exchange, sym, float(stub.get("entry") or 0.0))
@@ -1024,10 +1075,10 @@ def manage_open_positions(*, yaml_cfg: dict[str, Any] | None = None) -> dict[str
     state = load_trade_state()
     exchange = exchange_for_config(cfg)
     state = _reconcile_spot_into_state(exchange, state, cfg)
+    state = _sync_open_positions(exchange, state, cfg)
     state = ensure_spot_exit_orders(exchange, state, cfg)
     state = _sync_open_positions(exchange, state, cfg)
     closed = _apply_auto_closes(exchange, state, cfg)
-    state = ensure_spot_exit_orders(exchange, state, cfg)
     state = _sync_open_positions(exchange, state, cfg)
     save_trade_state(state)
     return {
@@ -1331,6 +1382,15 @@ def ensure_spot_exit_orders(
         if not sym or str(row.get("side", "long")).lower() != "long":
             updated.append(row)
             continue
+        try:
+            _mc, min_amt = _market_limits(exchange, sym)
+        except Exception:
+            min_amt = 1e-8
+        if not _spot_position_open(exchange, sym, min_amount=min_amt):
+            if _spot_has_open_sell_orders(exchange, sym) and not cfg.dry_run:
+                cancel_symbol_open_orders(exchange, sym, order_ids=_order_ids_from_rec(row))
+            continue
+
         if _spot_has_open_sell_orders(exchange, sym):
             row["exit_orders_placed"] = True
             updated.append(row)
@@ -1338,10 +1398,6 @@ def ensure_spot_exit_orders(
 
         amount = float(row.get("amount") or 0.0)
         if amount <= 0:
-            try:
-                _mc, min_amt = _market_limits(exchange, sym)
-            except Exception:
-                min_amt = 1e-8
             amount = _spot_resolve_amount(exchange, sym, row, min_amount=min_amt)
         entry_px = float(row.get("entry_price") or row.get("entry") or 0.0)
         stop = float(row.get("stop") or 0.0)
@@ -1679,10 +1735,10 @@ def maybe_run_auto_trade(
     state = load_trade_state()
     exchange = exchange_for_config(cfg)
     state = _reconcile_spot_into_state(exchange, state, cfg)
+    state = _sync_open_positions(exchange, state, cfg)
     state = ensure_spot_exit_orders(exchange, state, cfg)
     state = _sync_open_positions(exchange, state, cfg)
     _apply_auto_closes(exchange, state, cfg)
-    state = ensure_spot_exit_orders(exchange, state, cfg)
     state = _sync_open_positions(exchange, state, cfg)
     save_trade_state(state)
 

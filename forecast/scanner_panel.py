@@ -1002,7 +1002,9 @@ def _open_positions_section(
     timeframe: str = "1h",
     account: dict[str, Any] | None = None,
 ) -> str:
-    positions = list(state.get("open_positions") or [])
+    from .auto_trader import open_positions_for_panel
+
+    positions = open_positions_for_panel(state, account, at)
     exchange_only = False
     if not positions and account:
         positions = _exchange_holdings_as_positions(account)
