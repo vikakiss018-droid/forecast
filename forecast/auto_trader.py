@@ -1578,13 +1578,24 @@ def _try_open_candidate(
                 "trade_rank": trade_rank,
             }
         _min_cost, min_amount = _market_limits(exchange, symbol)
-        if _spot_base_amount(exchange, symbol) >= min_amount * 0.25:
-            return {
-                "action": "skipped",
-                "reason": "SPOT_BALANCE_OPEN",
-                "symbol": symbol,
-                "trade_rank": trade_rank,
-            }
+        bal_amount = _spot_base_amount(exchange, symbol)
+        if bal_amount >= min_amount * 0.25:
+            try:
+                px = _estimate_entry_price(
+                    exchange, symbol, float(setup.get("entry") or 1.0)
+                )
+                holding_usdt = bal_amount * px
+            except Exception:
+                holding_usdt = 0.0
+            # Остаток после ручного закрытия (пыль) не блокирует новый вход
+            if holding_usdt >= max(_min_cost, 3.0):
+                return {
+                    "action": "skipped",
+                    "reason": f"SPOT_BALANCE_OPEN:{holding_usdt:.2f}USDT",
+                    "symbol": symbol,
+                    "trade_rank": trade_rank,
+                    "holding_usdt": holding_usdt,
+                }
     elif _has_symbol_open(state, trade_sym) or _fetch_open_position(exchange, trade_sym):
         return {
             "action": "skipped",
