@@ -784,7 +784,8 @@ def _spot_position_open(
     *,
     min_amount: float,
 ) -> bool:
-    return _spot_base_amount(exchange, symbol) >= min_amount * 0.25
+    """Позиция есть, если баланс базы >= min amount биржи (пыль < 0.1 SEI не считается)."""
+    return _spot_base_amount(exchange, symbol) >= min_amount
 
 
 def _clear_last_trade_if_symbol(state: dict[str, Any], symbol: str) -> None:
@@ -1261,7 +1262,13 @@ def _place_spot_oco_exit(
     """Binance spot OCO (TP limit + stop). create_order('OCO') не поддерживается — только private API."""
     exchange.load_markets()
     market = exchange.market(symbol)
-    amount_s = exchange.amount_to_precision(symbol, amount)
+    _min_cost, min_amount = _market_limits(exchange, symbol)
+    if float(amount) < min_amount:
+        return {"ok": False, "reason": f"AMOUNT_BELOW_MIN:{amount}<{min_amount}"}
+    try:
+        amount_s = exchange.amount_to_precision(symbol, amount)
+    except Exception as e:
+        return {"ok": False, "reason": f"AMOUNT_PRECISION:{e}"}
     if float(amount_s) <= 0:
         return {"ok": False, "reason": "ZERO_AMOUNT"}
 
@@ -1402,15 +1409,25 @@ def ensure_spot_exit_orders(
         entry_px = float(row.get("entry_price") or row.get("entry") or 0.0)
         stop = float(row.get("stop") or 0.0)
         tp = float(row.get("take_profit") or 0.0)
-        if amount > 0 and entry_px > 0 and stop > 0 and tp > 0:
-            placed = _place_spot_oco_exit(
-                exchange,
-                sym,
-                amount=amount,
-                entry_price=entry_px,
-                stop=stop,
-                take_profit=tp,
+        if amount < min_amt:
+            print(
+                f"[auto_trade] skip exit orders {sym}: amount {amount} < min {min_amt}",
+                flush=True,
             )
+            continue
+        if amount > 0 and entry_px > 0 and stop > 0 and tp > 0:
+            try:
+                placed = _place_spot_oco_exit(
+                    exchange,
+                    sym,
+                    amount=amount,
+                    entry_price=entry_px,
+                    stop=stop,
+                    take_profit=tp,
+                )
+            except Exception as e:
+                placed = {"ok": False, "reason": f"EXIT_EXCEPTION:{e}"}
+                print(f"[auto_trade] exit orders error {sym}: {e}", flush=True)
             if placed.get("ok"):
                 row["exit_orders_placed"] = True
                 row["exit_method"] = placed.get("method")
