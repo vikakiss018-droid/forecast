@@ -13,6 +13,7 @@ MSK = ZoneInfo("Europe/Moscow")
 from .auto_trader import AutoTradeConfig, load_closed_trades, load_trade_history, load_trade_state
 from .binance_client import trading_credentials_source
 from .env_config import SETTINGS_META, get_settings_for_panel
+from .run_symbol_ranking import load_filtered_symbols
 
 
 def _e(s: Any) -> str:
@@ -513,12 +514,12 @@ def _pnl_class(v: float | None) -> str:
 def _dashboard_tabs(*, active: str, base_q: str) -> str:
     scan_cls = "tab active" if active == "scan" else "tab"
     closed_cls = "tab active" if active == "closed" else "tab"
-    tf_cls = "tab active" if active == "tfstudy" else "tab"
+    pairs_cls = "tab active" if active == "pairs" else "tab"
     return f"""
     <nav class="dash-tabs">
       <a class="{scan_cls}" href="/scanner?{base_q}">Сканер и торговля</a>
       <a class="{closed_cls}" href="/scanner?tab=closed&amp;{base_q}">Закрытые сделки</a>
-      <a class="{tf_cls}" href="/scanner?tab=tfstudy&amp;{base_q}">Тест таймфреймов</a>
+      <a class="{pairs_cls}" href="/scanner/pairs" target="_blank">Тест пар (400)</a>
     </nav>"""
 
 
@@ -647,6 +648,197 @@ def _tf_study_rows(ranking: list[dict[str, Any]]) -> str:
         </tr>"""
         )
     return "".join(rows)
+
+
+def _pair_passes_auto_filter(row: dict[str, Any]) -> bool:
+    return (
+        float(row.get("total_r") or 0) > 0.5
+        and float(row.get("win_rate_pct") or 0) > 50.0
+        and int(row.get("trades") or 0) > 0
+    )
+
+
+def _pair_ranking_rows(
+    ranking: list[dict[str, Any]],
+    *,
+    selected_symbols: set[str] | None = None,
+) -> str:
+    if not ranking:
+        return (
+            '<tr><td colspan="8" class="empty-cell">'
+            "Запустите тест — таблица заполнится после завершения (~5–10 мин)"
+            "</td></tr>"
+        )
+    rows_sorted = sorted(ranking, key=lambda r: -float(r.get("total_r") or 0))
+    out: list[str] = []
+    for i, row in enumerate(rows_sorted, 1):
+        sym = str(row.get("symbol") or "")
+        tr = float(row.get("total_r") or 0)
+        win = float(row.get("win_rate_pct") or 0)
+        trades = int(row.get("trades") or 0)
+        auto_ok = _pair_passes_auto_filter(row)
+        checked = ""
+        if selected_symbols is not None:
+            if sym in selected_symbols:
+                checked = " checked"
+        elif auto_ok:
+            checked = " checked"
+        r_cls = "pnl-pos" if tr > 0 else ("pnl-neg" if tr < 0 else "")
+        tag = _badge("авто", "ok") if auto_ok else ""
+        out.append(
+            f"""
+        <tr class="{'row-plus' if auto_ok else ''}">
+          <td><input type="checkbox" name="symbols" value="{_e(sym)}"{checked} /></td>
+          <td>{i}</td>
+          <td class="sym">{_e(sym)}</td>
+          <td class="mono {_pnl_class(tr)}">{tr:+.2f}</td>
+          <td>{_fmt_num(row.get('estimated_pnl_usdt'), 2)}</td>
+          <td>{trades}</td>
+          <td>{win:.1f}%</td>
+          <td>{tag}</td>
+        </tr>"""
+        )
+    return "\n".join(out)
+
+
+def render_pair_ranking_dashboard(
+    *,
+    result: dict[str, Any],
+    live_filtered: dict[str, Any],
+    msg: str | None = None,
+    err: str | None = None,
+) -> str:
+    status = str(result.get("status") or "idle")
+    ranking = list(result.get("ranking") or [])
+    progress = result.get("progress") or {}
+    cur = int(progress.get("current") or 0)
+    total = int(progress.get("total") or 0)
+    cur_sym = progress.get("symbol") or "—"
+    finished = _fmt_ts(result.get("finished_at"))
+    started = _fmt_ts(result.get("started_at"))
+    sym_count = int(result.get("symbols_count") or 0)
+    total_trades = int(result.get("total_trades") or 0)
+    total_r = result.get("total_r")
+
+    live_count = int(live_filtered.get("count") or 0)
+    live_at = _fmt_ts(live_filtered.get("approved_at") or live_filtered.get("created_at"))
+
+    banner = ""
+    if err:
+        banner = f'<div class="save-banner err">{_e(err)}</div>'
+    elif msg:
+        banner = f'<div class="save-banner ok">{_e(msg)}</div>'
+    elif status == "running":
+        pct = int(100 * cur / total) if total else 0
+        banner = (
+            f'<div class="save-banner warn">Тест выполняется: {cur}/{total} ({pct}%) · '
+            f"{_e(cur_sym)} · страница обновится автоматически</div>"
+        )
+    elif status == "error":
+        banner = f'<div class="save-banner err">Ошибка: {_e(result.get("error"))}</div>'
+
+    run_disabled = "disabled" if status == "running" else ""
+    refresh_meta = '<meta http-equiv="refresh" content="8" />' if status == "running" else ""
+    plus_count = sum(1 for r in ranking if _pair_passes_auto_filter(r))
+    show_form = status == "done" and bool(ranking)
+
+    approve_block = ""
+    if show_form:
+        approve_block = f"""
+    <form method="post" action="/scanner/pairs/approve" id="approve-form">
+      <div class="approve-bar">
+        <button type="button" class="btn" onclick="toggleAll(true)">Выбрать все плюсовые</button>
+        <button type="button" class="btn" onclick="toggleAll(false)">Снять все</button>
+        <button type="submit" class="btn btn-primary">Утвердить для live-скана</button>
+        <span class="hint-inline">Выбранные пары заменят текущий список для почасового скана</span>
+      </div>
+      <div class="table-wrap table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th></th><th>#</th><th>Пара</th><th>Total R</th><th>$ est.</th>
+              <th>Сделок</th><th>Win%</th><th>Авто</th>
+            </tr>
+          </thead>
+          <tbody>{_pair_ranking_rows(ranking)}</tbody>
+        </table>
+      </div>
+    </form>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  {refresh_meta}
+  <title>Forecast — Тест пар (400)</title>
+  {_panel_fonts_link()}
+  <style>
+    {_panel_theme_css(full=False)}
+    .wrap {{ max-width: 1200px; }}
+    .hint {{ color: var(--muted); font-size: 0.85rem; margin: 12px 0 20px; line-height: 1.6; }}
+    .btn {{ cursor: pointer; border: none; color: #2a1020; }}
+    .btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+    .approve-bar {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 16px 0; }}
+    .hint-inline {{ color: var(--muted); font-size: 0.8rem; }}
+    .table-scroll {{ max-height: 65vh; overflow: auto; }}
+    tr.row-plus td {{ background: rgba(134, 239, 172, 0.06); }}
+    .live-box {{
+      background: var(--glass); border: 1px solid var(--border); border-radius: 16px;
+      padding: 14px 18px; margin-bottom: 16px;
+    }}
+  </style>
+  <script>
+    function toggleAll(on) {{
+      document.querySelectorAll('#approve-form input[name="symbols"]').forEach(cb => {{
+        if (on) {{
+          const row = cb.closest('tr');
+          cb.checked = row && row.classList.contains('row-plus');
+        }} else {{
+          cb.checked = false;
+        }}
+      }});
+    }}
+  </script>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Тест пар (400)</h1>
+      <p class="subtitle">Trend-бэктест 1h · top volume USDT · выбор лучших для live-скана</p>
+    </header>
+    {_dashboard_tabs(active="pairs", base_q="")}
+    {banner}
+    <div class="live-box">
+      <strong>Live сейчас:</strong> {live_count} пар
+      <span style="color:var(--muted)"> · обновлено {_e(live_at)}</span>
+      <br/><span style="color:var(--muted);font-size:0.82rem">
+        Авто-отбор: R &gt; 0.5, win &gt; 50%, ≥1 сделка · после теста отметьте пары и нажмите «Утвердить»
+      </span>
+    </div>
+    <form method="post" action="/scanner/pairs/run" style="margin-bottom: 12px;">
+      <button type="submit" class="btn btn-primary" {run_disabled}>Запустить тест 400 пар (~5–10 мин)</button>
+    </form>
+    <p class="hint">
+      Тест не меняет live-список автоматически. По завершении выберите пары в таблице и утвердите —
+      они попадут в <code>symbol_ranking_filtered_r05_win50.json</code> для почасового скана.
+    </p>
+    <div class="stats">
+      <div class="stat"><label>Статус</label><strong>{_e(status)}</strong></div>
+      <div class="stat"><label>Пар в тесте</label><strong>{sym_count or total or '—'}</strong></div>
+      <div class="stat"><label>Плюсовых (авто)</label><strong>{plus_count if status == 'done' else '—'}</strong></div>
+      <div class="stat"><label>Сделок в тесте</label><strong>{total_trades if status == 'done' else '—'}</strong></div>
+      <div class="stat"><label>Total R</label><strong>{_fmt_num(total_r, 2) if total_r is not None else '—'}</strong></div>
+      <div class="stat"><label>Завершён</label><strong>{finished}</strong></div>
+      <div class="stat"><label>Прогресс</label><strong>{cur}/{total if total else '—'}</strong></div>
+    </div>
+    {approve_block}
+    <footer style="margin-top:24px;color:var(--muted);font-size:0.8rem">
+      <a href="/scanner" style="color:var(--accent)">← Сканер и торговля</a>
+    </footer>
+  </div>
+</body>
+</html>"""
 
 
 def render_tf_backtest_dashboard(
@@ -1109,7 +1301,7 @@ def render_scanner_dashboard(
     )
     refresh_url = f"/scanner?{base_q}"
     live_url = f"/scanner?{base_q}&live=1"
-    json_url = f"/scanner/json?{base_q}"
+    live_pairs = len(load_filtered_symbols())
 
     trader_on = at.enabled
     trader_live = trader_on and not at.dry_run
@@ -1160,11 +1352,11 @@ def render_scanner_dashboard(
     <div class="actions">
       <a class="btn btn-primary" href="{refresh_url}">Обновить</a>
       <a class="btn" href="{live_url}">Live-скан</a>
-      <a class="btn" href="{json_url}" target="_blank">JSON API</a>
-      <a class="btn" href="/trader/status" target="_blank">Trader API</a>
+      <a class="btn" href="/scanner/pairs" target="_blank">Тест пар (400)</a>
     </div>
 
     <div class="stats">
+      <div class="stat"><label>Live-пары</label><strong>{live_pairs}</strong></div>
       <div class="stat"><label>Последний скан</label><strong>{_fmt_ts(updated_at)}</strong></div>
       <div class="stat"><label>Пар в скане</label><strong>{sym_scanned}</strong></div>
       <div class="stat"><label>Время скана</label><strong>{_fmt_scan_duration(scan_dur)}</strong></div>

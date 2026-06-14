@@ -50,8 +50,18 @@ from .scan_cache import load_scan_history, load_scan_result, report_from_cache
 from .env_config import SETTINGS_META, update_env_values
 from .panel_auth import PANEL_AUTH_DEPS
 from .position_chart import build_position_chart_html
-from .scanner_panel import render_closed_trades_dashboard, render_scanner_dashboard, render_tf_backtest_dashboard
-from .tf_backtest import load_tf_backtest_result, run_timeframe_study_background
+from .scanner_panel import (
+    render_closed_trades_dashboard,
+    render_pair_ranking_dashboard,
+    render_scanner_dashboard,
+)
+from .run_symbol_ranking import (
+    DEFAULT_RANK_TOP_N,
+    approve_live_symbols,
+    load_symbol_ranking_filtered,
+    load_symbol_ranking_result,
+    run_symbol_ranking_background,
+)
 from .trade_gate import GateMode, TradeGateConfig, evaluate_trade_gate
 
 
@@ -1424,19 +1434,58 @@ def trader_position_chart(
     )
 
 
-@app.post("/scanner/tf-study/run", dependencies=PANEL_AUTH_DEPS)
-async def run_tf_study_endpoint(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
-    """Start multi-timeframe backtest in background (heavy)."""
-    form = await request.form()
-    return_q = str(form.get("return_q", "")).strip()
-    cur = load_tf_backtest_result()
+@app.get("/scanner/pairs", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
+def pair_ranking_panel(
+    approved: str | None = None,
+    started: str | None = None,
+    busy: str | None = None,
+    error: str | None = None,
+) -> str:
+    """Тест 400 пар + утверждение списка для live-скана."""
+    msg = None
+    err = error
+    if approved == "1":
+        data = load_symbol_ranking_filtered()
+        n = int(data.get("count") or 0)
+        msg = f"Утверждено {n} пар для live-скана"
+    elif started == "1":
+        msg = "Тест 400 пар запущен — страница обновится автоматически"
+    elif busy == "1":
+        msg = "Тест уже выполняется"
+    return render_pair_ranking_dashboard(
+        result=load_symbol_ranking_result(),
+        live_filtered=load_symbol_ranking_filtered(),
+        msg=msg,
+        err=err,
+    )
+
+
+@app.post("/scanner/pairs/run", dependencies=PANEL_AUTH_DEPS)
+async def pair_ranking_run(background_tasks: BackgroundTasks) -> RedirectResponse:
+    cur = load_symbol_ranking_result()
     if cur.get("status") == "running":
-        msg = "tf_busy=1"
-    else:
-        background_tasks.add_task(run_timeframe_study_background, _auto_trade_yaml())
-        msg = "tf_started=1"
-    sep = "&" if return_q else ""
-    return RedirectResponse(url=f"/scanner?tab=tfstudy&{return_q}{sep}{msg}", status_code=303)
+        return RedirectResponse(url="/scanner/pairs?busy=1", status_code=303)
+    background_tasks.add_task(run_symbol_ranking_background, top_n=DEFAULT_RANK_TOP_N)
+    return RedirectResponse(url="/scanner/pairs?started=1", status_code=303)
+
+
+@app.post("/scanner/pairs/approve", dependencies=PANEL_AUTH_DEPS)
+async def pair_ranking_approve(request: Request) -> RedirectResponse:
+    form = await request.form()
+    symbols = [s.strip() for s in _form_field_values(form, "symbols") if s.strip()]
+    if not symbols:
+        return RedirectResponse(
+            url="/scanner/pairs?error=" + quote("Выберите хотя бы одну пару"),
+            status_code=303,
+        )
+    try:
+        approve_live_symbols(symbols)
+    except OSError as e:
+        return RedirectResponse(
+            url="/scanner/pairs?error=" + quote(str(e)),
+            status_code=303,
+        )
+    return RedirectResponse(url="/scanner/pairs?approved=1", status_code=303)
 
 
 @app.get("/scanner", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
@@ -1456,6 +1505,7 @@ def scanner_panel(
     tf_busy: str | None = None,
 ) -> str:
     """Dashboard: тренд-скан 50 пар, spot auto-trader, history."""
+    _ = tf_started, tf_busy
     max_symbols_q = "" if max_symbols is None else str(max_symbols)
     base_q = (
         f"top={int(top)}&bars={int(bars)}&timeframe={html.escape(timeframe)}"
@@ -1476,18 +1526,6 @@ def scanner_panel(
             closed_trades=load_closed_trades(100),
             base_q=base_q,
             saved_msg=saved_msg,
-        )
-
-    if tab.strip().lower() == "tfstudy":
-        tf_msg = saved_msg
-        if tf_started == "1":
-            tf_msg = "Тест таймфреймов запущен в фоне — обновите страницу через 15–40 мин"
-        elif tf_busy == "1":
-            tf_msg = "Тест уже выполняется"
-        return render_tf_backtest_dashboard(
-            result=load_tf_backtest_result(),
-            base_q=base_q,
-            msg=tf_msg,
         )
 
     rep, updated_at, from_cache = _scanner_report(
