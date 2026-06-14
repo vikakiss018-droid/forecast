@@ -156,7 +156,13 @@ def load_auto_trade_config(yaml_cfg: dict[str, Any] | None = None) -> AutoTradeC
             "AUTO_TRADE_MIN_ATR_PCT",
         ):
             val = _env_float(env_name, float(default) if default else 0.0)
-            if val > 0 or env_name in ("AUTO_TRADE_PROFIT_CLOSE_PCT", "AUTO_TRADE_STOP_LOSS_ROI_USDT", "AUTO_TRADE_MIN_ATR_PCT"):
+            if val > 0 or env_name in (
+                "AUTO_TRADE_MIN_SCORE",
+                "AUTO_TRADE_MIN_PROB_PCT",
+                "AUTO_TRADE_PROFIT_CLOSE_PCT",
+                "AUTO_TRADE_STOP_LOSS_ROI_USDT",
+                "AUTO_TRADE_MIN_ATR_PCT",
+            ):
                 setattr(base, attr, val)
             continue
         if fn is _env_int and env_name in (
@@ -410,6 +416,17 @@ def _normalize_side(direction: str) -> str:
     return d
 
 
+def apply_scan_auto_filters(auto_cfg: AutoTradeConfig, scan_cfg: Any) -> None:
+    """validate_setup: prob/score только если заданы в env (stage1 — отдельно)."""
+    auto_cfg.min_probability_pct = float(getattr(scan_cfg, "min_probability_pct", 0))
+    score_raw = os.environ.get("AUTO_TRADE_MIN_SCORE", "").strip()
+    stage1 = float(getattr(scan_cfg, "stage1_min_score", 0))
+    if score_raw and float(score_raw) > 0:
+        auto_cfg.min_score = max(float(auto_cfg.min_score), stage1)
+    else:
+        auto_cfg.min_score = 0.0
+
+
 def validate_setup(candidate: dict[str, Any], cfg: AutoTradeConfig) -> tuple[bool, str]:
     if not cfg.allow_level_breakout and is_level_breakout_candidate(candidate):
         return False, "BREAKOUT_LEVEL_DISABLED"
@@ -420,10 +437,10 @@ def validate_setup(candidate: dict[str, Any], cfg: AutoTradeConfig) -> tuple[boo
     if side not in ("long", "short"):
         return False, f"BAD_DIRECTION:{setup.get('direction')}"
     score = float(candidate.get("score", 0.0))
-    if score < cfg.min_score:
+    if cfg.min_score > 0 and score < cfg.min_score:
         return False, f"LOW_SCORE:{score:.1f}"
     prob = float(setup.get("probability_pct", 0.0))
-    if prob < cfg.min_probability_pct:
+    if cfg.min_probability_pct > 0 and prob < cfg.min_probability_pct:
         return False, f"LOW_PROB:{prob:.1f}"
     rr = float(setup.get("risk_reward", 0.0))
     if rr < cfg.min_risk_reward:

@@ -457,6 +457,8 @@ def backtest_combined_single_symbol(
     trend_params: TrendPullbackParams | None = None,
     df_htf: pd.DataFrame | None = None,
     long_only: bool = False,
+    allow_trend: bool = True,
+    allow_range: bool = True,
 ) -> list[dict[str, Any]]:
     """Тренд + флет в одном walk-forward (режимы взаимоисключающие на баре)."""
     params = trend_params or DEFAULT_TREND_PARAMS
@@ -469,23 +471,25 @@ def backtest_combined_single_symbol(
     while next_i < end and (
         _trade_target_unlimited(target_trades) or len(trades) < target_trades
     ):
-        cand = _peek_trend_entry(
-            df,
-            next_i,
-            symbol=symbol,
-            timeframe=timeframe,
-            auto_cfg=auto_cfg,
-            stage1_min=stage1_min,
-            step=step,
-            max_hold=max_hold,
-            cooldown_bars=cooldown_bars,
-            trend_only=True,
-            trend_params=params,
-            df_htf=df_htf,
-            long_only=long_only,
-        )
+        cand = None
         regime = "trend"
-        if cand is None:
+        if allow_trend:
+            cand = _peek_trend_entry(
+                df,
+                next_i,
+                symbol=symbol,
+                timeframe=timeframe,
+                auto_cfg=auto_cfg,
+                stage1_min=stage1_min,
+                step=step,
+                max_hold=max_hold,
+                cooldown_bars=cooldown_bars,
+                trend_only=True,
+                trend_params=params,
+                df_htf=df_htf,
+                long_only=long_only,
+            )
+        if cand is None and allow_range:
             cand = _peek_range_entry(
                 df,
                 next_i,

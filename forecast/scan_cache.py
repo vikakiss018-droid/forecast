@@ -9,6 +9,7 @@ from .paths import PROCESSED_DATA_DIR, ensure_directories
 
 DEFAULT_CACHE_PATH = PROCESSED_DATA_DIR / "market_scan_latest.json"
 SCAN_HISTORY_PATH = PROCESSED_DATA_DIR / "scan_history.jsonl"
+SCAN_PROGRESS_PATH = PROCESSED_DATA_DIR / "scan_progress.json"
 MAX_SCAN_HISTORY = 96
 
 
@@ -92,6 +93,28 @@ def load_scan_history(limit: int = 30) -> list[dict[str, Any]]:
         if len(out) >= limit:
             break
     return out
+
+
+def save_scan_progress(payload: dict[str, Any]) -> None:
+    ensure_directories()
+    SCAN_PROGRESS_PATH.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def load_scan_progress() -> dict[str, Any]:
+    if not SCAN_PROGRESS_PATH.is_file():
+        return {"status": "idle"}
+    try:
+        data = json.loads(SCAN_PROGRESS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {"status": "idle"}
+    except (json.JSONDecodeError, OSError):
+        return {"status": "error", "error": "bad progress file"}
+
+
+def clear_scan_progress() -> None:
+    if SCAN_PROGRESS_PATH.is_file():
+        SCAN_PROGRESS_PATH.unlink(missing_ok=True)
 
 
 def load_scan_result(path: Path | None = None) -> dict[str, Any] | None:

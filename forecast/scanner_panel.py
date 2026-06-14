@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import json
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlencode
@@ -13,7 +14,7 @@ MSK = ZoneInfo("Europe/Moscow")
 from .auto_trader import AutoTradeConfig, load_closed_trades, load_trade_history, load_trade_state
 from .binance_client import trading_credentials_source
 from .env_config import SETTINGS_META, get_settings_for_panel
-from .run_symbol_ranking import load_filtered_symbols
+from .run_symbol_ranking import load_filtered_symbols, ranking_config_from_env
 
 
 def _e(s: Any) -> str:
@@ -650,6 +651,117 @@ def _tf_study_rows(ranking: list[dict[str, Any]]) -> str:
     return "".join(rows)
 
 
+def _progress_pct(current: int, total: int) -> int:
+    if total <= 0:
+        return 0
+    return min(100, int(100 * current / total))
+
+
+def _progress_bar_block(
+    *,
+    bar_id: str = "scan-progress-bar",
+    label_id: str = "scan-progress-label",
+    detail_id: str = "scan-progress-detail",
+    visible: bool = False,
+) -> str:
+    vis = "flex" if visible else "none"
+    return f"""
+    <div id="progress-panel" class="progress-panel" style="display:{vis}">
+      <div class="progress-head">
+        <strong id="{label_id}">Сканирование…</strong>
+        <span id="progress-pct">0%</span>
+      </div>
+      <div class="progress-track"><div id="{bar_id}" class="progress-fill" style="width:0%"></div></div>
+      <div id="{detail_id}" class="progress-detail">—</div>
+    </div>"""
+
+
+def _progress_poll_script(
+    *,
+    json_url: str,
+    reload_on_done: bool = True,
+    bar_id: str = "scan-progress-bar",
+    label_id: str = "scan-progress-label",
+    detail_id: str = "scan-progress-detail",
+    panel_id: str = "progress-panel",
+    interval_ms: int = 2500,
+) -> str:
+    reload_js = "window.location.reload();" if reload_on_done else ""
+    url_js = json.dumps(json_url)
+    return f"""
+  <script>
+  (function() {{
+    const url = {url_js};
+    const panel = document.getElementById({json.dumps(panel_id)});
+    const bar = document.getElementById({json.dumps(bar_id)});
+    const label = document.getElementById({json.dumps(label_id)});
+    const detail = document.getElementById({json.dumps(detail_id)});
+    const pctEl = document.getElementById('progress-pct');
+    if (!panel) return;
+
+    async function tick() {{
+      try {{
+        const r = await fetch(url, {{ credentials: 'same-origin' }});
+        const d = await r.json();
+        const st = d.status || 'idle';
+        const prog = d.progress || d;
+        const cur = parseInt(prog.current || 0, 10);
+        const tot = parseInt(prog.total || 0, 10);
+        const sym = prog.symbol || '—';
+        const pct = tot > 0 ? Math.min(100, Math.round(100 * cur / tot)) : 0;
+        if (st === 'running') {{
+          panel.style.display = 'flex';
+          if (bar) bar.style.width = pct + '%';
+          if (pctEl) pctEl.textContent = pct + '%';
+          if (label) label.textContent = d.kind === 'pair_test' ? 'Тест пар…' : 'Live-скан…';
+          if (detail) detail.textContent = cur + ' / ' + tot + ' · ' + sym;
+          return;
+        }}
+        if (st === 'done') {{
+          if (bar) bar.style.width = '100%';
+          if (pctEl) pctEl.textContent = '100%';
+          if (detail) detail.textContent = 'Готово';
+          {reload_js}
+          return;
+        }}
+        if (st === 'error') {{
+          panel.style.display = 'flex';
+          if (label) label.textContent = 'Ошибка';
+          if (detail) detail.textContent = d.error || 'unknown';
+          return;
+        }}
+        panel.style.display = 'none';
+      }} catch (e) {{
+        if (detail) detail.textContent = 'Ошибка опроса прогресса';
+      }}
+    }}
+    tick();
+    setInterval(tick, {int(interval_ms)});
+  }})();
+  </script>"""
+
+
+def _progress_panel_css() -> str:
+    return """
+    .progress-panel {
+      display: flex; flex-direction: column; gap: 8px;
+      background: linear-gradient(135deg, rgba(255, 182, 220, 0.14), rgba(167, 139, 250, 0.1));
+      border: 1px solid rgba(255, 182, 220, 0.35); border-radius: 16px;
+      padding: 14px 16px; margin: 0 0 16px;
+    }
+    .progress-head { display: flex; justify-content: space-between; align-items: center; }
+    .progress-track {
+      height: 10px; border-radius: 999px; background: rgba(255,255,255,0.08); overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%; border-radius: 999px;
+      background: linear-gradient(90deg, #ff9ecf, #c4b5fd);
+      transition: width 0.35s ease;
+    }
+    .progress-detail { font-size: 0.82rem; color: var(--muted); }
+    """
+
+
 def _pair_passes_auto_filter(row: dict[str, Any]) -> bool:
     return (
         float(row.get("total_r") or 0) > 0.5
@@ -701,6 +813,50 @@ def _pair_ranking_rows(
     return "\n".join(out)
 
 
+def _pair_test_config_block(result: dict[str, Any]) -> str:
+    cfg = dict(result.get("test_config") or {})
+    if not cfg:
+        try:
+            cfg = ranking_config_from_env().to_meta()
+        except Exception:
+            cfg = {}
+    if not cfg:
+        return ""
+    modes = []
+    if cfg.get("allow_trend"):
+        modes.append("trend")
+    if cfg.get("allow_range"):
+        modes.append("range")
+    mode_s = "+".join(modes) if modes else "—"
+    top_n = cfg.get("top_n", "—")
+    items = [
+        ("Пар", str(top_n)),
+        ("ТФ / bars", f"{cfg.get('timeframe', '—')} / {cfg.get('bars', '—')}"),
+        ("Режим", mode_s),
+        ("Stage1", f"{cfg.get('stage1_min', '—')} (relax {cfg.get('stage1_relax', '—')})"),
+        ("Long only", "да" if cfg.get("long_only") else "нет"),
+        ("Min score", str(cfg.get("min_score", "—"))),
+        ("Min prob %", str(cfg.get("min_probability_pct", "—"))),
+        ("Min R:R", str(cfg.get("min_risk_reward", "—"))),
+        ("Min ATR %", str(cfg.get("min_atr_pct_auto", "—"))),
+        ("Rel volume", str(cfg.get("min_rel_volume", "—"))),
+        ("ATR trend %", str(cfg.get("min_atr_pct_trend", "—"))),
+        ("Lookback", str(cfg.get("trend_lookback", "—"))),
+        ("Сделок/пара", str(cfg.get("target_trades_per_symbol", "—"))),
+    ]
+    rows = "".join(
+        f"<div class='cfg-item'><label>{_e(lbl)}</label><strong>{_e(val)}</strong></div>"
+        for lbl, val in items
+    )
+    rule = cfg.get("rule") or ""
+    return f"""
+    <div class="cfg-box">
+      <strong>Параметры теста (.env + config.yaml)</strong>
+      <div class="cfg-grid">{rows}</div>
+      <p class="cfg-rule">{_e(rule)}</p>
+    </div>"""
+
+
 def render_pair_ranking_dashboard(
     *,
     result: dict[str, Any],
@@ -738,9 +894,25 @@ def render_pair_ranking_dashboard(
         banner = f'<div class="save-banner err">Ошибка: {_e(result.get("error"))}</div>'
 
     run_disabled = "disabled" if status == "running" else ""
-    refresh_meta = '<meta http-equiv="refresh" content="8" />' if status == "running" else ""
+    poll_script = ""
+    if status == "running":
+        poll_script = _progress_poll_script(
+            json_url="/scanner/pairs/json",
+            reload_on_done=True,
+            bar_id="pair-progress-bar",
+            label_id="pair-progress-label",
+            detail_id="pair-progress-detail",
+            panel_id="progress-panel",
+        )
     plus_count = sum(1 for r in ranking if _pair_passes_auto_filter(r))
     show_form = status == "done" and bool(ranking)
+    test_cfg = result.get("test_config") or {}
+    try:
+        env_cfg = ranking_config_from_env().to_meta()
+    except Exception:
+        env_cfg = {}
+    top_n = int(test_cfg.get("top_n") or env_cfg.get("top_n") or 400)
+    config_block = _pair_test_config_block(result)
 
     approve_block = ""
     if show_form:
@@ -770,11 +942,11 @@ def render_pair_ranking_dashboard(
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  {refresh_meta}
-  <title>Forecast — Тест пар (400)</title>
+  <title>Forecast — Тест пар ({top_n})</title>
   {_panel_fonts_link()}
   <style>
     {_panel_theme_css(full=False)}
+    {_progress_panel_css()}
     .wrap {{ max-width: 1200px; }}
     .hint {{ color: var(--muted); font-size: 0.85rem; margin: 12px 0 20px; line-height: 1.6; }}
     .btn {{ cursor: pointer; border: none; color: #2a1020; }}
@@ -787,6 +959,17 @@ def render_pair_ranking_dashboard(
       background: var(--glass); border: 1px solid var(--border); border-radius: 16px;
       padding: 14px 18px; margin-bottom: 16px;
     }}
+    .cfg-box {{
+      background: var(--glass); border: 1px solid var(--border); border-radius: 16px;
+      padding: 14px 18px; margin-bottom: 16px;
+    }}
+    .cfg-grid {{
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+      gap: 10px 16px; margin-top: 12px;
+    }}
+    .cfg-item label {{ display: block; color: var(--muted); font-size: 0.75rem; }}
+    .cfg-item strong {{ font-size: 0.9rem; }}
+    .cfg-rule {{ color: var(--muted); font-size: 0.78rem; margin: 12px 0 0; line-height: 1.5; }}
   </style>
   <script>
     function toggleAll(on) {{
@@ -804,11 +987,18 @@ def render_pair_ranking_dashboard(
 <body>
   <div class="wrap">
     <header>
-      <h1>Тест пар (400)</h1>
-      <p class="subtitle">Trend-бэктест 1h · top volume USDT · выбор лучших для live-скана</p>
+      <h1>Тест пар ({top_n})</h1>
+      <p class="subtitle">Combined backtest · параметры из .env (как live-скан)</p>
     </header>
     {_dashboard_tabs(active="pairs", base_q="")}
     {banner}
+    {_progress_bar_block(
+        bar_id="pair-progress-bar",
+        label_id="pair-progress-label",
+        detail_id="pair-progress-detail",
+        visible=(status == "running"),
+    )}
+    {config_block}
     <div class="live-box">
       <strong>Live сейчас:</strong> {live_count} пар
       <span style="color:var(--muted)"> · обновлено {_e(live_at)}</span>
@@ -817,10 +1007,12 @@ def render_pair_ranking_dashboard(
       </span>
     </div>
     <form method="post" action="/scanner/pairs/run" style="margin-bottom: 12px;">
-      <button type="submit" class="btn btn-primary" {run_disabled}>Запустить тест 400 пар (~5–10 мин)</button>
+      <button type="submit" class="btn btn-primary" {run_disabled}>Запустить тест {top_n} пар (~5–10 мин)</button>
     </form>
     <p class="hint">
-      Тест не меняет live-список автоматически. По завершении выберите пары в таблице и утвердите —
+      Тест не меняет live-список автоматически. Параметры берутся из <code>.env</code>
+      (<code>FORECAST_*</code>, <code>TREND_*</code>, <code>AUTO_TRADE_*</code>, <code>RANK_*</code>) —
+      те же, что у почасового скана. По завершении выберите пары и утвердите —
       они попадут в <code>symbol_ranking_filtered_r05_win50.json</code> для почасового скана.
     </p>
     <div class="stats">
@@ -837,94 +1029,7 @@ def render_pair_ranking_dashboard(
       <a href="/scanner" style="color:var(--accent)">← Сканер и торговля</a>
     </footer>
   </div>
-</body>
-</html>"""
-
-
-def render_tf_backtest_dashboard(
-    *,
-    result: dict[str, Any],
-    base_q: str,
-    msg: str | None = None,
-) -> str:
-    status = str(result.get("status") or "idle")
-    ranking = list(result.get("ranking") or [])
-    symbols = ", ".join(result.get("symbols") or [])
-    tfs = ", ".join(result.get("timeframes") or [])
-    best = result.get("best_timeframe") or "—"
-    dur = result.get("duration_sec")
-    finished = _fmt_ts(result.get("finished_at"))
-    started = _fmt_ts(result.get("started_at"))
-
-    banner = ""
-    if msg:
-        banner = f'<p class="save-banner ok">{_e(msg)}</p>'
-    elif status == "running":
-        banner = '<p class="save-banner warn">Тест выполняется… обновите страницу через несколько минут.</p>'
-    elif status == "error":
-        banner = f'<p class="save-banner err">Ошибка: {_e(result.get("error"))}</p>'
-
-    run_disabled = "disabled" if status == "running" else ""
-    note = _e(result.get("note") or "")
-
-    return f"""<!DOCTYPE html>
-<html lang="ru">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Forecast — Тест таймфреймов</title>
-  {_panel_fonts_link()}
-  <style>
-    {_panel_theme_css(full=False)}
-    .wrap {{ max-width: 1100px; }}
-    .hint {{ color: var(--muted); font-size: 0.85rem; margin: 12px 0 20px; line-height: 1.5; }}
-    .btn {{ cursor: pointer; border: none; color: #2a1020; }}
-    .btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <header>
-      <h1>Тест таймфреймов</h1>
-      <p class="subtitle">10 волатильных альтов · walk-forward · логика сканера · цель 100 сделок на TF</p>
-    </header>
-    {_dashboard_tabs(active="tfstudy", base_q=base_q)}
-    {banner}
-    <form method="post" action="/scanner/tf-study/run" style="margin-bottom: 12px;">
-      <input type="hidden" name="return_q" value="{_e(base_q)}" />
-      <button type="submit" class="btn" {run_disabled}>Запустить тест (долго, 15–40 мин)</button>
-    </form>
-    <p class="hint">
-      Монеты: {_e(symbols)}.<br/>
-      Таймфреймы: {_e(tfs)}.<br/>
-      {note}<br/>
-      CLI: <code>python -m forecast.run_tf_backtest</code>
-    </p>
-    <div class="stats">
-      <div class="stat"><label>Статус</label><strong>{_e(status)}</strong></div>
-      <div class="stat"><label>Лучший TF</label><strong>{_e(best)}</strong></div>
-      <div class="stat"><label>Завершён</label><strong>{finished}</strong></div>
-      <div class="stat"><label>Длительность</label><strong>{_fmt_num(dur, 0) if dur is not None else '—'} с</strong></div>
-    </div>
-    <section>
-      <h2 style="font-size:1.05rem;margin:0 0 12px;">Рейтинг таймфреймов (по total R)</h2>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>#</th><th>TF</th><th>Сделок</th><th>100?</th><th>Win%</th>
-              <th>Avg R</th><th>Total R</th><th>PF</th><th>Лучшая монета</th>
-            </tr>
-          </thead>
-          <tbody>{_tf_study_rows(ranking)}</tbody>
-        </table>
-      </div>
-    </section>
-    <footer>
-      Кэш: data/processed/tf_backtest_latest.json ·
-      <a href="/scanner?{base_q}" style="color:var(--accent)">← Сканер</a>
-    </footer>
-  </div>
+  {poll_script}
 </body>
 </html>"""
 
@@ -1291,6 +1396,7 @@ def render_scanner_dashboard(
     max_symbols: int | None,
     live: bool,
     saved_msg: str | None = None,
+    scan_watch: bool = False,
 ) -> str:
     setups = report.get("top_setups") or []
     hero = setups[0] if setups else None
@@ -1300,8 +1406,10 @@ def render_scanner_dashboard(
         f"&stage1_min_score={float(stage1_min_score)}&max_symbols={html.escape(max_symbols_q)}"
     )
     refresh_url = f"/scanner?{base_q}"
-    live_url = f"/scanner?{base_q}&live=1"
     live_pairs = len(load_filtered_symbols())
+    scan_poll = ""
+    if scan_watch:
+        scan_poll = _progress_poll_script(json_url="/scanner/progress/json", reload_on_done=True)
 
     trader_on = at.enabled
     trader_live = trader_on and not at.dry_run
@@ -1331,7 +1439,7 @@ def render_scanner_dashboard(
   <meta http-equiv="refresh" content="3600" />
   <title>Forecast — Сканер и торговля</title>
   {_panel_fonts_link()}
-  <style>{_panel_theme_css(full=True)}</style>
+  <style>{_panel_theme_css(full=True)}{_progress_panel_css()}</style>
 </head>
 <body>
   <div class="wrap">
@@ -1349,9 +1457,18 @@ def render_scanner_dashboard(
 
     {_dashboard_tabs(active="scan", base_q=base_q)}
 
+    {_progress_bar_block(visible=scan_watch)}
+
     <div class="actions">
       <a class="btn btn-primary" href="{refresh_url}">Обновить</a>
-      <a class="btn" href="{live_url}">Live-скан</a>
+      <form method="post" action="/scanner/live/run" style="display:inline">
+        <input type="hidden" name="return_q" value="{_e(base_q)}" />
+        <input type="hidden" name="top" value="{int(top)}" />
+        <input type="hidden" name="bars" value="{int(bars)}" />
+        <input type="hidden" name="timeframe" value="{_e(timeframe)}" />
+        <input type="hidden" name="stage1_min_score" value="{float(stage1_min_score)}" />
+        <button type="submit" class="btn">Live-скан</button>
+      </form>
       <a class="btn" href="/scanner/pairs" target="_blank">Тест пар (400)</a>
     </div>
 
@@ -1430,9 +1547,10 @@ def render_scanner_dashboard(
     <footer>
       Кэш: market_scan_latest.json · История: scan_history.jsonl · Торги: auto_trade_state.json
       · <a href="/scanner?tab=closed&amp;{base_q}" style="color:var(--accent)">Закрытые</a>
-      · <a href="/scanner?tab=tfstudy&amp;{base_q}" style="color:var(--accent)">Тест TF</a>
+      · <a href="/scanner/pairs" target="_blank" style="color:var(--accent)">Тест пар</a>
       · <a class="btn" href="/legacy" style="display:inline-block;margin-top:8px">Старый forecast UI</a>
     </footer>
   </div>
+  {scan_poll}
 </body>
 </html>"""

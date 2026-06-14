@@ -37,11 +37,17 @@ EDITABLE_KEYS: tuple[str, ...] = (
     "FORECAST_USE_CLOSED_BAR",
     "FORECAST_LONG_ONLY",
     "FORECAST_MIN_PROB_PCT",
+    "FORECAST_ALLOW_TREND",
+    "FORECAST_ALLOW_RANGE",
     "AUTO_TRADE_MARKET",
     "AUTO_TRADE_SPOT_ALLOW_SHORT",
     "TREND_LOOKBACK",
     "TREND_MIN_MOVE_PCT",
     "TREND_MIN_REL_VOLUME",
+    "TREND_MIN_ATR_PCT",
+    "RANK_TOP_N",
+    "RANK_TARGET_PER_SYMBOL",
+    "RANK_STAGE1_RELAX_SCORE",
 )
 
 SETTINGS_META: list[dict[str, Any]] = [
@@ -103,9 +109,15 @@ SETTINGS_META: list[dict[str, Any]] = [
     {"key": "FORECAST_USE_CLOSED_BAR", "label": "Скан: только закрытая 1h свеча", "type": "bool", "group": "scan"},
     {"key": "FORECAST_LONG_ONLY", "label": "Скан: только long", "type": "bool", "group": "scan"},
     {"key": "FORECAST_MIN_PROB_PCT", "label": "Скан: min prob %", "type": "float", "group": "scan"},
+    {"key": "FORECAST_ALLOW_TREND", "label": "Скан: режим trend", "type": "bool", "group": "scan"},
+    {"key": "FORECAST_ALLOW_RANGE", "label": "Скан: режим range", "type": "bool", "group": "scan"},
     {"key": "TREND_LOOKBACK", "label": "Тренд: lookback баров", "type": "int", "group": "scan"},
     {"key": "TREND_MIN_MOVE_PCT", "label": "Тренд: min move (0.008)", "type": "float", "group": "scan"},
     {"key": "TREND_MIN_REL_VOLUME", "label": "Тренд: min rel volume", "type": "float", "group": "scan"},
+    {"key": "TREND_MIN_ATR_PCT", "label": "Тренд: min ATR %", "type": "float", "group": "scan"},
+    {"key": "RANK_TOP_N", "label": "Тест пар: кол-во пар", "type": "int", "group": "rank"},
+    {"key": "RANK_TARGET_PER_SYMBOL", "label": "Тест пар: сделок на пару", "type": "int", "group": "rank"},
+    {"key": "RANK_STAGE1_RELAX_SCORE", "label": "Тест пар: stage1 relax", "type": "float", "group": "rank"},
 ]
 
 _ENV_LINE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")

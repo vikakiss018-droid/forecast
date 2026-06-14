@@ -1,26 +1,140 @@
-"""Rank symbols by total R (per-symbol backtest, same trend params as multi_bt)."""
+"""Rank symbols by total R (per-symbol combined trend+range backtest, as live scan)."""
 
 from __future__ import annotations
 
 import json
 import os
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Callable
+from dataclasses import dataclass
 
 import ccxt
 
 from .paths import PROCESSED_DATA_DIR, ensure_directories, load_project_env
-from .single_symbol_backtest import _aggregate_by_symbol, backtest_single_symbol
-from .auto_trader import load_auto_trade_config
+from .single_symbol_backtest import _aggregate_by_symbol, backtest_combined_single_symbol
+from .auto_trader import load_auto_trade_config, apply_scan_auto_filters
 from .tf_backtest import BARS_BY_TF, DEFAULT_SYMBOLS, _fetch_df, fetch_top_usdt_symbols
-from .trend_rules import DEFAULT_TREND_PARAMS, TrendPullbackParams
+from pathlib import Path
+from typing import Any, Callable
+
+from .strategy_config import env_float, env_int, yaml_section
+from .trend_rules import TrendPullbackParams
 
 SYMBOL_RANKING_PATH = PROCESSED_DATA_DIR / "symbol_ranking_latest.json"
 SYMBOL_RANKING_FILTERED_PATH = PROCESSED_DATA_DIR / "symbol_ranking_filtered_r05_win50.json"
 DEFAULT_RANK_TOP_N = 400
 FILTER_TOTAL_R_GT = 0.5
 FILTER_WIN_RATE_PCT_GT = 50.0
+
+
+@dataclass(frozen=True)
+class RankingJobConfig:
+    top_n: int
+    timeframe: str
+    bars: int
+    stage1_min: float
+    stage1_relax: float
+    target_trades_per_symbol: int
+    use_top_volume: bool
+    long_only: bool
+    allow_trend: bool
+    allow_range: bool
+    trend_params: TrendPullbackParams
+    auto_cfg: Any
+
+    def to_meta(self) -> dict[str, Any]:
+        at = self.auto_cfg
+        tp = self.trend_params
+        return {
+            "top_n": self.top_n,
+            "timeframe": self.timeframe,
+            "bars": self.bars,
+            "stage1_min": self.stage1_min,
+            "stage1_relax": self.stage1_relax,
+            "target_trades_per_symbol": self.target_trades_per_symbol,
+            "use_top_volume": self.use_top_volume,
+            "long_only": self.long_only,
+            "allow_trend": self.allow_trend,
+            "allow_range": self.allow_range,
+            "min_rel_volume": tp.min_rel_volume,
+            "min_atr_pct_trend": tp.min_atr_pct,
+            "trend_lookback": tp.trend_lookback,
+            "min_trend_move_pct": tp.min_trend_move_pct,
+            "min_score": at.min_score,
+            "min_probability_pct": at.min_probability_pct,
+            "min_risk_reward": at.min_risk_reward,
+            "min_atr_pct_auto": at.min_atr_pct,
+            "rule": self.rule_text(),
+        }
+
+    def rule_text(self) -> str:
+        modes = []
+        if self.allow_trend:
+            modes.append("trend")
+        if self.allow_range:
+            modes.append("range")
+        mode_s = "+".join(modes) if modes else "none"
+        return (
+            f"combined {mode_s} {self.timeframe}; bars={self.bars}; "
+            f"stage1>={self.stage1_min}; RR>={self.auto_cfg.min_risk_reward}; "
+            f"rel_vol>={self.trend_params.min_rel_volume}"
+            + ("; long only" if self.long_only else "")
+        )
+
+
+def ranking_config_from_env() -> RankingJobConfig:
+    """Параметры теста пар: .env + config.yaml (как live-скан)."""
+    from .trend_scanner import trend_params_from_yaml, trend_scan_config_from_env
+
+    load_project_env(force=True)
+    scan_cfg = trend_scan_config_from_env()
+    trend_params = scan_cfg.trend_params or trend_params_from_yaml()
+    ref = yaml_section("reference_backtest")
+    scan_yaml = yaml_section("trend_scan")
+
+    top_n = env_int(
+        "RANK_TOP_N",
+        env_int("MULTI_BT_TOP_N", DEFAULT_RANK_TOP_N, positive=True),
+        positive=True,
+    )
+    per_sym = env_int("RANK_TARGET_PER_SYMBOL", 30, positive=True)
+    use_top = os.environ.get("MULTI_BT_USE_TOP_VOLUME", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+    stage1_relax = env_float(
+        "RANK_STAGE1_RELAX_SCORE",
+        float(ref.get("stage1_relax_score", scan_yaml.get("stage1_relax_score", 12))),
+        positive=True,
+    )
+    tf = scan_cfg.timeframe
+    bars = scan_cfg.bars or BARS_BY_TF.get(tf, 1000)
+
+    at_yaml = yaml_section("auto_trade")
+    auto_cfg = load_auto_trade_config(at_yaml)
+    apply_scan_auto_filters(auto_cfg, scan_cfg)
+    auto_cfg.allow_level_breakout = bool(at_yaml.get("allow_level_breakout", False))
+    auto_cfg.allow_triangle = bool(at_yaml.get("allow_triangle", False))
+    atr_env = os.environ.get("AUTO_TRADE_MIN_ATR_PCT", "").strip()
+    if atr_env:
+        auto_cfg.min_atr_pct = float(atr_env)
+    else:
+        auto_cfg.min_atr_pct = float(at_yaml.get("min_atr_pct", 0))
+
+    return RankingJobConfig(
+        top_n=top_n,
+        timeframe=tf,
+        bars=bars,
+        stage1_min=float(scan_cfg.stage1_min_score),
+        stage1_relax=stage1_relax,
+        target_trades_per_symbol=per_sym,
+        use_top_volume=use_top,
+        long_only=scan_cfg.long_only,
+        allow_trend=scan_cfg.allow_trend,
+        allow_range=scan_cfg.allow_range,
+        trend_params=trend_params,
+        auto_cfg=auto_cfg,
+    )
 
 
 def build_filtered_ranking(
@@ -93,18 +207,6 @@ def _ranking_rows_from_by(
     ]
 
 
-def _auto_trade_cfg_for_ranking() -> Any:
-    from .strategy_config import yaml_section
-
-    at_yaml = yaml_section("auto_trade")
-    auto_cfg = load_auto_trade_config(at_yaml)
-    auto_cfg.min_probability_pct = float(at_yaml.get("min_probability_pct", 50))
-    auto_cfg.min_score = float(at_yaml.get("min_score", 18))
-    auto_cfg.min_atr_pct = float(at_yaml.get("min_atr_pct", 0))
-    auto_cfg.allow_level_breakout = bool(at_yaml.get("allow_level_breakout", False))
-    auto_cfg.allow_triangle = bool(at_yaml.get("allow_triangle", False))
-    return auto_cfg
-
 
 def run_symbol_ranking_job(
     *,
@@ -113,49 +215,66 @@ def run_symbol_ranking_job(
     progress_cb: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Backtest top-N USDT pairs; returns ranking payload (status=done)."""
-    load_project_env(force=True)
-    n = int(top_n if top_n is not None else os.environ.get("MULTI_BT_TOP_N", str(DEFAULT_RANK_TOP_N)))
-    tf = os.environ.get("MULTI_BT_TIMEFRAME", "1h").strip() or "1h"
-    per_sym = int(os.environ.get("RANK_TARGET_PER_SYMBOL", "30"))
-    use_top = os.environ.get("MULTI_BT_USE_TOP_VOLUME", "1").strip() not in ("0", "false", "no")
+    cfg = ranking_config_from_env()
+    if top_n is not None:
+        cfg = RankingJobConfig(
+            top_n=int(top_n),
+            timeframe=cfg.timeframe,
+            bars=cfg.bars,
+            stage1_min=cfg.stage1_min,
+            stage1_relax=cfg.stage1_relax,
+            target_trades_per_symbol=cfg.target_trades_per_symbol,
+            use_top_volume=cfg.use_top_volume,
+            long_only=cfg.long_only,
+            allow_trend=cfg.allow_trend,
+            allow_range=cfg.allow_range,
+            trend_params=cfg.trend_params,
+            auto_cfg=cfg.auto_cfg,
+        )
 
-    min_vol = float(os.environ.get("TREND_MIN_REL_VOLUME", str(DEFAULT_TREND_PARAMS.min_rel_volume)))
-    trend_params = TrendPullbackParams(
-        require_pullback=False,
-        require_htf_align=False,
-        min_rel_volume=min_vol,
-        min_atr_pct=float(os.environ.get("TREND_MIN_ATR_PCT", "0")),
-        trend_lookback=int(os.environ.get("TREND_LOOKBACK", str(DEFAULT_TREND_PARAMS.trend_lookback))),
-        min_trend_move_pct=float(os.environ.get("TREND_MIN_MOVE_PCT", str(DEFAULT_TREND_PARAMS.min_trend_move_pct))),
-    )
+    n = cfg.top_n
+    tf = cfg.timeframe
+    per_sym = cfg.target_trades_per_symbol
+    trend_params = cfg.trend_params
+    auto_cfg = cfg.auto_cfg
+    bars = cfg.bars
 
     exchange = ccxt.binance({"enableRateLimit": True})
-    if use_top and n > len(DEFAULT_SYMBOLS):
+    if cfg.use_top_volume and n > len(DEFAULT_SYMBOLS):
         symbols = fetch_top_usdt_symbols(exchange, limit=n)
     else:
         symbols = DEFAULT_SYMBOLS[:n]
 
-    auto_cfg = _auto_trade_cfg_for_ranking()
-    bars = BARS_BY_TF.get(tf, 1000)
+    test_meta = cfg.to_meta()
     started_at = datetime.now(timezone.utc).isoformat()
 
     running: dict[str, Any] = {
         "status": "running",
+        "mode": "trend_plus_range",
+        "test_config": test_meta,
+        "long_only": cfg.long_only,
+        "allow_trend": cfg.allow_trend,
+        "allow_range": cfg.allow_range,
         "started_at": started_at,
         "symbols_count": len(symbols),
         "timeframe": tf,
+        "bars": bars,
+        "stage1_min": cfg.stage1_min,
+        "stage1_relax": cfg.stage1_relax,
         "tp_target_pct": trend_params.tp_target_pct,
         "min_rel_volume": trend_params.min_rel_volume,
         "target_trades_per_symbol": per_sym,
         "progress": {"current": 0, "total": len(symbols), "symbol": None},
+        "kind": "pair_test",
         "ranking": [],
         "ranking_note": "sorted by total_r ascending (worst first); see rank field",
+        "rule": cfg.rule_text(),
     }
     save_symbol_ranking_result(running)
 
     print(
-        f"[rank] {len(symbols)} pairs, {tf}, TP={trend_params.tp_target_pct * 100:.0f}%, "
-        f"rel_vol>={trend_params.min_rel_volume}, up to {per_sym} trades/symbol...",
+        f"[rank] {len(symbols)} pairs, {tf}, bars={bars}, {cfg.rule_text()}, "
+        f"up to {per_sym} trades/symbol...",
         flush=True,
     )
 
@@ -172,24 +291,30 @@ def run_symbol_ranking_job(
         if df is None:
             skipped.append(symbol)
             continue
-        sym_trades = backtest_single_symbol(
+        sym_trades = backtest_combined_single_symbol(
             df,
             symbol=symbol,
             timeframe=tf,
             auto_cfg=auto_cfg,
-            stage1_min=18.0,
+            stage1_min=cfg.stage1_min,
             target_trades=per_sym,
             trend_params=trend_params,
+            long_only=cfg.long_only,
+            allow_trend=cfg.allow_trend,
+            allow_range=cfg.allow_range,
         )
         if not sym_trades and per_sym > 0:
-            sym_trades = backtest_single_symbol(
+            sym_trades = backtest_combined_single_symbol(
                 df,
                 symbol=symbol,
                 timeframe=tf,
                 auto_cfg=auto_cfg,
-                stage1_min=12.0,
+                stage1_min=cfg.stage1_relax,
                 target_trades=per_sym,
                 trend_params=trend_params,
+                long_only=cfg.long_only,
+                allow_trend=cfg.allow_trend,
+                allow_range=cfg.allow_range,
             )
         all_trades.extend(sym_trades)
         r = sum(float(t["r_multiple"]) for t in sym_trades)
@@ -204,10 +329,18 @@ def run_symbol_ranking_job(
     ranking = _ranking_rows_from_by(symbols, by)
     payload: dict[str, Any] = {
         "status": "done",
+        "mode": "trend_plus_range",
+        "test_config": test_meta,
+        "long_only": cfg.long_only,
+        "allow_trend": cfg.allow_trend,
+        "allow_range": cfg.allow_range,
         "started_at": started_at,
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "symbols_count": len(symbols),
         "timeframe": tf,
+        "bars": bars,
+        "stage1_min": cfg.stage1_min,
+        "stage1_relax": cfg.stage1_relax,
         "tp_target_pct": trend_params.tp_target_pct,
         "min_rel_volume": trend_params.min_rel_volume,
         "target_trades_per_symbol": per_sym,
@@ -216,7 +349,9 @@ def run_symbol_ranking_job(
         "skipped_symbols": skipped,
         "ranking": ranking,
         "ranking_note": "sorted by total_r ascending (worst first); see rank field",
+        "rule": cfg.rule_text(),
         "progress": {"current": len(symbols), "total": len(symbols), "symbol": None},
+        "kind": "pair_test",
     }
     save_symbol_ranking_result(payload)
     print(f"\n[rank] сохранено: {SYMBOL_RANKING_PATH}", flush=True)
@@ -251,9 +386,9 @@ def run_symbol_ranking_job(
     return payload
 
 
-def run_symbol_ranking_background(*, top_n: int = DEFAULT_RANK_TOP_N) -> None:
+def run_symbol_ranking_background() -> None:
     try:
-        run_symbol_ranking_job(top_n=top_n, save_auto_filtered=False)
+        run_symbol_ranking_job(save_auto_filtered=False)
     except Exception as e:
         save_symbol_ranking_result(
             {

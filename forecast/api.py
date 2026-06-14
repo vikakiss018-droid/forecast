@@ -31,7 +31,13 @@ from .signal_combiner import (
 from .orderflow_stream import start_orderbook_stream, get_liquidity_snapshot
 from .backtest_analytics import ev_bucket_label
 from .ev_calibration import load_ev_calibration
-from .trend_scanner import TrendScanConfig, scan_trend_filtered_setups, trend_scan_config_from_env
+from .trend_scanner import (
+    SCAN_MODE,
+    TrendScanConfig,
+    scan_combined_setups,
+    scan_trend_filtered_setups,
+    trend_scan_config_from_env,
+)
 from .auto_trader import (
     close_position_from_panel,
     load_auto_trade_config,
@@ -46,7 +52,22 @@ from .futures_account import (
     fetch_spot_account_snapshot,
     fetch_trading_account_snapshot,
 )
-from .scan_cache import load_scan_history, load_scan_result, report_from_cache
+from .scan_cache import (
+    load_scan_history,
+    load_scan_progress,
+    load_scan_result,
+    report_from_cache,
+    save_scan_progress,
+    save_scan_result,
+)
+from .run_symbol_ranking import (
+    approve_live_symbols,
+    load_filtered_symbols,
+    load_symbol_ranking_filtered,
+    load_symbol_ranking_result,
+    ranking_config_from_env,
+    run_symbol_ranking_background,
+)
 from .env_config import SETTINGS_META, update_env_values
 from .panel_auth import PANEL_AUTH_DEPS
 from .position_chart import build_position_chart_html
@@ -54,13 +75,6 @@ from .scanner_panel import (
     render_closed_trades_dashboard,
     render_pair_ranking_dashboard,
     render_scanner_dashboard,
-)
-from .run_symbol_ranking import (
-    DEFAULT_RANK_TOP_N,
-    approve_live_symbols,
-    load_symbol_ranking_filtered,
-    load_symbol_ranking_result,
-    run_symbol_ranking_background,
 )
 from .trade_gate import GateMode, TradeGateConfig, evaluate_trade_gate
 
@@ -1230,6 +1244,101 @@ def _scanner_report(
     return rep, None, False
 
 
+def _run_live_scan_background(
+    *,
+    top: int,
+    bars: int,
+    timeframe: str,
+    stage1_min_score: float,
+) -> None:
+    from datetime import datetime, timezone
+
+    scan_cfg = _trend_scan_cfg_from_request(
+        top=top,
+        bars=bars,
+        timeframe=timeframe,
+        stage1_min_score=stage1_min_score,
+    )
+    symbols = tuple(scan_cfg.symbols or ()) or load_filtered_symbols()
+    if not symbols:
+        save_scan_progress(
+            {
+                "status": "error",
+                "kind": "live_scan",
+                "error": "нет символов для скана",
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        return
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    save_scan_progress(
+        {
+            "status": "running",
+            "kind": "live_scan",
+            "started_at": started_at,
+            "progress": {"current": 0, "total": len(symbols), "symbol": None},
+        }
+    )
+    auto_cfg = load_auto_trade_config(_auto_trade_yaml())
+
+    def on_progress(p: dict[str, Any]) -> None:
+        save_scan_progress(
+            {
+                "status": "running",
+                "kind": "live_scan",
+                "started_at": started_at,
+                "progress": p,
+            }
+        )
+
+    try:
+        rep = scan_combined_setups(
+            symbols,
+            scan_cfg=scan_cfg,
+            auto_cfg=auto_cfg,
+            progress_cb=on_progress,
+        )
+        save_scan_result(
+            rep,
+            scan_config={
+                "mode": SCAN_MODE,
+                "timeframe": scan_cfg.timeframe,
+                "bars": scan_cfg.bars or None,
+                "top_n": scan_cfg.top_n,
+                "stage1_min_score": scan_cfg.stage1_min_score,
+                "symbols_count": len(symbols),
+                "use_filtered": scan_cfg.use_filtered_symbols,
+                "allow_trend": scan_cfg.allow_trend,
+                "allow_range": scan_cfg.allow_range,
+                "long_only": scan_cfg.long_only,
+                "scan_duration_sec": rep.get("scan_duration_sec"),
+                "candidates_found": rep.get("candidates_found"),
+                "candidates_by_regime": rep.get("candidates_by_regime"),
+            },
+        )
+        save_scan_progress(
+            {
+                "status": "done",
+                "kind": "live_scan",
+                "started_at": started_at,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "progress": {"current": len(symbols), "total": len(symbols), "symbol": None},
+                "candidates_found": rep.get("candidates_found"),
+            }
+        )
+    except Exception as e:
+        save_scan_progress(
+            {
+                "status": "error",
+                "kind": "live_scan",
+                "error": str(e),
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        print(f"[scanner] live scan error: {e}", flush=True)
+
+
 def _auto_trade_yaml() -> dict:
     import yaml as _yaml
 
@@ -1465,7 +1574,7 @@ async def pair_ranking_run(background_tasks: BackgroundTasks) -> RedirectRespons
     cur = load_symbol_ranking_result()
     if cur.get("status") == "running":
         return RedirectResponse(url="/scanner/pairs?busy=1", status_code=303)
-    background_tasks.add_task(run_symbol_ranking_background, top_n=DEFAULT_RANK_TOP_N)
+    background_tasks.add_task(run_symbol_ranking_background)
     return RedirectResponse(url="/scanner/pairs?started=1", status_code=303)
 
 
@@ -1488,6 +1597,46 @@ async def pair_ranking_approve(request: Request) -> RedirectResponse:
     return RedirectResponse(url="/scanner/pairs?approved=1", status_code=303)
 
 
+@app.get("/scanner/pairs/json", dependencies=PANEL_AUTH_DEPS)
+def pair_ranking_json() -> dict[str, Any]:
+    data = load_symbol_ranking_result()
+    return {
+        "status": data.get("status", "idle"),
+        "kind": "pair_test",
+        "progress": data.get("progress") or {},
+        "symbols_count": data.get("symbols_count"),
+        "error": data.get("error"),
+    }
+
+
+@app.get("/scanner/progress/json", dependencies=PANEL_AUTH_DEPS)
+def scan_progress_json() -> dict[str, Any]:
+    return load_scan_progress()
+
+
+@app.post("/scanner/live/run", dependencies=PANEL_AUTH_DEPS)
+async def live_scan_run(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
+    form = await request.form()
+    return_q = str(form.get("return_q", "")).strip()
+    cur = load_scan_progress()
+    if cur.get("status") == "running":
+        sep = "&" if return_q else ""
+        return RedirectResponse(url=f"/scanner?{return_q}{sep}scan_busy=1", status_code=303)
+    top = int(form.get("top") or 20)
+    bars = int(form.get("bars") or 1000)
+    timeframe = str(form.get("timeframe") or "1h").strip() or "1h"
+    stage1_min_score = float(form.get("stage1_min_score") or 18)
+    background_tasks.add_task(
+        _run_live_scan_background,
+        top=top,
+        bars=bars,
+        timeframe=timeframe,
+        stage1_min_score=stage1_min_score,
+    )
+    sep = "&" if return_q else ""
+    return RedirectResponse(url=f"/scanner?{return_q}{sep}scan_started=1", status_code=303)
+
+
 @app.get("/scanner", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
 def scanner_panel(
     tab: str = "scan",
@@ -1501,6 +1650,8 @@ def scanner_panel(
     error: str | None = None,
     closed: str | None = None,
     close_error: str | None = None,
+    scan_started: str | None = None,
+    scan_busy: str | None = None,
     tf_started: str | None = None,
     tf_busy: str | None = None,
 ) -> str:
@@ -1520,6 +1671,12 @@ def scanner_panel(
         saved_msg = f"Ошибка закрытия: {close_error}"
     elif error:
         saved_msg = f"Ошибка сохранения: {error}"
+    elif scan_started == "1":
+        saved_msg = "Live-скан запущен — смотрите прогресс ниже"
+    elif scan_busy == "1":
+        saved_msg = "Скан уже выполняется"
+
+    scan_watch = scan_started == "1" or load_scan_progress().get("status") == "running"
 
     if tab.strip().lower() == "closed":
         return render_closed_trades_dashboard(
@@ -1565,5 +1722,6 @@ def scanner_panel(
         max_symbols=max_symbols,
         live=live,
         saved_msg=saved_msg,
+        scan_watch=scan_watch,
     )
 

@@ -9,12 +9,12 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import ccxt
 import pandas as pd
 
-from .auto_trader import load_auto_trade_config, validate_setup
+from .auto_trader import load_auto_trade_config, validate_setup, apply_scan_auto_filters
 from .market_scanner import _adjust_stage1_for_direction, _stage1_snapshot
 from .run_symbol_ranking import load_filtered_symbols
 from .signal_combiner import compute_volume_scores
@@ -62,10 +62,12 @@ def trend_params_from_yaml() -> TrendPullbackParams:
     return TrendPullbackParams(
         require_pullback=False,
         require_htf_align=False,
-        min_rel_volume=env_float("TREND_MIN_REL_VOLUME", float(y.get("min_rel_volume", 1.2))),
+        min_rel_volume=env_float("TREND_MIN_REL_VOLUME", float(y.get("min_rel_volume", 1.2)), positive=True),
         min_atr_pct=env_float("TREND_MIN_ATR_PCT", float(y.get("min_atr_pct", 0))),
-        trend_lookback=env_int("TREND_LOOKBACK", int(y.get("lookback", 60))),
-        min_trend_move_pct=env_float("TREND_MIN_MOVE_PCT", float(y.get("min_move_pct", 0.008))),
+        trend_lookback=env_int("TREND_LOOKBACK", int(y.get("lookback", 60)), positive=True),
+        min_trend_move_pct=env_float(
+            "TREND_MIN_MOVE_PCT", float(y.get("min_move_pct", 0.008)), positive=True
+        ),
         block_asian_session=env_bool("TREND_BLOCK_ASIAN", bool(y.get("block_asian_session", False))),
     )
 
@@ -81,7 +83,7 @@ def trend_scan_config_from_env() -> TrendScanConfig:
         float(y.get("stage1_min_score", 18)),
         positive=True,
     )
-    min_prob = env_float("FORECAST_MIN_PROB_PCT", float(y.get("min_prob_pct", 50)), positive=True)
+    min_prob = env_float("FORECAST_MIN_PROB_PCT", float(y.get("min_prob_pct", 50)))
     use_filtered = env_bool("FORECAST_USE_FILTERED", bool(y.get("use_filtered", True)))
     symbols: tuple[str, ...] | None = None
     sym_env = os.environ.get("FORECAST_SYMBOLS", "").strip()
@@ -145,14 +147,14 @@ def scan_combined_setups(
     *,
     scan_cfg: TrendScanConfig | None = None,
     auto_cfg: Any | None = None,
+    progress_cb: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Отчёт для auto_trader и панели (top_setups)."""
     scan_cfg = scan_cfg or TrendScanConfig()
     params = scan_cfg.trend_params or trend_params_from_yaml()
     bars = scan_cfg.bars or BARS_BY_TF.get(scan_cfg.timeframe, 1000)
     auto_cfg = auto_cfg or load_auto_trade_config()
-    auto_cfg.min_probability_pct = scan_cfg.min_probability_pct
-    auto_cfg.min_score = max(float(auto_cfg.min_score), scan_cfg.stage1_min_score)
+    apply_scan_auto_filters(auto_cfg, scan_cfg)
     auto_cfg.allow_level_breakout = False
     auto_cfg.allow_triangle = False
 
@@ -161,8 +163,12 @@ def scan_combined_setups(
     candidates: list[dict[str, Any]] = []
     skipped: list[str] = []
     regime_counts: dict[str, int] = {"trend": 0, "range": 0}
+    symbols_list = list(symbols)
+    total = len(symbols_list)
 
-    for symbol in symbols:
+    for i, symbol in enumerate(symbols_list, 1):
+        if progress_cb:
+            progress_cb({"current": i, "total": total, "symbol": symbol})
         df = _fetch_df(ex, symbol, scan_cfg.timeframe, bars)
         if df is None:
             skipped.append(symbol)
