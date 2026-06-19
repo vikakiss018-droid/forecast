@@ -28,6 +28,12 @@ from .signal_combiner import (
     compute_volume_scores,
     combine_probabilities,
 )
+from .scalp_engine import get_scalp_engine_status, start_scalp_engine
+from .orderbook_layer import (
+    get_all_orderbook_snapshots,
+    start_spot_orderbook_layer,
+    top_live_symbols,
+)
 from .orderflow_stream import start_orderbook_stream, get_liquidity_snapshot
 from .backtest_analytics import ev_bucket_label
 from .ev_calibration import load_ev_calibration
@@ -392,8 +398,15 @@ def _simple_symbol_snapshot(
 @app.on_event("startup")
 def _on_startup() -> None:
     loop = asyncio.get_event_loop()
-    symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "PEPEUSDT", "DOGEUSDT", "LINKUSDT"]
-    loop.create_task(start_orderbook_stream(symbols))
+    # Spot depth: top-N from live filtered list (OBI / microprice for scanner)
+    loop.create_task(start_spot_orderbook_layer())
+    loop.create_task(start_scalp_engine())
+    # Legacy /legacy UI: futures liquidity snapshot (hardcoded majors)
+    legacy_symbols = [
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
+        "XRPUSDT", "PEPEUSDT", "DOGEUSDT", "LINKUSDT",
+    ]
+    loop.create_task(start_orderbook_stream(legacy_symbols))
 
 
 @app.get("/", dependencies=PANEL_AUTH_DEPS)
@@ -1612,6 +1625,25 @@ def pair_ranking_json() -> dict[str, Any]:
 @app.get("/scanner/progress/json", dependencies=PANEL_AUTH_DEPS)
 def scan_progress_json() -> dict[str, Any]:
     return load_scan_progress()
+
+
+@app.get("/scanner/scalp/json", dependencies=PANEL_AUTH_DEPS)
+def scalp_json() -> dict[str, Any]:
+    """Live scalp engine: OBI persistence, paper signals, aggTrade flow."""
+    return get_scalp_engine_status()
+
+
+@app.get("/scanner/orderbook/json", dependencies=PANEL_AUTH_DEPS)
+def orderbook_json() -> dict[str, Any]:
+    """Live spot OBI / microprice for top-N live pairs."""
+    import os
+
+    return {
+        "symbols": list(top_live_symbols()),
+        "top_n": int(os.environ.get("ORDERBOOK_TOP_N", "8") or 8),
+        "gate_enabled": os.environ.get("ORDERBOOK_GATE_ENABLED", "0").strip().lower() in ("1", "true", "yes"),
+        "rows": get_all_orderbook_snapshots(),
+    }
 
 
 @app.post("/scanner/live/run", dependencies=PANEL_AUTH_DEPS)

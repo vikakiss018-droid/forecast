@@ -12,6 +12,8 @@ from zoneinfo import ZoneInfo
 MSK = ZoneInfo("Europe/Moscow")
 
 from .auto_trader import AutoTradeConfig, load_closed_trades, load_trade_history, load_trade_state
+from .orderbook_layer import top_live_symbols
+from .scalp_config import load_scalp_config
 from .binance_client import trading_credentials_source
 from .env_config import SETTINGS_META, get_settings_for_panel
 from .run_symbol_ranking import load_filtered_symbols, ranking_config_from_env
@@ -770,6 +772,160 @@ def _pair_passes_auto_filter(row: dict[str, Any]) -> bool:
     )
 
 
+def _orderbook_poll_script() -> str:
+    return """
+  <script>
+  (function() {
+    const tbody = document.getElementById('ob-tbody');
+    if (!tbody) return;
+    const gateEl = document.getElementById('ob-gate-status');
+    async function tick() {
+      try {
+        const r = await fetch('/scanner/orderbook/json', { credentials: 'same-origin' });
+        const d = await r.json();
+        if (gateEl) gateEl.textContent = d.gate_enabled ? 'вкл (авто)' : 'выкл (только мониторинг)';
+        const rows = d.rows || [];
+        if (!rows.length) {
+          tbody.innerHTML = '<tr><td colspan="8" class="empty-cell">Нет live-пар или ждём данные…</td></tr>';
+          return;
+        }
+        tbody.innerHTML = rows.map(row => {
+          const stale = row.stale;
+          const obi = row.obi_smooth != null ? row.obi_smooth.toFixed(3) : '—';
+          const obiRaw = row.obi != null ? row.obi.toFixed(3) : '—';
+          const mp = row.microprice != null ? row.microprice : '—';
+          const spr = row.spread_bps != null ? row.spread_bps.toFixed(1) : '—';
+          const age = row.age_sec != null ? row.age_sec + 's' : '—';
+          const cls = stale ? 'muted' : (row.obi_smooth > 0.12 ? 'ok' : (row.obi_smooth < -0.12 ? 'bad' : ''));
+          return `<tr class="${cls}">
+            <td>${row.symbol || '—'}</td>
+            <td>${obi}</td>
+            <td>${obiRaw}</td>
+            <td>${mp}</td>
+            <td>${spr}</td>
+            <td>${row.bid_vol != null ? row.bid_vol.toFixed(2) : '—'}</td>
+            <td>${row.ask_vol != null ? row.ask_vol.toFixed(2) : '—'}</td>
+            <td>${stale ? 'stale' : age}</td>
+          </tr>`;
+        }).join('');
+      } catch (e) { /* ignore */ }
+    }
+    tick();
+    setInterval(tick, 2000);
+  })();
+  </script>"""
+
+
+def _orderbook_section_html() -> str:
+    syms = top_live_symbols()
+    n = len(syms)
+    sym_hint = ", ".join(syms[:6]) + ("…" if len(syms) > 6 else "") if syms else "—"
+    return f"""
+    <section class="ob-section">
+      <h2>Live стакан (spot) · top-{n}</h2>
+      <p class="hint" style="margin:0 0 12px;color:var(--muted);font-size:0.85rem">
+        OBI = (bid−ask)/(bid+ask), top-10 уровней · EMA ~2.5с ·
+        gate для авто: <span id="ob-gate-status">…</span> · пары: {_e(sym_hint)}
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Пара</th><th>OBI EMA</th><th>OBI</th><th>Microprice</th>
+              <th>Spread bps</th><th>Bid vol</th><th>Ask vol</th><th>Age</th>
+            </tr>
+          </thead>
+          <tbody id="ob-tbody">
+            <tr><td colspan="8" class="empty-cell">Загрузка…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+    {_orderbook_poll_script()}"""
+
+
+def _scalp_poll_script() -> str:
+    return """
+  <script>
+  (function() {
+    const tbody = document.getElementById('scalp-tbody');
+    const statusEl = document.getElementById('scalp-status');
+    const recentEl = document.getElementById('scalp-recent');
+    if (!tbody) return;
+    async function tick() {
+      try {
+        const r = await fetch('/scanner/scalp/json', { credentials: 'same-origin' });
+        const d = await r.json();
+        const cfg = d.config || {};
+        if (statusEl) {
+          const mode = cfg.dry_run ? 'paper' : 'live';
+          const on = d.enabled && d.running;
+          statusEl.textContent = on
+            ? mode + ' · OBI≥' + cfg.obi_long_min + ' ' + cfg.obi_persist_sec + 's · TP ' + cfg.min_tp_pct + '%'
+            : 'выкл (SCALP_ENABLED=0)';
+        }
+        const rows = d.rows || [];
+        tbody.innerHTML = rows.length ? rows.map(row => {
+          const pl = row.obi_persist_long_sec != null ? row.obi_persist_long_sec + 's' : '—';
+          const ps = row.obi_persist_short_sec != null ? row.obi_persist_short_sec + 's' : '—';
+          const fr = row.flow ? row.flow.flow_ratio : '—';
+          const obi = row.obi_smooth != null ? row.obi_smooth.toFixed(3) : '—';
+          const skip = row.skip_reason || '—';
+          return `<tr>
+            <td>${row.symbol}</td>
+            <td>${obi}</td>
+            <td>${pl}</td>
+            <td>${ps}</td>
+            <td>${fr}</td>
+            <td class="muted" style="font-size:0.8rem">${skip}</td>
+          </tr>`;
+        }).join('') : '<tr><td colspan="6" class="empty-cell">Нет данных</td></tr>';
+        const recent = (d.trader && d.trader.recent_signals) || [];
+        if (recentEl) {
+          recentEl.innerHTML = recent.length
+            ? recent.slice(0, 5).map(s => {
+                const sig = s.signal || {};
+                const pl = s.plan || {};
+                return `<div class="scalp-signal">${sig.side || '?'} ${sig.symbol} entry=${sig.entry} TP=${pl.tp_pct}% · ${s.ts_iso || ''}</div>`;
+              }).join('')
+            : '<span class="muted">Пока нет paper-сигналов</span>';
+        }
+      } catch (e) { /* ignore */ }
+    }
+    tick();
+    setInterval(tick, 2000);
+  })();
+  </script>"""
+
+
+def _scalp_section_html() -> str:
+    cfg = load_scalp_config()
+    enabled_hint = "вкл" if cfg.enabled else "выкл — задайте SCALP_ENABLED=1 в .env"
+    return f"""
+    <section class="scalp-section">
+      <h2>Скальп (event-driven) · <span id="scalp-status" class="muted">…</span></h2>
+      <p class="hint" style="margin:0 0 12px;color:var(--muted);font-size:0.85rem">
+        Сигнал: устойчивый OBI {cfg.obi_persist_sec}s · независим от часового скана ·
+        режим: {enabled_hint} · лог: data/processed/scalp_signals.jsonl
+      </p>
+      <div id="scalp-recent" class="scalp-recent" style="margin-bottom:12px;font-size:0.85rem"></div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Пара</th><th>OBI EMA</th><th>Persist L</th><th>Persist S</th>
+              <th>Flow ratio</th><th>Статус</th>
+            </tr>
+          </thead>
+          <tbody id="scalp-tbody">
+            <tr><td colspan="6" class="empty-cell">Загрузка…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+    {_scalp_poll_script()}"""
+
+
 def _pair_ranking_rows(
     ranking: list[dict[str, Any]],
     *,
@@ -1495,6 +1651,10 @@ def render_scanner_dashboard(
       <h2>Лучший сетап (№1)</h2>
       {_hero_setup(hero, pick_from_top_n=int(at.pick_from_top_n))}
     </section>
+
+    {_orderbook_section_html()}
+
+    {_scalp_section_html()}
 
     <div class="two-col">
       <section>
