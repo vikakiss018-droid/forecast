@@ -66,6 +66,12 @@ from .scan_cache import (
     save_scan_progress,
     save_scan_result,
 )
+from .run_scalp_pair_ranking import (
+    approve_scalp_symbols,
+    load_scalp_ranking_live,
+    load_scalp_ranking_result,
+    run_scalp_pair_ranking_background,
+)
 from .run_symbol_ranking import (
     approve_live_symbols,
     load_filtered_symbols,
@@ -80,6 +86,7 @@ from .position_chart import build_position_chart_html
 from .scanner_panel import (
     render_closed_trades_dashboard,
     render_pair_ranking_dashboard,
+    render_scalp_pair_ranking_dashboard,
     render_scanner_dashboard,
 )
 from .trade_gate import GateMode, TradeGateConfig, evaluate_trade_gate
@@ -1625,6 +1632,93 @@ def pair_ranking_json() -> dict[str, Any]:
 @app.get("/scanner/progress/json", dependencies=PANEL_AUTH_DEPS)
 def scan_progress_json() -> dict[str, Any]:
     return load_scan_progress()
+
+
+@app.get("/scanner/scalp/pairs", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
+def scalp_pair_ranking_panel(
+    approved: str | None = None,
+    started: str | None = None,
+    busy: str | None = None,
+    error: str | None = None,
+) -> str:
+    msg = None
+    err = error
+    if approved == "1":
+        data = load_scalp_ranking_live()
+        n = int(data.get("count") or 0)
+        msg = f"Утверждено {n} пар для скальпа. Перезапустите API: systemctl restart forecast-api"
+    elif started == "1":
+        msg = "Скан 400 пар для скальпа запущен — страница обновится автоматически"
+    elif busy == "1":
+        msg = "Скан уже выполняется"
+    return render_scalp_pair_ranking_dashboard(
+        result=load_scalp_ranking_result(),
+        live=load_scalp_ranking_live(),
+        msg=msg,
+        err=err,
+    )
+
+
+@app.post("/scanner/scalp/pairs/run", dependencies=PANEL_AUTH_DEPS)
+async def scalp_pair_ranking_run(background_tasks: BackgroundTasks) -> RedirectResponse:
+    cur = load_scalp_ranking_result()
+    if cur.get("status") == "running":
+        return RedirectResponse(url="/scanner/scalp/pairs?busy=1", status_code=303)
+    background_tasks.add_task(run_scalp_pair_ranking_background)
+    return RedirectResponse(url="/scanner/scalp/pairs?started=1", status_code=303)
+
+
+@app.post("/scanner/scalp/pairs/approve", dependencies=PANEL_AUTH_DEPS)
+async def scalp_pair_ranking_approve(request: Request) -> RedirectResponse:
+    form = await request.form()
+    symbols = [s.strip() for s in _form_field_values(form, "symbols") if s.strip()]
+    if not symbols:
+        return RedirectResponse(
+            url="/scanner/scalp/pairs?error=" + quote("Выберите хотя бы одну пару"),
+            status_code=303,
+        )
+    try:
+        approve_scalp_symbols(symbols)
+    except OSError as e:
+        return RedirectResponse(
+            url="/scanner/scalp/pairs?error=" + quote(str(e)),
+            status_code=303,
+        )
+    return RedirectResponse(url="/scanner/scalp/pairs?approved=1", status_code=303)
+
+
+@app.post("/scanner/scalp/pairs/approve-top8", dependencies=PANEL_AUTH_DEPS)
+async def scalp_pair_ranking_approve_top8() -> RedirectResponse:
+    latest = load_scalp_ranking_result()
+    syms = list(latest.get("suggested_symbols") or [])
+    if not syms:
+        ranking = list(latest.get("ranking") or [])
+        syms = [str(r["symbol"]) for r in ranking[:8]]
+    if not syms:
+        return RedirectResponse(
+            url="/scanner/scalp/pairs?error=" + quote("Сначала запустите скан 400 пар"),
+            status_code=303,
+        )
+    try:
+        approve_scalp_symbols(syms)
+    except OSError as e:
+        return RedirectResponse(
+            url="/scanner/scalp/pairs?error=" + quote(str(e)),
+            status_code=303,
+        )
+    return RedirectResponse(url="/scanner/scalp/pairs?approved=1", status_code=303)
+
+
+@app.get("/scanner/scalp/pairs/json", dependencies=PANEL_AUTH_DEPS)
+def scalp_pair_ranking_json() -> dict[str, Any]:
+    data = load_scalp_ranking_result()
+    return {
+        "status": data.get("status", "idle"),
+        "kind": "scalp_pair_test",
+        "progress": data.get("progress") or {},
+        "symbols_count": data.get("symbols_count"),
+        "error": data.get("error"),
+    }
 
 
 @app.get("/scanner/scalp/json", dependencies=PANEL_AUTH_DEPS)

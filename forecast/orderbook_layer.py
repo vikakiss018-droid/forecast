@@ -100,10 +100,17 @@ def spot_stream_symbol(symbol: str) -> str:
 
 
 def top_live_symbols(n: int | None = None) -> tuple[str, ...]:
-    """Top-N spot pairs from live filtered list (by total_r, else approval order)."""
+    """Top-N pairs for orderbook/scalp (scalp live list or swing filtered list)."""
     from .run_symbol_ranking import load_filtered_symbols, load_symbol_ranking_filtered
 
     n = n or _env_int("ORDERBOOK_TOP_N", 8)
+    if _env_bool("SCALP_USE_DEDICATED_LIST", True):
+        from .run_scalp_pair_ranking import load_scalp_live_symbols
+
+        scalp_syms = load_scalp_live_symbols()
+        if scalp_syms:
+            return scalp_syms[:n]
+
     data = load_symbol_ranking_filtered()
     ranking = list(data.get("ranking") or [])
     if ranking:

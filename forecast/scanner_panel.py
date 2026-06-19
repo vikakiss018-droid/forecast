@@ -17,6 +17,7 @@ from .scalp_config import load_scalp_config
 from .binance_client import trading_credentials_source
 from .env_config import SETTINGS_META, get_settings_for_panel
 from .run_symbol_ranking import load_filtered_symbols, ranking_config_from_env
+from .run_scalp_pair_ranking import load_scalp_ranking_live, scalp_rank_config_from_env
 
 
 def _e(s: Any) -> str:
@@ -518,11 +519,13 @@ def _dashboard_tabs(*, active: str, base_q: str) -> str:
     scan_cls = "tab active" if active == "scan" else "tab"
     closed_cls = "tab active" if active == "closed" else "tab"
     pairs_cls = "tab active" if active == "pairs" else "tab"
+    scalp_pairs_cls = "tab active" if active == "scalp_pairs" else "tab"
     return f"""
     <nav class="dash-tabs">
       <a class="{scan_cls}" href="/scanner?{base_q}">Сканер и торговля</a>
       <a class="{closed_cls}" href="/scanner?tab=closed&amp;{base_q}">Закрытые сделки</a>
-      <a class="{pairs_cls}" href="/scanner/pairs" target="_blank">Тест пар (400)</a>
+      <a class="{pairs_cls}" href="/scanner/pairs" target="_blank">Тест пар (400) swing</a>
+      <a class="{scalp_pairs_cls}" href="/scanner/scalp/pairs" target="_blank">Скальп-пары (400→8)</a>
     </nav>"""
 
 
@@ -715,7 +718,7 @@ def _progress_poll_script(
           panel.style.display = 'flex';
           if (bar) bar.style.width = pct + '%';
           if (pctEl) pctEl.textContent = pct + '%';
-          if (label) label.textContent = d.kind === 'pair_test' ? 'Тест пар…' : 'Live-скан…';
+          if (label) label.textContent = d.kind === 'scalp_pair_test' ? 'Скальп-пары…' : d.kind === 'pair_test' ? 'Тест пар…' : 'Live-скан…';
           if (detail) detail.textContent = cur + ' / ' + tot + ' · ' + sym;
           return;
         }}
@@ -945,7 +948,7 @@ def _scalp_section_html() -> str:
     <section class="scalp-section">
       <h2>Скальп (event-driven) · <span id="scalp-status" class="muted">…</span></h2>
       <p class="hint" style="margin:0 0 12px;color:var(--muted);font-size:0.85rem">
-        Сигнал: устойчивый OBI {cfg.obi_persist_sec}s · независим от часового скана ·
+        Сигнал: устойчивый OBI {cfg.obi_persist_sec}s · пары из <a href="/scanner/scalp/pairs" style="color:var(--accent)">скальп-листа</a> ·
         режим: {enabled_hint} · лог: data/processed/scalp_signals.jsonl
       </p>
       <div id="scalp-pnl-summary" class="scalp-pnl" style="margin-bottom:12px;font-size:0.9rem"></div>
@@ -1240,6 +1243,213 @@ def render_pair_ranking_dashboard(
       <div class="stat"><label>Плюсовых (авто)</label><strong>{plus_count if status == 'done' else '—'}</strong></div>
       <div class="stat"><label>Сделок в тесте</label><strong>{total_trades if status == 'done' else '—'}</strong></div>
       <div class="stat"><label>Total R</label><strong>{_fmt_num(total_r, 2) if total_r is not None else '—'}</strong></div>
+      <div class="stat"><label>Завершён</label><strong>{finished}</strong></div>
+      <div class="stat"><label>Прогресс</label><strong>{cur}/{total if total else '—'}</strong></div>
+    </div>
+    {approve_block}
+    <footer style="margin-top:24px;color:var(--muted);font-size:0.8rem">
+      <a href="/scanner" style="color:var(--accent)">← Сканер и торговля</a>
+    </footer>
+  </div>
+  {poll_script}
+</body>
+</html>"""
+
+
+def _scalp_pair_in_top8(row: dict[str, Any], top_n: int = 8) -> bool:
+    return int(row.get("rank") or 999) <= top_n and float(row.get("scalp_score") or -999) > 0
+
+
+def _scalp_pair_ranking_rows(
+    ranking: list[dict[str, Any]],
+    *,
+    top_n: int = 8,
+    selected_symbols: set[str] | None = None,
+) -> str:
+    if not ranking:
+        return (
+            '<tr><td colspan="10" class="empty-cell">'
+            "Запустите скан — таблица заполнится после завершения"
+            "</td></tr>"
+        )
+    out: list[str] = []
+    for row in ranking:
+        sym = str(row.get("symbol") or "")
+        score = float(row.get("scalp_score") or 0)
+        in_top = _scalp_pair_in_top8(row, top_n)
+        tr_cls = "row-plus" if in_top else ""
+        checked = ""
+        if selected_symbols is not None:
+            checked = " checked" if sym in selected_symbols else ""
+        elif in_top:
+            checked = " checked"
+        spread = row.get("spread_bps")
+        spread_s = f"{float(spread):.1f}" if spread is not None else "—"
+        out.append(
+            f'<tr class="{tr_cls}">'
+            f'<td><input type="checkbox" name="symbols" value="{_e(sym)}"{checked} /></td>'
+            f'<td>{int(row.get("rank") or 0)}</td>'
+            f'<td class="sym">{_e(sym)}</td>'
+            f'<td><strong>{score:.1f}</strong></td>'
+            f'<td>{float(row.get("sim_expectancy_pct") or 0):+.3f}%</td>'
+            f'<td>{float(row.get("sim_win_rate_pct") or 0):.1f}%</td>'
+            f'<td>{int(row.get("sim_trades") or 0)}</td>'
+            f'<td>{spread_s}</td>'
+            f'<td>{float(row.get("median_range_bps") or 0):.1f}</td>'
+            f'<td>{int(float(row.get("quote_vol_usdt") or 0)):,}</td>'
+            f"</tr>"
+        )
+    return "".join(out)
+
+
+def render_scalp_pair_ranking_dashboard(
+    *,
+    result: dict[str, Any],
+    live: dict[str, Any],
+    msg: str | None = None,
+    err: str | None = None,
+) -> str:
+    status = str(result.get("status") or "idle")
+    ranking = list(result.get("ranking") or [])
+    progress = result.get("progress") or {}
+    cur = int(progress.get("current") or 0)
+    total = int(progress.get("total") or 0)
+    cur_sym = progress.get("symbol") or "—"
+    finished = _fmt_ts(result.get("finished_at"))
+    sym_count = int(result.get("symbols_count") or 0)
+    live_count = int(live.get("count") or 0)
+    live_at = _fmt_ts(live.get("approved_at"))
+    live_syms = ", ".join(live.get("symbols") or []) or "—"
+
+    try:
+        cfg = scalp_rank_config_from_env()
+        top_n = cfg.live_n
+        rank_top = cfg.top_n
+    except Exception:
+        top_n = 8
+        rank_top = 400
+
+    banner = ""
+    if err:
+        banner = f'<div class="save-banner err">{_e(err)}</div>'
+    elif msg:
+        banner = f'<div class="save-banner ok">{_e(msg)}</div>'
+    elif status == "running":
+        pct = int(100 * cur / total) if total else 0
+        banner = (
+            f'<div class="save-banner warn">Скан выполняется: {cur}/{total} ({pct}%) · '
+            f"{_e(cur_sym)} · страница обновится автоматически</div>"
+        )
+    elif status == "error":
+        banner = f'<div class="save-banner err">Ошибка: {_e(result.get("error"))}</div>'
+
+    run_disabled = "disabled" if status == "running" else ""
+    poll_script = ""
+    if status == "running":
+        poll_script = _progress_poll_script(
+            json_url="/scanner/scalp/pairs/json",
+            reload_on_done=True,
+            bar_id="pair-progress-bar",
+            label_id="pair-progress-label",
+            detail_id="pair-progress-detail",
+            panel_id="progress-panel",
+        )
+
+    show_form = status == "done" and bool(ranking)
+    test_cfg = result.get("test_config") or {}
+    suggested = result.get("suggested_symbols") or []
+
+    approve_block = ""
+    if show_form:
+        approve_block = f"""
+    <form method="post" action="/scanner/scalp/pairs/approve-top8" style="margin: 12px 0">
+      <button type="submit" class="btn btn-primary">Быстро: утвердить топ-{top_n} по score</button>
+    </form>
+    <form method="post" action="/scanner/scalp/pairs/approve" id="approve-form">
+      <div class="approve-bar">
+        <button type="button" class="btn" onclick="toggleScalpTop(true)">Выбрать топ-{top_n}</button>
+        <button type="button" class="btn" onclick="toggleScalpTop(false)">Снять все</button>
+        <button type="submit" class="btn btn-primary">Утвердить выбранные</button>
+        <span class="hint-inline">Список → стакан, OBI, paper P&L (отдельно от swing live)</span>
+      </div>
+      <div class="table-wrap table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th></th><th>#</th><th>Пара</th><th>Score</th><th>Exp %</th>
+              <th>Win%</th><th>Сим</th><th>Spread</th><th>Range bps</th><th>Vol USDT</th>
+            </tr>
+          </thead>
+          <tbody>{_scalp_pair_ranking_rows(ranking, top_n=top_n)}</tbody>
+        </table>
+      </div>
+    </form>
+    <script>
+    function toggleScalpTop(on) {{
+      document.querySelectorAll('#approve-form input[name=symbols]').forEach((cb, i) => {{
+        cb.checked = on ? (i < {top_n}) : false;
+      }});
+    }}
+    </script>"""
+
+    rule = _e(result.get("rule") or test_cfg.get("rule") or "1m scalp sim")
+    suggested_hint = _e(", ".join(suggested[:top_n])) if suggested else "—"
+
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Forecast — Скальп-пары ({rank_top}→{top_n})</title>
+  {_panel_fonts_link()}
+  <style>
+    {_panel_theme_css(full=False)}
+    {_progress_panel_css()}
+    .wrap {{ max-width: 1200px; }}
+    .hint {{ color: var(--muted); font-size: 0.85rem; margin: 12px 0 20px; line-height: 1.6; }}
+    .btn {{ cursor: pointer; border: none; color: #2a1020; }}
+    .btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+    .approve-bar {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 16px 0; }}
+    .table-scroll {{ max-height: 65vh; overflow: auto; }}
+    tr.row-plus td {{ background: rgba(134, 239, 172, 0.06); }}
+    .live-box {{
+      background: var(--glass); border: 1px solid var(--border); border-radius: 16px;
+      padding: 14px 18px; margin-bottom: 16px;
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Скальп: отбор пар ({rank_top} → top-{top_n})</h1>
+    {_dashboard_tabs(active="scalp_pairs", base_q="")}
+    {banner}
+    <div id="progress-panel" class="progress-panel" style="display:{'flex' if status == 'running' else 'none'}">
+      <div class="progress-head">
+        <span id="pair-progress-label">Скан для скальпа…</span>
+        <span id="progress-pct">0%</span>
+      </div>
+      <div class="progress-track"><div id="pair-progress-bar" class="progress-fill" style="width:0%"></div></div>
+      <div id="pair-progress-detail" class="progress-detail">—</div>
+    </div>
+    <div class="live-box">
+      <strong>Live скальп-пары ({live_count})</strong>
+      <span class="hint-inline"> · обновлено {live_at}</span>
+      <div class="hint" style="margin-top:8px">{_e(live_syms)}</div>
+    </div>
+    <p class="hint">
+      Отдельный скан от swing-теста: 1m OHLCV, симуляция long TP/SL/time-stop, live spread на топ-кандидатах.
+      Критерий: <code>scalp_score</code> (ликвидность + узкий спред + положит. expectancy после комиссии).
+      Файл: <code>symbol_ranking_scalp_live.json</code>
+    </p>
+    <p class="hint"><strong>Правило:</strong> {rule}</p>
+    <p class="hint"><strong>Рекомендовано топ-{top_n}:</strong> {suggested_hint}</p>
+    <form method="post" action="/scanner/scalp/pairs/run" style="margin-bottom: 12px;">
+      <button type="submit" class="btn btn-primary" {run_disabled}>Запустить скан {rank_top} пар</button>
+    </form>
+    <div class="stats">
+      <div class="stat"><label>Статус</label><strong>{_e(status)}</strong></div>
+      <div class="stat"><label>Проанализировано</label><strong>{int(result.get('analyzed_count') or 0) if status == 'done' else '—'}</strong></div>
+      <div class="stat"><label>В тесте</label><strong>{sym_count or total or '—'}</strong></div>
       <div class="stat"><label>Завершён</label><strong>{finished}</strong></div>
       <div class="stat"><label>Прогресс</label><strong>{cur}/{total if total else '—'}</strong></div>
     </div>
@@ -1626,6 +1836,8 @@ def render_scanner_dashboard(
     )
     refresh_url = f"/scanner?{base_q}"
     live_pairs = len(load_filtered_symbols())
+    scalp_live = load_scalp_ranking_live()
+    scalp_pairs = int(scalp_live.get("count") or 0)
     scan_poll = ""
     if scan_watch:
         scan_poll = _progress_poll_script(json_url="/scanner/progress/json", reload_on_done=True)
@@ -1688,11 +1900,13 @@ def render_scanner_dashboard(
         <input type="hidden" name="stage1_min_score" value="{float(stage1_min_score)}" />
         <button type="submit" class="btn">Live-скан</button>
       </form>
-      <a class="btn" href="/scanner/pairs" target="_blank">Тест пар (400)</a>
+      <a class="btn" href="/scanner/pairs" target="_blank">Swing-пары (400)</a>
+      <a class="btn" href="/scanner/scalp/pairs" target="_blank">Скальп-пары (400→8)</a>
     </div>
 
     <div class="stats">
-      <div class="stat"><label>Live-пары</label><strong>{live_pairs}</strong></div>
+      <div class="stat"><label>Swing live</label><strong>{live_pairs}</strong></div>
+      <div class="stat"><label>Скальп live</label><strong>{scalp_pairs}</strong></div>
       <div class="stat"><label>Последний скан</label><strong>{_fmt_ts(updated_at)}</strong></div>
       <div class="stat"><label>Пар в скане</label><strong>{sym_scanned}</strong></div>
       <div class="stat"><label>Время скана</label><strong>{_fmt_scan_duration(scan_dur)}</strong></div>
