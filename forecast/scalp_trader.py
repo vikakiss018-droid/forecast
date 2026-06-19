@@ -13,6 +13,7 @@ from typing import Any
 from .paths import PROCESSED_DATA_DIR, ensure_directories
 from .scalp_config import ScalpConfig
 from .scalp_signals import ScalpSignal
+from .scalp_paper_pnl import get_paper_pnl_status, open_paper_position
 
 SIGNALS_LOG = PROCESSED_DATA_DIR / "scalp_signals.jsonl"
 TICKS_DIR = PROCESSED_DATA_DIR / "scalp_ticks"
@@ -126,6 +127,15 @@ def emit_paper_signal(
     _DAILY_EMITS.append(now)
     _STATS["emitted"] += 1
 
+    open_paper_position(
+        signal,
+        tp_price=plan.tp_price,
+        sl_price=plan.sl_price,
+        time_stop_sec=plan.time_stop_sec,
+        cfg=cfg,
+        now=now,
+    )
+
     print(
         f"[scalp] PAPER {signal.side.upper()} {signal.symbol} "
         f"entry={signal.entry:.6f} obi={signal.obi_smooth:.3f} "
@@ -155,4 +165,5 @@ def get_scalp_trader_status(cfg: ScalpConfig) -> dict[str, Any]:
         "daily_count": len(_DAILY_EMITS),
         "recent_signals": list(_RECENT_SIGNALS)[:20],
         "log_path": str(SIGNALS_LOG),
+        "pnl": get_paper_pnl_status(cfg),
     }

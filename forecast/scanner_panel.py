@@ -851,6 +851,9 @@ def _scalp_poll_script() -> str:
     const tbody = document.getElementById('scalp-tbody');
     const statusEl = document.getElementById('scalp-status');
     const recentEl = document.getElementById('scalp-recent');
+    const pnlEl = document.getElementById('scalp-pnl-summary');
+    const openEl = document.getElementById('scalp-open-tbody');
+    const closedEl = document.getElementById('scalp-closed-tbody');
     if (!tbody) return;
     async function tick() {
       try {
@@ -890,6 +893,43 @@ def _scalp_poll_script() -> str:
               }).join('')
             : '<span class="muted">Пока нет paper-сигналов</span>';
         }
+        const pnl = (d.trader && d.trader.pnl) || {};
+        const s24 = pnl.summary_24h || {};
+        if (pnlEl) {
+          const pnlVal = s24.total_pnl_usdt != null ? s24.total_pnl_usdt : 0;
+          const cls = pnlVal >= 0 ? 'ok' : 'bad';
+          pnlEl.innerHTML = `
+            <div class="stat-row">
+              <span>24h P&L (net): <strong class="${cls}">${pnlVal >= 0 ? '+' : ''}${pnlVal} USDT</strong></span>
+              <span>сделок: ${s24.trades || 0}</span>
+              <span>win: ${s24.win_rate_pct || 0}%</span>
+              <span>TP/SL/TS: ${s24.tp || 0}/${s24.sl || 0}/${s24.time_stop || 0}</span>
+              <span>notional: ${pnl.notional_usdt || '—'} USDT · fee: ${pnl.fee_pct || '—'}%</span>
+            </div>`;
+        }
+        const openPos = pnl.open_positions || [];
+        if (openEl) {
+          openEl.innerHTML = openPos.length ? openPos.map(p => {
+            const up = p.upnl_usdt != null ? p.upnl_usdt.toFixed(2) : '—';
+            const upc = p.upnl_usdt > 0 ? 'ok' : (p.upnl_usdt < 0 ? 'bad' : '');
+            return `<tr>
+              <td>${p.symbol}</td><td>${p.side}</td><td>${p.entry}</td>
+              <td>${p.tp_price}</td><td>${p.sl_price}</td>
+              <td class="${upc}">${up}</td><td>${p.time_left_sec}s</td>
+            </tr>`;
+          }).join('') : '<tr><td colspan="7" class="empty-cell">Нет открытых paper-позиций</td></tr>';
+        }
+        const closed = pnl.recent_closed || [];
+        if (closedEl) {
+          closedEl.innerHTML = closed.length ? closed.map(c => {
+            const p = c.pnl_usdt != null ? c.pnl_usdt.toFixed(2) : '—';
+            const cls = c.win ? 'ok' : 'bad';
+            return `<tr class="${cls}">
+              <td>${c.symbol}</td><td>${c.side}</td><td>${c.reason}</td>
+              <td>${c.net_pct}%</td><td>${p}</td><td style="font-size:0.8rem">${c.ts_iso || ''}</td>
+            </tr>`;
+          }).join('') : '<tr><td colspan="6" class="empty-cell">Пока нет закрытых сделок</td></tr>';
+        }
       } catch (e) { /* ignore */ }
     }
     tick();
@@ -908,7 +948,30 @@ def _scalp_section_html() -> str:
         Сигнал: устойчивый OBI {cfg.obi_persist_sec}s · независим от часового скана ·
         режим: {enabled_hint} · лог: data/processed/scalp_signals.jsonl
       </p>
+      <div id="scalp-pnl-summary" class="scalp-pnl" style="margin-bottom:12px;font-size:0.9rem"></div>
       <div id="scalp-recent" class="scalp-recent" style="margin-bottom:12px;font-size:0.85rem"></div>
+      <h3 style="font-size:0.95rem;margin:16px 0 8px">Открытые paper-позиции</h3>
+      <div class="table-wrap" style="margin-bottom:16px">
+        <table>
+          <thead><tr>
+            <th>Пара</th><th>Сторона</th><th>Entry</th><th>TP</th><th>SL</th><th>uPnL net</th><th>Time left</th>
+          </tr></thead>
+          <tbody id="scalp-open-tbody">
+            <tr><td colspan="7" class="empty-cell">Загрузка…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <h3 style="font-size:0.95rem;margin:0 0 8px">Закрытые (paper P&L)</h3>
+      <div class="table-wrap" style="margin-bottom:16px">
+        <table>
+          <thead><tr>
+            <th>Пара</th><th>Сторона</th><th>Причина</th><th>Net %</th><th>P&L USDT</th><th>Время</th>
+          </tr></thead>
+          <tbody id="scalp-closed-tbody">
+            <tr><td colspan="6" class="empty-cell">Загрузка…</td></tr>
+          </tbody>
+        </table>
+      </div>
       <div class="table-wrap">
         <table>
           <thead>

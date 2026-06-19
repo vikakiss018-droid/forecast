@@ -53,6 +53,8 @@ class ScalpConfig:
     require_agg_flow: bool = False
     tick_log: bool = False
     spot_allow_short: bool = False
+    paper_notional_usdt: float = 30.0
+    round_trip_fee_pct: float = 0.2
 
 
 def load_scalp_config() -> ScalpConfig:
@@ -75,4 +77,6 @@ def load_scalp_config() -> ScalpConfig:
         require_agg_flow=_env_bool("SCALP_REQUIRE_AGG_FLOW", False),
         tick_log=_env_bool("SCALP_TICK_LOG", False),
         spot_allow_short=_env_bool("SCALP_SPOT_ALLOW_SHORT", False),
+        paper_notional_usdt=_env_float("SCALP_PAPER_NOTIONAL_USDT", 30.0),
+        round_trip_fee_pct=_env_float("SCALP_ROUND_TRIP_FEE_PCT", 0.2),
     )

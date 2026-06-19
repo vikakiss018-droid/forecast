@@ -25,6 +25,7 @@ from .scalp_config import ScalpConfig, load_scalp_config
 from .scalp_flow import AggFlowState
 from .scalp_signals import SymbolSignalState, evaluate_scalp_signal
 from .scalp_trader import append_tick_log, emit_paper_signal, get_scalp_trader_status
+from .scalp_paper_pnl import update_paper_positions
 
 _FLOWS: dict[str, AggFlowState] = {}
 _SYM_STATES: dict[str, SymbolSignalState] = {}
@@ -54,6 +55,8 @@ async def _on_depth_tick(symbol: str, metrics: OrderBookMetrics) -> None:
 
     async with _LOCK:
         _ENGINE_STATS["depth_ticks"] += 1
+        if metrics.mid > 0:
+            update_paper_positions(symbol, metrics.mid)
         _ENGINE_STATS["signals_checked"] += 1
         sym_state = _sym_state(symbol)
         flow = _FLOWS.get(symbol)
