@@ -15,8 +15,6 @@ from typing import Any, Awaitable, Callable
 
 import websockets
 
-from .run_symbol_ranking import load_symbol_ranking_filtered, load_filtered_symbols
-
 SPOT_WS_BASE = "wss://stream.binance.com:9443/ws"
 
 
@@ -103,6 +101,8 @@ def spot_stream_symbol(symbol: str) -> str:
 
 def top_live_symbols(n: int | None = None) -> tuple[str, ...]:
     """Top-N spot pairs from live filtered list (by total_r, else approval order)."""
+    from .run_symbol_ranking import load_filtered_symbols, load_symbol_ranking_filtered
+
     n = n or _env_int("ORDERBOOK_TOP_N", 8)
     data = load_symbol_ranking_filtered()
     ranking = list(data.get("ranking") or [])

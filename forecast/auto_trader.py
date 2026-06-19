@@ -15,7 +15,6 @@ from dotenv import load_dotenv
 from .binance_client import create_trading_client
 from .paths import PROCESSED_DATA_DIR, ensure_directories, load_project_env
 from .scan_cache import DEFAULT_CACHE_PATH, load_scan_result
-from .orderbook_layer import filter_candidates_by_orderbook
 
 STATE_PATH = PROCESSED_DATA_DIR / "auto_trade_state.json"
 MAX_TRADE_HISTORY = 80
@@ -372,6 +371,8 @@ def pick_trade_candidates(
                 flush=True,
             )
     if qualified:
+        from .orderbook_layer import filter_candidates_by_orderbook
+
         qualified, ob_reason = filter_candidates_by_orderbook(qualified)
         if not qualified:
             return [], ob_reason
