@@ -52,7 +52,7 @@ class ScalpRankConfig:
 
     def rule_text(self) -> str:
         return (
-            f"scalp rank top-{self.top_n} on 1m; sim long TP={self.tp_pct}% SL={self.sl_pct}% "
+            f"scalp rank top-{self.top_n} on 1m; sim long+short TP={self.tp_pct}% SL={self.sl_pct}% "
             f"hold={self.hold_bars}m; fee={self.fee_pct}% RT; pick top-{self.live_n}"
         )
 
@@ -95,8 +95,21 @@ def _atr_pct(df: pd.DataFrame, period: int = 14) -> float:
     return float(atr / last * 100.0)
 
 
-def simulate_scalp_long_1m(
+def _empty_sim() -> dict[str, Any]:
+    return {
+        "sim_trades": 0,
+        "sim_wins": 0,
+        "sim_win_rate_pct": 0.0,
+        "sim_expectancy_pct": 0.0,
+        "sim_tp": 0,
+        "sim_sl": 0,
+        "sim_time_stop": 0,
+    }
+
+
+def _simulate_scalp_side_1m(
     df: pd.DataFrame,
+    side: str,
     *,
     tp_pct: float,
     sl_pct: float,
@@ -104,24 +117,17 @@ def simulate_scalp_long_1m(
     fee_pct: float,
     step_bars: int,
 ) -> dict[str, Any]:
-    """Simple long-only scalp sim on 1m OHLCV (proxy without order book)."""
+    """Long or short scalp sim on 1m OHLCV (proxy without order book)."""
     n = len(df)
     warmup = 60
     if n < warmup + hold_bars + 10:
-        return {
-            "sim_trades": 0,
-            "sim_wins": 0,
-            "sim_win_rate_pct": 0.0,
-            "sim_expectancy_pct": 0.0,
-            "sim_tp": 0,
-            "sim_sl": 0,
-            "sim_time_stop": 0,
-        }
+        return _empty_sim()
 
     opens = df["open"].to_numpy()
     highs = df["high"].to_numpy()
     lows = df["low"].to_numpy()
     closes = df["close"].to_numpy()
+    is_long = side == "long"
 
     nets: list[float] = []
     tp_n = sl_n = ts_n = 0
@@ -130,26 +136,44 @@ def simulate_scalp_long_1m(
         entry = float(opens[i])
         if entry <= 0:
             continue
-        tp_px = entry * (1.0 + tp_pct / 100.0)
-        sl_px = entry * (1.0 - sl_pct / 100.0)
+
+        if is_long:
+            tp_px = entry * (1.0 + tp_pct / 100.0)
+            sl_px = entry * (1.0 - sl_pct / 100.0)
+        else:
+            tp_px = entry * (1.0 - tp_pct / 100.0)
+            sl_px = entry * (1.0 + sl_pct / 100.0)
+
         exit_px = float(closes[i + hold_bars])
-        outcome = "TIME_STOP"
 
         for j in range(i + 1, i + 1 + hold_bars):
-            if float(lows[j]) <= sl_px:
-                exit_px = sl_px
-                outcome = "SL"
-                sl_n += 1
-                break
-            if float(highs[j]) >= tp_px:
-                exit_px = tp_px
-                outcome = "TP"
-                tp_n += 1
-                break
+            hi = float(highs[j])
+            lo = float(lows[j])
+            if is_long:
+                if lo <= sl_px:
+                    exit_px = sl_px
+                    sl_n += 1
+                    break
+                if hi >= tp_px:
+                    exit_px = tp_px
+                    tp_n += 1
+                    break
+            else:
+                if hi >= sl_px:
+                    exit_px = sl_px
+                    sl_n += 1
+                    break
+                if lo <= tp_px:
+                    exit_px = tp_px
+                    tp_n += 1
+                    break
         else:
             ts_n += 1
 
-        gross = (exit_px - entry) / entry * 100.0
+        if is_long:
+            gross = (exit_px - entry) / entry * 100.0
+        else:
+            gross = (entry - exit_px) / entry * 100.0
         nets.append(gross - fee_pct)
 
     trades = len(nets)
@@ -166,6 +190,85 @@ def simulate_scalp_long_1m(
         "sim_sl": sl_n,
         "sim_time_stop": ts_n,
     }
+
+
+def _prefix_sim(sim: dict[str, Any], side: str) -> dict[str, Any]:
+    return {k.replace("sim_", f"sim_{side}_", 1): v for k, v in sim.items()}
+
+
+def simulate_scalp_both_1m(
+    df: pd.DataFrame,
+    *,
+    tp_pct: float,
+    sl_pct: float,
+    hold_bars: int,
+    fee_pct: float,
+    step_bars: int,
+) -> dict[str, Any]:
+    """Run long and short sim; combined fields used for ranking score."""
+    kw = dict(
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+        hold_bars=hold_bars,
+        fee_pct=fee_pct,
+        step_bars=step_bars,
+    )
+    long_sim = _simulate_scalp_side_1m(df, "long", **kw)
+    short_sim = _simulate_scalp_side_1m(df, "short", **kw)
+
+    long_tr = int(long_sim["sim_trades"])
+    short_tr = int(short_sim["sim_trades"])
+    total_tr = long_tr + short_tr
+
+    if total_tr > 0:
+        long_exp = float(long_sim["sim_expectancy_pct"])
+        short_exp = float(short_sim["sim_expectancy_pct"])
+        long_wr = float(long_sim["sim_win_rate_pct"])
+        short_wr = float(short_sim["sim_win_rate_pct"])
+        combined_exp = (long_exp * long_tr + short_exp * short_tr) / total_tr
+        combined_wr = (long_wr * long_tr + short_wr * short_tr) / total_tr
+    else:
+        combined_exp = 0.0
+        combined_wr = 0.0
+
+    out: dict[str, Any] = {
+        **_prefix_sim(long_sim, "long"),
+        **_prefix_sim(short_sim, "short"),
+        "sim_trades": total_tr,
+        "sim_wins": int(long_sim["sim_wins"]) + int(short_sim["sim_wins"]),
+        "sim_win_rate_pct": round(combined_wr, 1),
+        "sim_expectancy_pct": round(combined_exp, 4),
+        "sim_tp": int(long_sim["sim_tp"]) + int(short_sim["sim_tp"]),
+        "sim_sl": int(long_sim["sim_sl"]) + int(short_sim["sim_sl"]),
+        "sim_time_stop": int(long_sim["sim_time_stop"]) + int(short_sim["sim_time_stop"]),
+        "best_side": (
+            "long"
+            if float(long_sim["sim_expectancy_pct"]) >= float(short_sim["sim_expectancy_pct"])
+            else "short"
+        ),
+    }
+    return out
+
+
+def simulate_scalp_long_1m(
+    df: pd.DataFrame,
+    *,
+    tp_pct: float,
+    sl_pct: float,
+    hold_bars: int,
+    fee_pct: float,
+    step_bars: int,
+) -> dict[str, Any]:
+    """Backward-compatible alias."""
+    return _simulate_scalp_side_1m(
+        df,
+        "long",
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+        hold_bars=hold_bars,
+        fee_pct=fee_pct,
+        step_bars=step_bars,
+    )
 
 
 def _live_spread_bps(exchange: ccxt.Exchange, symbol: str) -> float | None:
@@ -186,8 +289,13 @@ def _live_spread_bps(exchange: ccxt.Exchange, symbol: str) -> float | None:
 
 
 def compute_scalp_score(row: dict[str, Any]) -> float:
-    """Higher is better for scalp suitability."""
-    if int(row.get("sim_trades") or 0) < 3:
+    """Higher is better for scalp suitability (long + short combined)."""
+    long_tr = int(row.get("sim_long_trades") or 0)
+    short_tr = int(row.get("sim_short_trades") or 0)
+    total_tr = int(row.get("sim_trades") or 0) or (long_tr + short_tr)
+    if long_tr < 2 or short_tr < 2:
+        return -999.0
+    if total_tr < 4:
         return -999.0
 
     expectancy = float(row.get("sim_expectancy_pct") or 0.0)
@@ -222,7 +330,7 @@ def analyze_symbol_for_scalp(
     if df is None or len(df) < 200:
         return None
 
-    sim = simulate_scalp_long_1m(
+    sim = simulate_scalp_both_1m(
         df,
         tp_pct=cfg.tp_pct,
         sl_pct=cfg.sl_pct,
@@ -363,7 +471,8 @@ def run_scalp_pair_ranking_job(
         rows.append(row)
         print(
             f"[scalp-rank] {i}/{len(symbols)} {sym} score={row['scalp_score']:.1f} "
-            f"exp={row['sim_expectancy_pct']:+.3f}% spread=—",
+            f"L={row.get('sim_long_expectancy_pct', 0):+.3f}% "
+            f"S={row.get('sim_short_expectancy_pct', 0):+.3f}%",
             flush=True,
         )
 

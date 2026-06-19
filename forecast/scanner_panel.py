@@ -1268,7 +1268,7 @@ def _scalp_pair_ranking_rows(
 ) -> str:
     if not ranking:
         return (
-            '<tr><td colspan="10" class="empty-cell">'
+            '<tr><td colspan="13" class="empty-cell">'
             "Запустите скан — таблица заполнится после завершения"
             "</td></tr>"
         )
@@ -1291,7 +1291,10 @@ def _scalp_pair_ranking_rows(
             f'<td>{int(row.get("rank") or 0)}</td>'
             f'<td class="sym">{_e(sym)}</td>'
             f'<td><strong>{score:.1f}</strong></td>'
+            f'<td>{float(row.get("sim_long_expectancy_pct") or 0):+.3f}%</td>'
+            f'<td>{float(row.get("sim_short_expectancy_pct") or 0):+.3f}%</td>'
             f'<td>{float(row.get("sim_expectancy_pct") or 0):+.3f}%</td>'
+            f'<td>{_e(str(row.get("best_side") or "—"))}</td>'
             f'<td>{float(row.get("sim_win_rate_pct") or 0):.1f}%</td>'
             f'<td>{int(row.get("sim_trades") or 0)}</td>'
             f'<td>{spread_s}</td>'
@@ -1376,7 +1379,8 @@ def render_scalp_pair_ranking_dashboard(
         <table>
           <thead>
             <tr>
-              <th></th><th>#</th><th>Пара</th><th>Score</th><th>Exp %</th>
+              <th></th><th>#</th><th>Пара</th><th>Score</th>
+              <th>Exp L</th><th>Exp S</th><th>Exp ∑</th><th>Лучше</th>
               <th>Win%</th><th>Сим</th><th>Spread</th><th>Range bps</th><th>Vol USDT</th>
             </tr>
           </thead>
@@ -1437,7 +1441,7 @@ def render_scalp_pair_ranking_dashboard(
       <div class="hint" style="margin-top:8px">{_e(live_syms)}</div>
     </div>
     <p class="hint">
-      Отдельный скан от swing-теста: 1m OHLCV, симуляция long TP/SL/time-stop, live spread на топ-кандидатах.
+      Отдельный скан от swing-теста: 1m OHLCV, симуляция <strong>long + short</strong> TP/SL/time-stop, live spread на топ-кандидатах.
       Критерий: <code>scalp_score</code> (ликвидность + узкий спред + положит. expectancy после комиссии).
       Файл: <code>symbol_ranking_scalp_live.json</code>
     </p>
