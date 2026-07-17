@@ -20,7 +20,7 @@ from .run_symbol_ranking import load_filtered_symbols
 from .signal_combiner import compute_volume_scores
 from .single_symbol_backtest import _build_candidate
 from .strategy_config import env_bool, env_float, env_int, env_str, yaml_section
-from .tf_backtest import BARS_BY_TF, _fetch_df
+from .tf_backtest import BARS_BY_TF, _fetch_df, fetch_top_usdt_symbols
 from .trend_rules import (
     DEFAULT_TREND_PARAMS,
     MIN_ATR_PCT,
@@ -61,12 +61,26 @@ class TrendScanConfig:
     min_probability_pct: float = 50.0
     trend_params: TrendPullbackParams | None = None
     use_filtered_symbols: bool = True
+    universe_top_n: int = 400  # если use_filtered=false — топ-N по объёму 24h
     symbols: tuple[str, ...] | None = None
     long_only: bool = False
     use_closed_bar_only: bool = True
     allow_trend: bool = True
     allow_range: bool = True
     btc_regime_filter: bool = True
+
+
+def _resolve_scan_symbols(scan_cfg: TrendScanConfig) -> tuple[str, ...]:
+    """Явный список → filtered → топ по объёму (universe_top_n)."""
+    if scan_cfg.symbols:
+        return tuple(scan_cfg.symbols)
+    if scan_cfg.use_filtered_symbols:
+        filtered = load_filtered_symbols()
+        if filtered:
+            return filtered
+    n = max(1, int(scan_cfg.universe_top_n or 400))
+    ex = ccxt.binance({"enableRateLimit": True})
+    return fetch_top_usdt_symbols(ex, limit=n)
 
 
 def trend_params_from_yaml() -> TrendPullbackParams:
@@ -130,6 +144,11 @@ def trend_scan_config_from_env() -> TrendScanConfig:
     )
     min_prob = env_float("FORECAST_MIN_PROB_PCT", float(y.get("min_prob_pct", 0)))
     use_filtered = env_bool("FORECAST_USE_FILTERED", bool(y.get("use_filtered", True)))
+    universe_top_n = env_int(
+        "FORECAST_SCAN_TOP_N",
+        int(y.get("universe_top_n", y.get("scan_top_n", 400))),
+        positive=True,
+    )
     symbols: tuple[str, ...] | None = None
     sym_env = os.environ.get("FORECAST_SYMBOLS", "").strip()
     if sym_env:
@@ -149,6 +168,7 @@ def trend_scan_config_from_env() -> TrendScanConfig:
         min_probability_pct=min_prob,
         trend_params=trend_params_from_yaml(),
         use_filtered_symbols=use_filtered,
+        universe_top_n=universe_top_n,
         symbols=symbols,
         long_only=long_only,
         use_closed_bar_only=use_closed,
@@ -376,16 +396,22 @@ def scan_combined_filtered_setups(
     auto_cfg: Any | None = None,
 ) -> dict[str, Any]:
     scan_cfg = scan_cfg or trend_scan_config_from_env()
-    symbols = scan_cfg.symbols
+    try:
+        symbols = _resolve_scan_symbols(scan_cfg)
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": f"no_symbols: {e}",
+            "top_setups": [],
+        }
     if not symbols:
-        if scan_cfg.use_filtered_symbols:
-            symbols = load_filtered_symbols()
-        if not symbols:
-            return {
-                "status": "error",
-                "error": "no_symbols: run symbol ranking or set FORECAST_SYMBOLS",
-                "top_setups": [],
-            }
+        return {
+            "status": "error",
+            "error": "no_symbols: set FORECAST_USE_FILTERED=0 and FORECAST_SCAN_TOP_N=400, "
+            "or run ranking / set FORECAST_SYMBOLS",
+            "top_setups": [],
+        }
+    scan_cfg.symbols = symbols
     return scan_combined_setups(symbols, scan_cfg=scan_cfg, auto_cfg=auto_cfg)
 
 

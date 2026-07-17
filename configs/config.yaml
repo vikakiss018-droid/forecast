@@ -85,7 +85,8 @@ trend_scan:
   bars: 1000
   top_n: 20
   stage1_min_score: 12
-  use_filtered: true
+  use_filtered: false           # false = топ по объёму (universe_top_n)
+  universe_top_n: 400           # при use_filtered=false — сколько пар сканировать
   long_only: false
   use_closed_bar_only: true
   allow_trend: true

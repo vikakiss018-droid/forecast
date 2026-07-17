@@ -19,10 +19,10 @@ import yaml
 
 from .auto_trader import load_auto_trade_config
 from .paths import CONFIGS_DIR, load_project_env
-from .run_symbol_ranking import load_filtered_symbols
 from .scan_cache import save_scan_result
 from .trend_scanner import (
     SCAN_MODE,
+    _resolve_scan_symbols,
     scan_combined_filtered_setups,
     trend_scan_config_from_env,
 )
@@ -46,16 +46,19 @@ def main() -> int:
     auto_cfg = load_auto_trade_config(auto_yaml)
     params = scan_cfg.trend_params
 
-    symbols = scan_cfg.symbols or ()
-    if not symbols and scan_cfg.use_filtered_symbols:
-        symbols = load_filtered_symbols()
-
+    try:
+        symbols = _resolve_scan_symbols(scan_cfg)
+    except Exception as e:
+        print(f"[combined] ERROR: нет символов ({e})", flush=True)
+        return 1
     if not symbols:
         print(
-            "[combined] ERROR: нет символов. Запустите run_symbol_ranking или задайте FORECAST_SYMBOLS",
+            "[combined] ERROR: нет символов. "
+            "FORECAST_USE_FILTERED=0 + FORECAST_SCAN_TOP_N=400, или ranking / FORECAST_SYMBOLS",
             flush=True,
         )
         return 1
+    scan_cfg.symbols = symbols
 
     regimes = []
     if scan_cfg.allow_trend:
@@ -67,9 +70,13 @@ def main() -> int:
         return 1
 
     min_vol = params.min_rel_volume if params else 1.2
+    universe_label = (
+        "filtered R>0.5 win>50%"
+        if scan_cfg.use_filtered_symbols
+        else f"top-{scan_cfg.universe_top_n} by volume"
+    )
     print(
-        f"[combined] scan {len(symbols)} pairs "
-        f"({'filtered R>0.5 win>50%' if scan_cfg.use_filtered_symbols else 'custom'}), "
+        f"[combined] scan {len(symbols)} pairs ({universe_label}), "
         f"{scan_cfg.timeframe} regimes={'+'.join(regimes)} "
         f"stage1>={scan_cfg.stage1_min_score} rel_vol>={min_vol} "
         f"RR>={auto_cfg.min_risk_reward} "
