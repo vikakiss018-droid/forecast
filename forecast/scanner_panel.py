@@ -431,6 +431,17 @@ def _scan_history_rows(items: list[dict[str, Any]]) -> str:
     return "\n".join(rows)
 
 
+def _fmt_duration(seconds: int) -> str:
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s} сек"
+    m, sec = divmod(s, 60)
+    if m < 60:
+        return f"{m} мин {sec} сек" if sec else f"{m} мин"
+    h, m = divmod(m, 60)
+    return f"{h} ч {m} мин"
+
+
 def _fmt_scan_duration(sec: Any) -> str:
     try:
         s = float(sec)
