@@ -95,7 +95,7 @@ def main() -> None:
                 continue
 
             stage1 = _adjust_stage1_for_direction(
-                max(float(snap["stage1_score"]), 10.0),
+                float(snap["stage1_score"]),
                 direction="Long" if trend == "up" else "Short",
                 rel_vol=rel_vol,
                 candle_bullish=float(sub.iloc[-1]["close"]) > float(sub.iloc[-1]["open"]),

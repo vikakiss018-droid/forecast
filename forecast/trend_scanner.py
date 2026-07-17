@@ -23,13 +23,24 @@ from .strategy_config import env_bool, env_float, env_int, env_str, yaml_section
 from .tf_backtest import BARS_BY_TF, _fetch_df
 from .trend_rules import (
     DEFAULT_TREND_PARAMS,
+    MIN_ATR_PCT,
+    MIN_REL_VOLUME_RANGE,
     TrendPullbackParams,
     build_range_plan,
     build_trend_plan,
+    htf_trend_aligned,
+    trend_params_for_timeframe,
 )
 
 Regime = Literal["trend", "range"]
 SCAN_MODE = "trend_plus_range"
+
+# Режим BTC: когда BTC падает, лонги по альтам проигрывают независимо от сетапа
+BTC_REGIME_SYMBOL = "BTC/USDT"
+BTC_REGIME_TIMEFRAME = "4h"
+BTC_REGIME_BARS = 400
+BTC_REGIME_RET_24H_THR = 0.02  # |24h return| > 2% — выраженное направление
+HTF_ALIGN_BARS = 400
 
 
 def df_closed_only(df: pd.DataFrame) -> pd.DataFrame:
@@ -51,24 +62,58 @@ class TrendScanConfig:
     trend_params: TrendPullbackParams | None = None
     use_filtered_symbols: bool = True
     symbols: tuple[str, ...] | None = None
-    long_only: bool = True
+    long_only: bool = False
     use_closed_bar_only: bool = True
     allow_trend: bool = True
     allow_range: bool = True
+    btc_regime_filter: bool = True
 
 
 def trend_params_from_yaml() -> TrendPullbackParams:
     y = yaml_section("trend_scan")
+    tf = env_str("FORECAST_TIMEFRAME", str(y.get("timeframe", "1h")))
+    base = trend_params_for_timeframe(tf, base=DEFAULT_TREND_PARAMS)
     return TrendPullbackParams(
-        require_pullback=False,
-        require_htf_align=False,
-        min_rel_volume=env_float("TREND_MIN_REL_VOLUME", float(y.get("min_rel_volume", 1.2)), positive=True),
-        min_atr_pct=env_float("TREND_MIN_ATR_PCT", float(y.get("min_atr_pct", 0))),
-        trend_lookback=env_int("TREND_LOOKBACK", int(y.get("lookback", 60)), positive=True),
-        min_trend_move_pct=env_float(
-            "TREND_MIN_MOVE_PCT", float(y.get("min_move_pct", 0.008)), positive=True
+        require_pullback=env_bool("TREND_REQUIRE_PULLBACK", bool(y.get("require_pullback", base.require_pullback))),
+        require_htf_align=env_bool(
+            "TREND_REQUIRE_HTF_ALIGN", bool(y.get("require_htf_align", base.require_htf_align))
         ),
-        block_asian_session=env_bool("TREND_BLOCK_ASIAN", bool(y.get("block_asian_session", False))),
+        block_opposite_level=env_bool(
+            "TREND_BLOCK_OPPOSITE_LEVEL",
+            bool(y.get("block_opposite_level", base.block_opposite_level)),
+        ),
+        require_rejection_candle=env_bool(
+            "TREND_REQUIRE_REJECTION",
+            bool(y.get("require_rejection_candle", base.require_rejection_candle)),
+        ),
+        min_rel_volume=env_float(
+            "TREND_MIN_REL_VOLUME",
+            float(y.get("min_rel_volume", base.min_rel_volume)),
+            positive=True,
+        ),
+        min_rel_volume_range=env_float(
+            "TREND_MIN_REL_VOLUME_RANGE",
+            float(y.get("min_rel_volume_range", base.min_rel_volume_range)),
+            positive=True,
+        ),
+        min_atr_pct=env_float("TREND_MIN_ATR_PCT", float(y.get("min_atr_pct", base.min_atr_pct))),
+        trend_lookback=env_int(
+            "TREND_LOOKBACK", int(y.get("lookback", base.trend_lookback)), positive=True
+        ),
+        min_trend_move_pct=env_float(
+            "TREND_MIN_MOVE_PCT",
+            float(y.get("min_move_pct", base.min_trend_move_pct)),
+            positive=True,
+        ),
+        tp_target_pct=env_float(
+            "TREND_TP_TARGET_PCT",
+            float(y.get("tp_target_pct", base.tp_target_pct)),
+        ),
+        rr_target=env_float("TREND_RR_TARGET", float(y.get("rr_target", base.rr_target)), positive=True),
+        block_asian_session=env_bool(
+            "TREND_BLOCK_ASIAN", bool(y.get("block_asian_session", base.block_asian_session))
+        ),
+        htf_timeframe=str(y.get("htf_timeframe", base.htf_timeframe)),
     )
 
 
@@ -80,10 +125,10 @@ def trend_scan_config_from_env() -> TrendScanConfig:
     top_n = env_int("FORECAST_TOP", int(y.get("top_n", 20)), positive=True)
     stage1 = env_float(
         "FORECAST_STAGE1_MIN_SCORE",
-        float(y.get("stage1_min_score", 18)),
+        float(y.get("stage1_min_score", 12)),
         positive=True,
     )
-    min_prob = env_float("FORECAST_MIN_PROB_PCT", float(y.get("min_prob_pct", 50)))
+    min_prob = env_float("FORECAST_MIN_PROB_PCT", float(y.get("min_prob_pct", 0)))
     use_filtered = env_bool("FORECAST_USE_FILTERED", bool(y.get("use_filtered", True)))
     symbols: tuple[str, ...] | None = None
     sym_env = os.environ.get("FORECAST_SYMBOLS", "").strip()
@@ -91,10 +136,11 @@ def trend_scan_config_from_env() -> TrendScanConfig:
         symbols = tuple(s.strip() for s in sym_env.split(",") if s.strip())
     elif use_filtered:
         symbols = load_filtered_symbols() or None
-    long_only = env_bool("FORECAST_LONG_ONLY", bool(y.get("long_only", True)))
+    long_only = env_bool("FORECAST_LONG_ONLY", bool(y.get("long_only", False)))
     use_closed = env_bool("FORECAST_USE_CLOSED_BAR", bool(y.get("use_closed_bar_only", True)))
     allow_trend = env_bool("FORECAST_ALLOW_TREND", bool(y.get("allow_trend", True)))
     allow_range = env_bool("FORECAST_ALLOW_RANGE", bool(y.get("allow_range", True)))
+    btc_regime = env_bool("FORECAST_BTC_REGIME_FILTER", bool(y.get("btc_regime_filter", True)))
     return TrendScanConfig(
         timeframe=tf,
         bars=bars,
@@ -108,7 +154,37 @@ def trend_scan_config_from_env() -> TrendScanConfig:
         use_closed_bar_only=use_closed,
         allow_trend=allow_trend,
         allow_range=allow_range,
+        btc_regime_filter=btc_regime,
     )
+
+
+def _btc_regime(ex: ccxt.Exchange) -> str:
+    """
+    Режим BTC на 4h: 'bear' — блок лонгов по альтам, 'bull' — блок шортов.
+    bear: close < EMA200 или 24h return < -2%; bull — зеркально.
+    Конфликт сигналов (например, выше EMA200, но резко падает) => 'neutral'.
+    """
+    df = _fetch_df(ex, BTC_REGIME_SYMBOL, BTC_REGIME_TIMEFRAME, BTC_REGIME_BARS)
+    if df is None or len(df) < 210:
+        return "neutral"
+    last = df.iloc[-1]
+    close = float(last["close"])
+    ema200 = float(last["ema_200"])
+    bars_24h = 6  # 6 баров по 4h
+    ret_24h = 0.0
+    if len(df) > bars_24h:
+        prev = float(df["close"].iloc[-bars_24h - 1])
+        if prev > 0:
+            ret_24h = close / prev - 1.0
+    bear = close < ema200 or ret_24h < -BTC_REGIME_RET_24H_THR
+    bull = close > ema200 or ret_24h > BTC_REGIME_RET_24H_THR
+    if bear and bull:
+        return "neutral"
+    if bear:
+        return "bear"
+    if bull:
+        return "bull"
+    return "neutral"
 
 
 def _resolve_plan(
@@ -136,10 +212,12 @@ def _why_selected(plan: dict[str, Any], regime: Regime, rel_vol: float, params: 
             f"range bounce 1h; pos={plan.get('range_position_pct')}% "
             f"rel_vol={rel_vol:.2f}; RR={plan.get('risk_reward', 0):.2f}"
         )
-    return (
-        f"trend {plan.get('trend')} momentum 1h; rel_vol={rel_vol:.2f}; "
+    tp_txt = (
         f"TP {params.tp_target_pct * 100:.0f}%"
+        if params.tp_target_pct > 0
+        else f"TP {params.rr_target:.1f}R"
     )
+    return f"trend {plan.get('trend')} {plan.get('entry_style')} 1h; rel_vol={rel_vol:.2f}; {tp_txt}"
 
 
 def scan_combined_setups(
@@ -166,6 +244,11 @@ def scan_combined_setups(
     symbols_list = list(symbols)
     total = len(symbols_list)
 
+    btc_regime = _btc_regime(ex) if scan_cfg.btc_regime_filter else "neutral"
+    if btc_regime != "neutral":
+        blocked_side = "Long" if btc_regime == "bear" else "Short"
+        print(f"[combined_scan] BTC regime={btc_regime}: skip all {blocked_side}", flush=True)
+
     for i, symbol in enumerate(symbols_list, 1):
         if progress_cb:
             progress_cb({"current": i, "total": total, "symbol": symbol})
@@ -191,8 +274,24 @@ def scan_combined_setups(
             continue
 
         plan, regime = resolved
-        if scan_cfg.long_only and str(plan.get("direction", "")).strip().lower() == "short":
+        direction = str(plan.get("direction", "")).strip()
+        if scan_cfg.long_only and direction.lower() == "short":
             continue
+        if btc_regime == "bear" and direction == "Long":
+            continue
+        if btc_regime == "bull" and direction == "Short":
+            continue
+
+        if regime == "trend" and params.require_htf_align:
+            df_htf = _fetch_df(ex, symbol, params.htf_timeframe, HTF_ALIGN_BARS)
+            if df_htf is None:
+                continue
+            aligned, htf_reason = htf_trend_aligned(
+                df_htf, work.index[-1], str(plan.get("trend", "")), params
+            )
+            if not aligned:
+                print(f"[combined_scan] skip {symbol} (htf): {htf_reason}", flush=True)
+                continue
 
         last = work.iloc[-1]
         close = float(last["close"])
@@ -202,8 +301,9 @@ def scan_combined_setups(
         resistance = float(plan["trend_resistance"])
         vol_up, vol_down = compute_volume_scores(work)
 
+        # Без floor: пара без уровней/паттернов не должна проходить порог за счёт одного объёма
         stage1 = _adjust_stage1_for_direction(
-            max(float(snap["stage1_score"]), 10.0),
+            float(snap["stage1_score"]),
             direction=str(plan["direction"]),
             rel_vol=rel_vol,
             candle_bullish=candle_bullish,
@@ -249,11 +349,18 @@ def scan_combined_setups(
         "long_only": scan_cfg.long_only,
         "allow_trend": scan_cfg.allow_trend,
         "allow_range": scan_cfg.allow_range,
+        "btc_regime": btc_regime,
         "trend_params": {
             "lookback": params.trend_lookback,
             "min_move_pct": params.min_trend_move_pct,
             "min_rel_volume": params.min_rel_volume,
+            "min_rel_volume_range": params.min_rel_volume_range,
+            "min_atr_pct": params.min_atr_pct,
             "tp_target_pct": params.tp_target_pct,
+            "rr_target": params.rr_target,
+            "require_pullback": params.require_pullback,
+            "require_htf_align": params.require_htf_align,
+            "block_opposite_level": params.block_opposite_level,
             "block_asian_session": params.block_asian_session,
         },
         "rule": (

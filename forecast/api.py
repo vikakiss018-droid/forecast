@@ -28,7 +28,6 @@ from .signal_combiner import (
     compute_volume_scores,
     combine_probabilities,
 )
-from .scalp_engine import get_scalp_engine_status, start_scalp_engine
 from .orderbook_layer import (
     get_all_orderbook_snapshots,
     start_spot_orderbook_layer,
@@ -44,20 +43,7 @@ from .trend_scanner import (
     scan_trend_filtered_setups,
     trend_scan_config_from_env,
 )
-from .auto_trader import (
-    close_position_from_panel,
-    load_auto_trade_config,
-    load_closed_trades,
-    load_trade_history,
-    load_trade_state,
-)
-from .binance_client import trading_credentials_source
-from .futures_account import (
-    compute_bot_stats,
-    fetch_futures_account_snapshot,
-    fetch_spot_account_snapshot,
-    fetch_trading_account_snapshot,
-)
+from .auto_trader import load_auto_trade_config
 from .scan_cache import (
     load_scan_history,
     load_scan_progress,
@@ -65,12 +51,6 @@ from .scan_cache import (
     report_from_cache,
     save_scan_progress,
     save_scan_result,
-)
-from .run_scalp_pair_ranking import (
-    approve_scalp_symbols,
-    load_scalp_ranking_live,
-    load_scalp_ranking_result,
-    run_scalp_pair_ranking_background,
 )
 from .run_symbol_ranking import (
     approve_live_symbols,
@@ -82,11 +62,8 @@ from .run_symbol_ranking import (
 )
 from .env_config import SETTINGS_META, update_env_values
 from .panel_auth import PANEL_AUTH_DEPS
-from .position_chart import build_position_chart_html
 from .scanner_panel import (
-    render_closed_trades_dashboard,
     render_pair_ranking_dashboard,
-    render_scalp_pair_ranking_dashboard,
     render_scanner_dashboard,
 )
 from .trade_gate import GateMode, TradeGateConfig, evaluate_trade_gate
@@ -407,7 +384,6 @@ def _on_startup() -> None:
     loop = asyncio.get_event_loop()
     # Spot depth: top-N from live filtered list (OBI / microprice for scanner)
     loop.create_task(start_spot_orderbook_layer())
-    loop.create_task(start_scalp_engine())
     # Legacy /legacy UI: futures liquidity snapshot (hardcoded majors)
     legacy_symbols = [
         "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
@@ -418,7 +394,7 @@ def _on_startup() -> None:
 
 @app.get("/", dependencies=PANEL_AUTH_DEPS)
 def index_redirect():
-    """Main dashboard: scanner + auto-trader."""
+    """Main dashboard: scanner."""
     return RedirectResponse(url="/scanner", status_code=302)
 
 
@@ -1366,64 +1342,6 @@ def _auto_trade_yaml() -> dict:
         return (_yaml.safe_load(f) or {}).get("auto_trade") or {}
 
 
-@app.get("/futures/account", dependencies=PANEL_AUTH_DEPS)
-def futures_account_json(force: bool = False) -> dict:
-    """USDT balance (spot or futures per AUTO_TRADE_MARKET), bot stats (cached ~50s)."""
-    trade_hist = load_trade_history(40)
-    scan_hist = load_scan_history(30)
-    return {
-        "account": fetch_trading_account_snapshot(force=force),
-        "bot_stats": compute_bot_stats(trade_hist, scan_hist),
-    }
-
-
-@app.get("/spot/account", dependencies=PANEL_AUTH_DEPS)
-def spot_account_json(force: bool = False) -> dict:
-    """Spot USDT balance and holdings (cached ~50s)."""
-    trade_hist = load_trade_history(40)
-    scan_hist = load_scan_history(30)
-    return {
-        "account": fetch_spot_account_snapshot(force=force),
-        "bot_stats": compute_bot_stats(trade_hist, scan_hist),
-    }
-
-
-@app.get("/trader/status", dependencies=PANEL_AUTH_DEPS)
-def trader_status() -> dict:
-    """Auto-trader config and last state (no secrets)."""
-    at = load_auto_trade_config(_auto_trade_yaml())
-    return {
-        "config": {
-            "enabled": at.enabled,
-            "dry_run": at.dry_run,
-            "min_score": at.min_score,
-            "max_notional_usdt": at.max_notional_usdt,
-            "cooldown_minutes": at.cooldown_minutes,
-            "leverage": at.leverage,
-            "margin_mode": at.margin_mode,
-            "market_type": at.market_type,
-            "spot_allow_short": at.spot_allow_short,
-            "market": at.market_type,
-            "api_credentials": trading_credentials_source(),
-            "pick_from_top_n": at.pick_from_top_n,
-            "max_open_positions": at.max_open_positions,
-            "profit_close_pct": at.profit_close_pct,
-            "stop_loss_roi_usdt": at.stop_loss_roi_usdt,
-            "allow_level_breakout": at.allow_level_breakout,
-            "allow_triangle": at.allow_triangle,
-            "allowed_hours": at.allowed_hours,
-            "min_atr_pct": at.min_atr_pct,
-        },
-        "state": load_trade_state(),
-        "trade_history": load_trade_history(40),
-        "closed_trades": load_closed_trades(100),
-        "scan_history": load_scan_history(30),
-        "account": fetch_trading_account_snapshot(),
-        "futures_account": fetch_trading_account_snapshot(),
-        "bot_stats": compute_bot_stats(load_trade_history(40), load_scan_history(30)),
-    }
-
-
 @app.get("/scanner/json", dependencies=PANEL_AUTH_DEPS)
 def scanner_json(
     top: int = 20,
@@ -1446,40 +1364,7 @@ def scanner_json(
         rep["updated_at"] = updated_at
     rep["from_cache"] = from_cache
     cached_full = load_scan_result()
-    at = load_auto_trade_config(_auto_trade_yaml())
-    rep["trader"] = {
-        "config": {
-            "enabled": at.enabled,
-            "dry_run": at.dry_run,
-            "min_score": at.min_score,
-            "min_probability_pct": at.min_probability_pct,
-            "min_risk_reward": at.min_risk_reward,
-            "risk_pct_of_balance": at.risk_pct_of_balance,
-            "max_notional_usdt": at.max_notional_usdt,
-            "leverage": at.leverage,
-            "margin_mode": at.margin_mode,
-            "cooldown_minutes": at.cooldown_minutes,
-            "market_type": at.market_type,
-            "spot_allow_short": at.spot_allow_short,
-            "market": at.market_type,
-            "api_credentials": trading_credentials_source(),
-            "pick_from_top_n": at.pick_from_top_n,
-            "max_open_positions": at.max_open_positions,
-            "profit_close_pct": at.profit_close_pct,
-            "stop_loss_roi_usdt": at.stop_loss_roi_usdt,
-            "allow_level_breakout": at.allow_level_breakout,
-            "allow_triangle": at.allow_triangle,
-            "allowed_hours": at.allowed_hours,
-            "min_atr_pct": at.min_atr_pct,
-        },
-        "state": load_trade_state(),
-    }
     rep["scan_history"] = load_scan_history(30)
-    rep["trade_history"] = load_trade_history(40)
-    rep["closed_trades"] = load_closed_trades(100)
-    rep["futures_account"] = fetch_trading_account_snapshot()
-    rep["account"] = rep["futures_account"]
-    rep["bot_stats"] = compute_bot_stats(rep["trade_history"], rep["scan_history"])
     if cached_full:
         rep["scan_config"] = cached_full.get("scan_config") or {}
     return rep
@@ -1518,49 +1403,6 @@ async def save_scanner_settings(request: Request) -> RedirectResponse:
         msg = f"error={quote(detail, safe='')}"
     sep = "&" if return_q else ""
     return RedirectResponse(url=f"/scanner?{return_q}{sep}{msg}", status_code=303)
-
-
-@app.post("/trader/close", dependencies=PANEL_AUTH_DEPS)
-async def trader_close_position(request: Request) -> RedirectResponse:
-    """Market-close one futures position from the dashboard."""
-    form = await request.form()
-    fsym = str(form.get("futures_symbol", "")).strip()
-    return_q = str(form.get("return_q", "")).strip()
-    if not fsym:
-        msg = "close_error=missing_symbol"
-    else:
-        try:
-            res = close_position_from_panel(fsym, yaml_cfg=_auto_trade_yaml())
-            if res.get("ok"):
-                msg = "closed=1"
-            else:
-                msg = f"close_error={html.escape(str(res.get('reason', 'close_failed')))}"
-        except Exception as e:
-            msg = f"close_error={html.escape(str(e))}"
-    sep = "&" if return_q else ""
-    return RedirectResponse(url=f"/scanner?{return_q}{sep}{msg}", status_code=303)
-
-
-@app.get("/trader/chart", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
-def trader_position_chart(
-    symbol: str,
-    timeframe: str = "1h",
-    side: str = "long",
-    bars: int = 120,
-    entry: float | None = None,
-    stop: float | None = None,
-    tp: float | None = None,
-) -> str:
-    """Candlestick chart for an open position (embedded in panel iframe)."""
-    return build_position_chart_html(
-        symbol=symbol,
-        timeframe=timeframe,
-        entry=entry,
-        stop=stop,
-        take_profit=tp,
-        side=side,
-        bars=bars,
-    )
 
 
 @app.get("/scanner/pairs", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
@@ -1634,99 +1476,6 @@ def scan_progress_json() -> dict[str, Any]:
     return load_scan_progress()
 
 
-@app.get("/scanner/scalp/pairs", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
-def scalp_pair_ranking_panel(
-    approved: str | None = None,
-    started: str | None = None,
-    busy: str | None = None,
-    error: str | None = None,
-) -> str:
-    msg = None
-    err = error
-    if approved == "1":
-        data = load_scalp_ranking_live()
-        n = int(data.get("count") or 0)
-        msg = f"Утверждено {n} пар для скальпа. Перезапустите API: systemctl restart forecast-api"
-    elif started == "1":
-        msg = "Скан 400 пар для скальпа запущен — страница обновится автоматически"
-    elif busy == "1":
-        msg = "Скан уже выполняется"
-    return render_scalp_pair_ranking_dashboard(
-        result=load_scalp_ranking_result(),
-        live=load_scalp_ranking_live(),
-        msg=msg,
-        err=err,
-    )
-
-
-@app.post("/scanner/scalp/pairs/run", dependencies=PANEL_AUTH_DEPS)
-async def scalp_pair_ranking_run(background_tasks: BackgroundTasks) -> RedirectResponse:
-    cur = load_scalp_ranking_result()
-    if cur.get("status") == "running":
-        return RedirectResponse(url="/scanner/scalp/pairs?busy=1", status_code=303)
-    background_tasks.add_task(run_scalp_pair_ranking_background)
-    return RedirectResponse(url="/scanner/scalp/pairs?started=1", status_code=303)
-
-
-@app.post("/scanner/scalp/pairs/approve", dependencies=PANEL_AUTH_DEPS)
-async def scalp_pair_ranking_approve(request: Request) -> RedirectResponse:
-    form = await request.form()
-    symbols = [s.strip() for s in _form_field_values(form, "symbols") if s.strip()]
-    if not symbols:
-        return RedirectResponse(
-            url="/scanner/scalp/pairs?error=" + quote("Выберите хотя бы одну пару"),
-            status_code=303,
-        )
-    try:
-        approve_scalp_symbols(symbols)
-    except OSError as e:
-        return RedirectResponse(
-            url="/scanner/scalp/pairs?error=" + quote(str(e)),
-            status_code=303,
-        )
-    return RedirectResponse(url="/scanner/scalp/pairs?approved=1", status_code=303)
-
-
-@app.post("/scanner/scalp/pairs/approve-top8", dependencies=PANEL_AUTH_DEPS)
-async def scalp_pair_ranking_approve_top8() -> RedirectResponse:
-    latest = load_scalp_ranking_result()
-    syms = list(latest.get("suggested_symbols") or [])
-    if not syms:
-        ranking = list(latest.get("ranking") or [])
-        syms = [str(r["symbol"]) for r in ranking[:8]]
-    if not syms:
-        return RedirectResponse(
-            url="/scanner/scalp/pairs?error=" + quote("Сначала запустите скан 400 пар"),
-            status_code=303,
-        )
-    try:
-        approve_scalp_symbols(syms)
-    except OSError as e:
-        return RedirectResponse(
-            url="/scanner/scalp/pairs?error=" + quote(str(e)),
-            status_code=303,
-        )
-    return RedirectResponse(url="/scanner/scalp/pairs?approved=1", status_code=303)
-
-
-@app.get("/scanner/scalp/pairs/json", dependencies=PANEL_AUTH_DEPS)
-def scalp_pair_ranking_json() -> dict[str, Any]:
-    data = load_scalp_ranking_result()
-    return {
-        "status": data.get("status", "idle"),
-        "kind": "scalp_pair_test",
-        "progress": data.get("progress") or {},
-        "symbols_count": data.get("symbols_count"),
-        "error": data.get("error"),
-    }
-
-
-@app.get("/scanner/scalp/json", dependencies=PANEL_AUTH_DEPS)
-def scalp_json() -> dict[str, Any]:
-    """Live scalp engine: OBI persistence, paper signals, aggTrade flow."""
-    return get_scalp_engine_status()
-
-
 @app.get("/scanner/orderbook/json", dependencies=PANEL_AUTH_DEPS)
 def orderbook_json() -> dict[str, Any]:
     """Live spot OBI / microprice for top-N live pairs."""
@@ -1765,36 +1514,23 @@ async def live_scan_run(request: Request, background_tasks: BackgroundTasks) -> 
 
 @app.get("/scanner", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
 def scanner_panel(
-    tab: str = "scan",
     top: int = 20,
     bars: int = 1000,
     timeframe: str = "1h",
     stage1_min_score: float = 18.0,
     max_symbols: int | None = None,
     live: bool = False,
+    tab: str = "",
     saved: str | None = None,
     error: str | None = None,
-    closed: str | None = None,
-    close_error: str | None = None,
     scan_started: str | None = None,
     scan_busy: str | None = None,
-    tf_started: str | None = None,
-    tf_busy: str | None = None,
 ) -> str:
-    """Dashboard: тренд-скан 50 пар, spot auto-trader, history."""
-    _ = tf_started, tf_busy
-    max_symbols_q = "" if max_symbols is None else str(max_symbols)
-    base_q = (
-        f"top={int(top)}&bars={int(bars)}&timeframe={html.escape(timeframe)}"
-        f"&stage1_min_score={float(stage1_min_score)}&max_symbols={html.escape(max_symbols_q)}"
-    )
+    """Dashboard: тренд-скан 50 пар, лучший сетап (без автоторговли)."""
+    _ = tab  # legacy query param
     saved_msg = None
     if saved == "1":
         saved_msg = "Настройки сохранены в .env"
-    elif closed == "1":
-        saved_msg = "Позиция закрыта по рынку"
-    elif close_error:
-        saved_msg = f"Ошибка закрытия: {close_error}"
     elif error:
         saved_msg = f"Ошибка сохранения: {error}"
     elif scan_started == "1":
@@ -1804,13 +1540,6 @@ def scanner_panel(
 
     scan_watch = scan_started == "1" or load_scan_progress().get("status") == "running"
 
-    if tab.strip().lower() == "closed":
-        return render_closed_trades_dashboard(
-            closed_trades=load_closed_trades(100),
-            base_q=base_q,
-            saved_msg=saved_msg,
-        )
-
     rep, updated_at, from_cache = _scanner_report(
         top=top,
         bars=bars,
@@ -1819,28 +1548,11 @@ def scanner_panel(
         max_symbols=max_symbols,
         live=live,
     )
-    cached = load_scan_result() or {}
-    at_yaml = _auto_trade_yaml()
-    at = load_auto_trade_config(at_yaml)
-    try:
-        from .auto_trader import manage_open_positions
-
-        manage_open_positions(yaml_cfg=at_yaml)
-    except Exception as e:
-        print(f"[scanner] manage_open_positions warning: {e}", flush=True)
-    trade_hist = load_trade_history(30)
-    scan_hist = load_scan_history(25)
     return render_scanner_dashboard(
         report=rep,
         updated_at=updated_at,
         from_cache=from_cache,
-        scan_config=cached.get("scan_config") or {},
-        at=at,
-        trade_state=load_trade_state(),
-        scan_history=scan_hist,
-        trade_history=trade_hist,
-        account=fetch_trading_account_snapshot(market_type=at.market_type, force=True),
-        bot_stats=compute_bot_stats(trade_hist, scan_hist),
+        scan_history=load_scan_history(25),
         top=top,
         bars=bars,
         timeframe=timeframe,

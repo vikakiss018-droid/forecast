@@ -4,9 +4,9 @@
 Запуск (cron / systemd каждый час :03 UTC):
   python -m forecast.run_scheduled_scan
 
-Параметры: configs/config.yaml → trend_scan, auto_trade
+Параметры: configs/config.yaml → trend_scan (+ фильтры из auto_trade для validate_setup)
 Переменные: FORECAST_USE_FILTERED, FORECAST_ALLOW_TREND, FORECAST_ALLOW_RANGE,
-  FORECAST_LONG_ONLY, TREND_MIN_REL_VOLUME, AUTO_TRADE_* …
+  FORECAST_LONG_ONLY, TREND_MIN_REL_VOLUME, AUTO_TRADE_MIN_* …
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from pathlib import Path
 
 import yaml
 
-from .auto_trader import load_auto_trade_config, manage_open_positions, maybe_run_auto_trade
+from .auto_trader import load_auto_trade_config
 from .paths import CONFIGS_DIR, load_project_env
 from .run_symbol_ranking import load_filtered_symbols
 from .scan_cache import save_scan_result
@@ -74,7 +74,7 @@ def main() -> int:
         f"stage1>={scan_cfg.stage1_min_score} rel_vol>={min_vol} "
         f"RR>={auto_cfg.min_risk_reward} "
         f"{'long-only ' if scan_cfg.long_only else ''}"
-        f"market={auto_cfg.market_type} dry_run={auto_cfg.dry_run}",
+        f"(scanner only, no auto-trade)",
         flush=True,
     )
 
@@ -116,21 +116,6 @@ def main() -> int:
             f"{plan.get('direction')} score={row.get('score')} RR={plan.get('risk_reward')}",
             flush=True,
         )
-
-    pos_result = manage_open_positions(yaml_cfg=auto_yaml)
-    print(
-        f"[combined] positions open={pos_result.get('open_count')} "
-        f"profit_closed={len(pos_result.get('profit_closed') or [])} "
-        f"loss_closed={len(pos_result.get('loss_closed') or [])}",
-        flush=True,
-    )
-
-    trade_result = maybe_run_auto_trade(report, yaml_cfg=auto_yaml)
-    print(
-        f"[combined] auto_trade: {trade_result.get('action')} "
-        f"opened={trade_result.get('opened_count', 0)} {trade_result.get('reason', '')}",
-        flush=True,
-    )
     return 0
 
 

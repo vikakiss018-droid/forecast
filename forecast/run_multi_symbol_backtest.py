@@ -8,11 +8,12 @@ from .paths import load_project_env
 from .run_symbol_ranking import load_filtered_symbols
 from .single_symbol_backtest import MultiSymbolBacktestConfig, run_multi_symbol_backtest
 from .tf_backtest import DEFAULT_SYMBOLS
-from .trend_rules import DEFAULT_TREND_PARAMS, TrendPullbackParams
+from .trend_scanner import trend_params_from_yaml, trend_scan_config_from_env
 
 
 def main() -> int:
-    load_project_env(force=True)
+    # force=False: CLI/shell env перекрывает .env (удобно для абляций)
+    load_project_env(force=False)
     tf = os.environ.get("MULTI_BT_TIMEFRAME", "1h").strip() or "1h"
     deposit = float(os.environ.get("MULTI_BT_DEPOSIT", "1000"))
     risk = float(os.environ.get("MULTI_BT_RISK_PCT", "0.5"))
@@ -51,35 +52,34 @@ def main() -> int:
     else:
         symbols = DEFAULT_SYMBOLS
 
+    # Те же параметры, что у live-скана (config.yaml trend_scan + env-переопределения)
+    scan_cfg = trend_scan_config_from_env()
+    trend_params = trend_params_from_yaml()
     print(
         f"[multi_bt] {len(symbols)} symbols"
         + (" (R>0.5, win>50%)" if use_filtered and not symbols_env else "")
-        + f", {tf} lookback={os.environ.get('TREND_LOOKBACK', '60')} "
-        f"move>={os.environ.get('TREND_MIN_MOVE_PCT', '0.008')} vol>={os.environ.get('TREND_MIN_REL_VOLUME', '1.2')}, "
+        + f", {tf} trend+range stage1>={scan_cfg.stage1_min_score} "
+        f"lookback={trend_params.trend_lookback} "
+        f"move>={trend_params.min_trend_move_pct} vol>={trend_params.min_rel_volume} "
+        f"vol_range>={trend_params.min_rel_volume_range} atr>={trend_params.min_atr_pct} "
+        f"pullback={trend_params.require_pullback} htf={trend_params.require_htf_align} "
+        f"opp_level={trend_params.block_opposite_level}, "
         f"{'lev=' + str(leverage) + 'x ' if use_leverage_sizing else 'spot/1x '}"
         f"{'long-only ' if long_only else ''}"
         f"{'window ' + entry_start + '..' + entry_end + ' ' if entry_start and entry_end else ''}"
         f"target={target_label}...",
         flush=True,
     )
-    min_vol = float(os.environ.get("TREND_MIN_REL_VOLUME", str(DEFAULT_TREND_PARAMS.min_rel_volume)))
-    min_atr = float(os.environ.get("TREND_MIN_ATR_PCT", "0"))
-    lookback = int(os.environ.get("TREND_LOOKBACK", str(DEFAULT_TREND_PARAMS.trend_lookback)))
-    min_move = float(os.environ.get("TREND_MIN_MOVE_PCT", str(DEFAULT_TREND_PARAMS.min_trend_move_pct)))
-    trend_params = TrendPullbackParams(
-        require_pullback=False,
-        require_htf_align=False,
-        min_rel_volume=min_vol,
-        min_atr_pct=min_atr,
-        trend_lookback=lookback,
-        min_trend_move_pct=min_move,
-    )
     result = run_multi_symbol_backtest(
         cfg=MultiSymbolBacktestConfig(
             symbols=symbols,
             timeframe=tf,
             target_trades=target,
+            stage1_min_score=scan_cfg.stage1_min_score,
+            trend_only=False,
             trend_params=trend_params,
+            require_htf_align=trend_params.require_htf_align,
+            htf_timeframe=trend_params.htf_timeframe,
             leverage=leverage,
             max_notional_usdt=max_notional,
             use_leverage_sizing=use_leverage_sizing,

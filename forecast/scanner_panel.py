@@ -1,4 +1,4 @@
-"""HTML dashboard for scanner + futures auto-trader."""
+"""HTML dashboard for scanner (best setup)."""
 
 from __future__ import annotations
 
@@ -6,18 +6,12 @@ import html
 import json
 from datetime import datetime
 from typing import Any
-from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 MSK = ZoneInfo("Europe/Moscow")
 
-from .auto_trader import AutoTradeConfig, load_closed_trades, load_trade_history, load_trade_state
-from .orderbook_layer import top_live_symbols
-from .scalp_config import load_scalp_config
-from .binance_client import trading_credentials_source
-from .env_config import SETTINGS_META, get_settings_for_panel
+from .env_config import get_settings_for_panel
 from .run_symbol_ranking import load_filtered_symbols, ranking_config_from_env
-from .run_scalp_pair_ranking import load_scalp_ranking_live, scalp_rank_config_from_env
 
 
 def _e(s: Any) -> str:
@@ -358,16 +352,7 @@ def _panel_theme_css(*, full: bool = False) -> str:
     {extra}"""
 
 
-def _action_badge(action: str) -> str:
-    a = (action or "").lower()
-    if a in ("executed", "dry_run"):
-        return _badge(action.upper(), "ok")
-    if a == "failed":
-        return _badge("FAILED", "bad")
-    return _badge(action or "—", "muted")
-
-
-def _hero_setup(setup_row: dict[str, Any] | None, *, pick_from_top_n: int = 4) -> str:
+def _hero_setup(setup_row: dict[str, Any] | None) -> str:
     if not setup_row:
         return '<div class="hero empty">Нет сетапов в последнем скане</div>'
     plan = setup_row.get("setup") or {}
@@ -391,7 +376,7 @@ def _hero_setup(setup_row: dict[str, Any] | None, *, pick_from_top_n: int = 4) -
         <div><label>TP2</label><div class="mono tp">{_fmt_num(plan.get('target_2'))}</div></div>
       </div>
       <p class="hero-why">{_e(setup_row.get('why_selected'))}</p>
-      <p class="hero-note">Автоторговля: <strong>market</strong> вход, перебор <strong>топ-{int(pick_from_top_n)}</strong> (не только №1). №1 на экране — лучший score.</p>
+      <p class="hero-note">№1 — лучший score. Сетап для ручного входа (автоторговля отключена).</p>
     </div>
     """
 
@@ -446,37 +431,6 @@ def _scan_history_rows(items: list[dict[str, Any]]) -> str:
     return "\n".join(rows)
 
 
-def _trade_history_rows(items: list[dict[str, Any]]) -> str:
-    if not items:
-        return '<tr><td colspan="6" class="empty-cell">История сделок появится при включённом AUTO_TRADE_ENABLED</td></tr>'
-    rows = []
-    for t in items:
-        rows.append(
-            f"""
-        <tr>
-          <td class="mono">{_fmt_ts(t.get('at'))}</td>
-          <td>{_action_badge(str(t.get('action', '')))}</td>
-          <td>{_e(t.get('symbol') or '—')}</td>
-          <td>{_direction_badge(str(t.get('side') or '')) if t.get('side') else '—'}</td>
-          <td class="reason">{_e(t.get('reason') or '—')}</td>
-          <td>{'DRY' if t.get('dry_run') else 'LIVE'}</td>
-        </tr>"""
-        )
-    return "\n".join(rows)
-
-
-def _fmt_duration(seconds: int | None) -> str:
-    if seconds is None:
-        return "—"
-    if seconds < 60:
-        return f"{seconds} сек"
-    if seconds < 3600:
-        return f"{seconds // 60} мин"
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    return f"{h} ч {m} мин" if m else f"{h} ч"
-
-
 def _fmt_scan_duration(sec: Any) -> str:
     try:
         s = float(sec)
@@ -487,22 +441,6 @@ def _fmt_scan_duration(sec: Any) -> str:
     if s < 60:
         return f"{s:.1f} сек"
     return _fmt_duration(int(round(s)))
-
-
-def _close_reason_label(reason: str | None) -> str:
-    r = str(reason or "")
-    labels = {
-        "MANUAL_PANEL": "Вручную (панель)",
-        "EXCHANGE_CLOSED": "На бирже (стоп/тейк)",
-        "position_closed": "Позиция закрыта",
-    }
-    if r in labels:
-        return labels[r]
-    if r.startswith("PROFIT_"):
-        return "Прибыль (авто % маржи)"
-    if r.startswith("STOP_LOSS_ROI"):
-        return "Стоп по ROI (uPnL)"
-    return r or "—"
 
 
 def _pnl_class(v: float | None) -> str:
@@ -517,143 +455,12 @@ def _pnl_class(v: float | None) -> str:
 
 def _dashboard_tabs(*, active: str, base_q: str) -> str:
     scan_cls = "tab active" if active == "scan" else "tab"
-    closed_cls = "tab active" if active == "closed" else "tab"
     pairs_cls = "tab active" if active == "pairs" else "tab"
-    scalp_pairs_cls = "tab active" if active == "scalp_pairs" else "tab"
     return f"""
     <nav class="dash-tabs">
-      <a class="{scan_cls}" href="/scanner?{base_q}">Сканер и торговля</a>
-      <a class="{closed_cls}" href="/scanner?tab=closed&amp;{base_q}">Закрытые сделки</a>
-      <a class="{pairs_cls}" href="/scanner/pairs" target="_blank">Тест пар (400) swing</a>
-      <a class="{scalp_pairs_cls}" href="/scanner/scalp/pairs" target="_blank">Скальп-пары (400→8)</a>
+      <a class="{scan_cls}" href="/scanner?{base_q}">Сканер</a>
+      <a class="{pairs_cls}" href="/scanner/pairs">Тест пар</a>
     </nav>"""
-
-
-def _closed_trades_summary(rows: list[dict[str, Any]]) -> str:
-    if not rows:
-        return ""
-    pnls = [float(r["realized_pnl"]) for r in rows if r.get("realized_pnl") is not None]
-    durs = [int(r["duration_sec"]) for r in rows if r.get("duration_sec") is not None]
-    wins = sum(1 for p in pnls if p > 0)
-    avg_pnl = sum(pnls) / len(pnls) if pnls else None
-    avg_dur = int(sum(durs) / len(durs)) if durs else None
-    return f"""
-    <div class="stats stats-closed">
-      <div class="stat"><label>Закрыто</label><strong>{len(rows)}</strong></div>
-      <div class="stat"><label>В плюс</label><strong class="pnl-pos">{wins}</strong></div>
-      <div class="stat"><label>Средн. PnL</label><strong class="{_pnl_class(avg_pnl)}">{_fmt_num(avg_pnl, 2) if avg_pnl is not None else '—'}</strong></div>
-      <div class="stat"><label>Средн. время</label><strong>{_fmt_duration(avg_dur)}</strong></div>
-    </div>"""
-
-
-def _closed_trades_rows(items: list[dict[str, Any]]) -> str:
-    if not items:
-        return (
-            '<tr><td colspan="14" class="empty-cell">'
-            "Закрытые LIVE-сделки появятся после первого закрытия позиции"
-            "</td></tr>"
-        )
-    rows = []
-    for t in items:
-        pnl = t.get("realized_pnl")
-        try:
-            pnl_f = float(pnl) if pnl is not None else None
-        except (TypeError, ValueError):
-            pnl_f = None
-        rows.append(
-            f"""
-        <tr>
-          <td class="sym">{_e(t.get('symbol'))}</td>
-          <td>{_direction_badge(str(t.get('side') or ''))}</td>
-          <td>{_e(t.get('pattern') or '—')}</td>
-          <td><span class="trend-{_e(t.get('trend'))}">{_e(t.get('trend') or '—')}</span></td>
-          <td>{_fmt_num(t.get('score'), 1)}</td>
-          <td>{_fmt_num(t.get('probability_pct'), 1)}%</td>
-          <td>{_fmt_num(t.get('risk_reward'), 2)}</td>
-          <td class="mono">{_fmt_ts(t.get('opened_at'))}</td>
-          <td class="mono">{_fmt_ts(t.get('closed_at'))}</td>
-          <td>{_fmt_duration(t.get('duration_sec'))}</td>
-          <td class="reason">{_e(_close_reason_label(t.get('close_reason')))}</td>
-          <td>{_fmt_num(t.get('notional_usdt'), 1)}</td>
-          <td class="mono {_pnl_class(pnl_f)}">{_fmt_num(pnl_f, 2) if pnl_f is not None else '—'}</td>
-          <td class="why">{_e(t.get('why_selected') or '—')}</td>
-        </tr>"""
-        )
-    return "\n".join(rows)
-
-
-def render_closed_trades_dashboard(
-    *,
-    closed_trades: list[dict[str, Any]],
-    base_q: str,
-    saved_msg: str | None = None,
-) -> str:
-    banner = ""
-    if saved_msg:
-        banner = f'<div class="save-banner ok">{_e(saved_msg)}</div>'
-    return f"""<!DOCTYPE html>
-<html lang="ru">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="refresh" content="3600" />
-  <title>Forecast — Закрытые сделки</title>
-  {_panel_fonts_link()}
-  <style>{_panel_theme_css(full=False)}</style>
-</head>
-<body>
-  <div class="wrap">
-    <header>
-      <h1>Закрытые сделки</h1>
-      <p class="subtitle">Журнал LIVE-позиций: паттерн, тренд, время в сделке, причина закрытия</p>
-    </header>
-    {_dashboard_tabs(active="closed", base_q=base_q)}
-    {banner}
-    {_closed_trades_summary(closed_trades)}
-    <section>
-      <h2>Все закрытые сделки</h2>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Пара</th><th>Сторона</th><th>Паттерн</th><th>Тренд</th><th>Score</th>
-              <th>Prob</th><th>R:R</th><th>Открыта</th><th>Закрыта</th><th>Длительность</th>
-              <th>Причина</th><th>Notional</th><th>PnL</th><th>Почему</th>
-            </tr>
-          </thead>
-          <tbody>{_closed_trades_rows(closed_trades)}</tbody>
-        </table>
-      </div>
-    </section>
-    <footer>Данные: auto_trade_state.json → closed_trades · <a href="/scanner?{base_q}" style="color:var(--accent)">← Сканер</a></footer>
-  </div>
-</body>
-</html>"""
-
-
-def _tf_study_rows(ranking: list[dict[str, Any]]) -> str:
-    if not ranking:
-        return '<tr><td colspan="8" class="empty-cell">Нет данных — запустите тест</td></tr>'
-    rows: list[str] = []
-    for i, r in enumerate(ranking, start=1):
-        pf = r.get("profit_factor")
-        pf_s = _fmt_num(pf, 2) if pf is not None else "—"
-        target_ok = "да" if r.get("target_reached") else "нет"
-        rows.append(
-            f"""
-        <tr class="{'rank-1' if i == 1 else ''}">
-          <td>{i}</td>
-          <td class="sym">{_e(r.get('timeframe'))}</td>
-          <td>{int(r.get('trades') or 0)} / {int(r.get('target') or 100)}</td>
-          <td>{target_ok}</td>
-          <td>{_fmt_num(r.get('win_rate_pct'), 1)}%</td>
-          <td class="{_pnl_class(float(r.get('avg_r') or 0))}">{_fmt_num(r.get('avg_r'), 3)}</td>
-          <td class="{_pnl_class(float(r.get('total_r') or 0))}">{_fmt_num(r.get('total_r'), 2)}</td>
-          <td>{pf_s}</td>
-          <td class="muted">{_e(r.get('best_symbol') or '—')}</td>
-        </tr>"""
-        )
-    return "".join(rows)
 
 
 def _progress_pct(current: int, total: int) -> int:
@@ -718,7 +525,7 @@ def _progress_poll_script(
           panel.style.display = 'flex';
           if (bar) bar.style.width = pct + '%';
           if (pctEl) pctEl.textContent = pct + '%';
-          if (label) label.textContent = d.kind === 'scalp_pair_test' ? 'Скальп-пары…' : d.kind === 'pair_test' ? 'Тест пар…' : 'Live-скан…';
+          if (label) label.textContent = d.kind === 'pair_test' ? 'Тест пар…' : 'Live-скан…';
           if (detail) detail.textContent = cur + ' / ' + tot + ' · ' + sym;
           return;
         }}
@@ -773,223 +580,6 @@ def _pair_passes_auto_filter(row: dict[str, Any]) -> bool:
         and float(row.get("win_rate_pct") or 0) > 50.0
         and int(row.get("trades") or 0) > 0
     )
-
-
-def _orderbook_poll_script() -> str:
-    return """
-  <script>
-  (function() {
-    const tbody = document.getElementById('ob-tbody');
-    if (!tbody) return;
-    const gateEl = document.getElementById('ob-gate-status');
-    async function tick() {
-      try {
-        const r = await fetch('/scanner/orderbook/json', { credentials: 'same-origin' });
-        const d = await r.json();
-        if (gateEl) gateEl.textContent = d.gate_enabled ? 'вкл (авто)' : 'выкл (только мониторинг)';
-        const rows = d.rows || [];
-        if (!rows.length) {
-          tbody.innerHTML = '<tr><td colspan="8" class="empty-cell">Нет live-пар или ждём данные…</td></tr>';
-          return;
-        }
-        tbody.innerHTML = rows.map(row => {
-          const stale = row.stale;
-          const obi = row.obi_smooth != null ? row.obi_smooth.toFixed(3) : '—';
-          const obiRaw = row.obi != null ? row.obi.toFixed(3) : '—';
-          const mp = row.microprice != null ? row.microprice : '—';
-          const spr = row.spread_bps != null ? row.spread_bps.toFixed(1) : '—';
-          const age = row.age_sec != null ? row.age_sec + 's' : '—';
-          const cls = stale ? 'muted' : (row.obi_smooth > 0.12 ? 'ok' : (row.obi_smooth < -0.12 ? 'bad' : ''));
-          return `<tr class="${cls}">
-            <td>${row.symbol || '—'}</td>
-            <td>${obi}</td>
-            <td>${obiRaw}</td>
-            <td>${mp}</td>
-            <td>${spr}</td>
-            <td>${row.bid_vol != null ? row.bid_vol.toFixed(2) : '—'}</td>
-            <td>${row.ask_vol != null ? row.ask_vol.toFixed(2) : '—'}</td>
-            <td>${stale ? 'stale' : age}</td>
-          </tr>`;
-        }).join('');
-      } catch (e) { /* ignore */ }
-    }
-    tick();
-    setInterval(tick, 2000);
-  })();
-  </script>"""
-
-
-def _orderbook_section_html() -> str:
-    syms = top_live_symbols()
-    n = len(syms)
-    sym_hint = ", ".join(syms[:6]) + ("…" if len(syms) > 6 else "") if syms else "—"
-    return f"""
-    <section class="ob-section">
-      <h2>Live стакан (spot) · top-{n}</h2>
-      <p class="hint" style="margin:0 0 12px;color:var(--muted);font-size:0.85rem">
-        OBI = (bid−ask)/(bid+ask), top-10 уровней · EMA ~2.5с ·
-        gate для авто: <span id="ob-gate-status">…</span> · пары: {_e(sym_hint)}
-      </p>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Пара</th><th>OBI EMA</th><th>OBI</th><th>Microprice</th>
-              <th>Spread bps</th><th>Bid vol</th><th>Ask vol</th><th>Age</th>
-            </tr>
-          </thead>
-          <tbody id="ob-tbody">
-            <tr><td colspan="8" class="empty-cell">Загрузка…</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-    {_orderbook_poll_script()}"""
-
-
-def _scalp_poll_script() -> str:
-    return """
-  <script>
-  (function() {
-    const tbody = document.getElementById('scalp-tbody');
-    const statusEl = document.getElementById('scalp-status');
-    const recentEl = document.getElementById('scalp-recent');
-    const pnlEl = document.getElementById('scalp-pnl-summary');
-    const openEl = document.getElementById('scalp-open-tbody');
-    const closedEl = document.getElementById('scalp-closed-tbody');
-    if (!tbody) return;
-    async function tick() {
-      try {
-        const r = await fetch('/scanner/scalp/json', { credentials: 'same-origin' });
-        const d = await r.json();
-        const cfg = d.config || {};
-        if (statusEl) {
-          const mode = cfg.dry_run ? 'paper' : 'live';
-          const on = d.enabled && d.running;
-          statusEl.textContent = on
-            ? mode + ' · OBI≥' + cfg.obi_long_min + ' ' + cfg.obi_persist_sec + 's · TP ' + cfg.min_tp_pct + '%'
-            : 'выкл (SCALP_ENABLED=0)';
-        }
-        const rows = d.rows || [];
-        tbody.innerHTML = rows.length ? rows.map(row => {
-          const pl = row.obi_persist_long_sec != null ? row.obi_persist_long_sec + 's' : '—';
-          const ps = row.obi_persist_short_sec != null ? row.obi_persist_short_sec + 's' : '—';
-          const fr = row.flow ? row.flow.flow_ratio : '—';
-          const obi = row.obi_smooth != null ? row.obi_smooth.toFixed(3) : '—';
-          const skip = row.skip_reason || '—';
-          return `<tr>
-            <td>${row.symbol}</td>
-            <td>${obi}</td>
-            <td>${pl}</td>
-            <td>${ps}</td>
-            <td>${fr}</td>
-            <td class="muted" style="font-size:0.8rem">${skip}</td>
-          </tr>`;
-        }).join('') : '<tr><td colspan="6" class="empty-cell">Нет данных</td></tr>';
-        const recent = (d.trader && d.trader.recent_signals) || [];
-        if (recentEl) {
-          recentEl.innerHTML = recent.length
-            ? recent.slice(0, 5).map(s => {
-                const sig = s.signal || {};
-                const pl = s.plan || {};
-                return `<div class="scalp-signal">${sig.side || '?'} ${sig.symbol} entry=${sig.entry} TP=${pl.tp_pct}% · ${s.ts_iso || ''}</div>`;
-              }).join('')
-            : '<span class="muted">Пока нет paper-сигналов</span>';
-        }
-        const pnl = (d.trader && d.trader.pnl) || {};
-        const s24 = pnl.summary_24h || {};
-        if (pnlEl) {
-          const pnlVal = s24.total_pnl_usdt != null ? s24.total_pnl_usdt : 0;
-          const cls = pnlVal >= 0 ? 'ok' : 'bad';
-          pnlEl.innerHTML = `
-            <div class="stat-row">
-              <span>24h P&L (net): <strong class="${cls}">${pnlVal >= 0 ? '+' : ''}${pnlVal} USDT</strong></span>
-              <span>сделок: ${s24.trades || 0}</span>
-              <span>win: ${s24.win_rate_pct || 0}%</span>
-              <span>TP/SL/TS: ${s24.tp || 0}/${s24.sl || 0}/${s24.time_stop || 0}</span>
-              <span>notional: ${pnl.notional_usdt || '—'} USDT · fee: ${pnl.fee_pct || '—'}%</span>
-            </div>`;
-        }
-        const openPos = pnl.open_positions || [];
-        if (openEl) {
-          openEl.innerHTML = openPos.length ? openPos.map(p => {
-            const up = p.upnl_usdt != null ? p.upnl_usdt.toFixed(2) : '—';
-            const upc = p.upnl_usdt > 0 ? 'ok' : (p.upnl_usdt < 0 ? 'bad' : '');
-            return `<tr>
-              <td>${p.symbol}</td><td>${p.side}</td><td>${p.entry}</td>
-              <td>${p.tp_price}</td><td>${p.sl_price}</td>
-              <td class="${upc}">${up}</td><td>${p.time_left_sec}s</td>
-            </tr>`;
-          }).join('') : '<tr><td colspan="7" class="empty-cell">Нет открытых paper-позиций</td></tr>';
-        }
-        const closed = pnl.recent_closed || [];
-        if (closedEl) {
-          closedEl.innerHTML = closed.length ? closed.map(c => {
-            const p = c.pnl_usdt != null ? c.pnl_usdt.toFixed(2) : '—';
-            const cls = c.win ? 'ok' : 'bad';
-            return `<tr class="${cls}">
-              <td>${c.symbol}</td><td>${c.side}</td><td>${c.reason}</td>
-              <td>${c.net_pct}%</td><td>${p}</td><td style="font-size:0.8rem">${c.ts_iso || ''}</td>
-            </tr>`;
-          }).join('') : '<tr><td colspan="6" class="empty-cell">Пока нет закрытых сделок</td></tr>';
-        }
-      } catch (e) { /* ignore */ }
-    }
-    tick();
-    setInterval(tick, 2000);
-  })();
-  </script>"""
-
-
-def _scalp_section_html() -> str:
-    cfg = load_scalp_config()
-    enabled_hint = "вкл" if cfg.enabled else "выкл — задайте SCALP_ENABLED=1 в .env"
-    return f"""
-    <section class="scalp-section">
-      <h2>Скальп (event-driven) · <span id="scalp-status" class="muted">…</span></h2>
-      <p class="hint" style="margin:0 0 12px;color:var(--muted);font-size:0.85rem">
-        Сигнал: устойчивый OBI {cfg.obi_persist_sec}s · пары из <a href="/scanner/scalp/pairs" style="color:var(--accent)">скальп-листа</a> ·
-        режим: {enabled_hint} · лог: data/processed/scalp_signals.jsonl
-      </p>
-      <div id="scalp-pnl-summary" class="scalp-pnl" style="margin-bottom:12px;font-size:0.9rem"></div>
-      <div id="scalp-recent" class="scalp-recent" style="margin-bottom:12px;font-size:0.85rem"></div>
-      <h3 style="font-size:0.95rem;margin:16px 0 8px">Открытые paper-позиции</h3>
-      <div class="table-wrap" style="margin-bottom:16px">
-        <table>
-          <thead><tr>
-            <th>Пара</th><th>Сторона</th><th>Entry</th><th>TP</th><th>SL</th><th>uPnL net</th><th>Time left</th>
-          </tr></thead>
-          <tbody id="scalp-open-tbody">
-            <tr><td colspan="7" class="empty-cell">Загрузка…</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <h3 style="font-size:0.95rem;margin:0 0 8px">Закрытые (paper P&L)</h3>
-      <div class="table-wrap" style="margin-bottom:16px">
-        <table>
-          <thead><tr>
-            <th>Пара</th><th>Сторона</th><th>Причина</th><th>Net %</th><th>P&L USDT</th><th>Время</th>
-          </tr></thead>
-          <tbody id="scalp-closed-tbody">
-            <tr><td colspan="6" class="empty-cell">Загрузка…</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Пара</th><th>OBI EMA</th><th>Persist L</th><th>Persist S</th>
-              <th>Flow ratio</th><th>Статус</th>
-            </tr>
-          </thead>
-          <tbody id="scalp-tbody">
-            <tr><td colspan="6" class="empty-cell">Загрузка…</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-    {_scalp_poll_script()}"""
 
 
 def _pair_ranking_rows(
@@ -1210,7 +800,7 @@ def render_pair_ranking_dashboard(
   <div class="wrap">
     <header>
       <h1>Тест пар ({top_n})</h1>
-      <p class="subtitle">Combined backtest · параметры из .env (как live-скан)</p>
+      <p class="subtitle">Отбор пар для live-скана · параметры из .env</p>
     </header>
     {_dashboard_tabs(active="pairs", base_q="")}
     {banner}
@@ -1233,9 +823,9 @@ def render_pair_ranking_dashboard(
     </form>
     <p class="hint">
       Тест не меняет live-список автоматически. Параметры берутся из <code>.env</code>
-      (<code>FORECAST_*</code>, <code>TREND_*</code>, <code>AUTO_TRADE_*</code>, <code>RANK_*</code>) —
-      те же, что у почасового скана. По завершении выберите пары и утвердите —
-      они попадут в <code>symbol_ranking_filtered_r05_win50.json</code> для почасового скана.
+      (<code>FORECAST_*</code>, <code>TREND_*</code>, <code>RANK_*</code>) —
+      те же, что у live-скана. По завершении выберите пары и утвердите —
+      они попадут в <code>symbol_ranking_filtered_r05_win50.json</code>.
     </p>
     <div class="stats">
       <div class="stat"><label>Статус</label><strong>{_e(status)}</strong></div>
@@ -1248,385 +838,16 @@ def render_pair_ranking_dashboard(
     </div>
     {approve_block}
     <footer style="margin-top:24px;color:var(--muted);font-size:0.8rem">
-      <a href="/scanner" style="color:var(--accent)">← Сканер и торговля</a>
+      <a href="/scanner" style="color:var(--accent)">← Сканер</a>
     </footer>
   </div>
   {poll_script}
 </body>
 </html>"""
-
-
-def _scalp_pair_in_top8(row: dict[str, Any], top_n: int = 8) -> bool:
-    return int(row.get("rank") or 999) <= top_n and float(row.get("scalp_score") or -999) > 0
-
-
-def _scalp_pair_ranking_rows(
-    ranking: list[dict[str, Any]],
-    *,
-    top_n: int = 8,
-    selected_symbols: set[str] | None = None,
-) -> str:
-    if not ranking:
-        return (
-            '<tr><td colspan="13" class="empty-cell">'
-            "Запустите скан — таблица заполнится после завершения"
-            "</td></tr>"
-        )
-    out: list[str] = []
-    for row in ranking:
-        sym = str(row.get("symbol") or "")
-        score = float(row.get("scalp_score") or 0)
-        in_top = _scalp_pair_in_top8(row, top_n)
-        tr_cls = "row-plus" if in_top else ""
-        checked = ""
-        if selected_symbols is not None:
-            checked = " checked" if sym in selected_symbols else ""
-        elif in_top:
-            checked = " checked"
-        spread = row.get("spread_bps")
-        spread_s = f"{float(spread):.1f}" if spread is not None else "—"
-        out.append(
-            f'<tr class="{tr_cls}">'
-            f'<td><input type="checkbox" name="symbols" value="{_e(sym)}"{checked} /></td>'
-            f'<td>{int(row.get("rank") or 0)}</td>'
-            f'<td class="sym">{_e(sym)}</td>'
-            f'<td><strong>{score:.1f}</strong></td>'
-            f'<td>{float(row.get("sim_long_expectancy_pct") or 0):+.3f}%</td>'
-            f'<td>{float(row.get("sim_short_expectancy_pct") or 0):+.3f}%</td>'
-            f'<td>{float(row.get("sim_expectancy_pct") or 0):+.3f}%</td>'
-            f'<td>{_e(str(row.get("best_side") or "—"))}</td>'
-            f'<td>{float(row.get("sim_win_rate_pct") or 0):.1f}%</td>'
-            f'<td>{int(row.get("sim_trades") or 0)}</td>'
-            f'<td>{spread_s}</td>'
-            f'<td>{float(row.get("median_range_bps") or 0):.1f}</td>'
-            f'<td>{int(float(row.get("quote_vol_usdt") or 0)):,}</td>'
-            f"</tr>"
-        )
-    return "".join(out)
-
-
-def render_scalp_pair_ranking_dashboard(
-    *,
-    result: dict[str, Any],
-    live: dict[str, Any],
-    msg: str | None = None,
-    err: str | None = None,
-) -> str:
-    status = str(result.get("status") or "idle")
-    ranking = list(result.get("ranking") or [])
-    progress = result.get("progress") or {}
-    cur = int(progress.get("current") or 0)
-    total = int(progress.get("total") or 0)
-    cur_sym = progress.get("symbol") or "—"
-    finished = _fmt_ts(result.get("finished_at"))
-    sym_count = int(result.get("symbols_count") or 0)
-    live_count = int(live.get("count") or 0)
-    live_at = _fmt_ts(live.get("approved_at"))
-    live_syms = ", ".join(live.get("symbols") or []) or "—"
-
-    try:
-        cfg = scalp_rank_config_from_env()
-        top_n = cfg.live_n
-        rank_top = cfg.top_n
-    except Exception:
-        top_n = 8
-        rank_top = 400
-
-    banner = ""
-    if err:
-        banner = f'<div class="save-banner err">{_e(err)}</div>'
-    elif msg:
-        banner = f'<div class="save-banner ok">{_e(msg)}</div>'
-    elif status == "running":
-        pct = int(100 * cur / total) if total else 0
-        banner = (
-            f'<div class="save-banner warn">Скан выполняется: {cur}/{total} ({pct}%) · '
-            f"{_e(cur_sym)} · страница обновится автоматически</div>"
-        )
-    elif status == "error":
-        banner = f'<div class="save-banner err">Ошибка: {_e(result.get("error"))}</div>'
-
-    run_disabled = "disabled" if status == "running" else ""
-    poll_script = ""
-    if status == "running":
-        poll_script = _progress_poll_script(
-            json_url="/scanner/scalp/pairs/json",
-            reload_on_done=True,
-            bar_id="pair-progress-bar",
-            label_id="pair-progress-label",
-            detail_id="pair-progress-detail",
-            panel_id="progress-panel",
-        )
-
-    show_form = status == "done" and bool(ranking)
-    test_cfg = result.get("test_config") or {}
-    suggested = result.get("suggested_symbols") or []
-
-    approve_block = ""
-    if show_form:
-        approve_block = f"""
-    <form method="post" action="/scanner/scalp/pairs/approve-top8" style="margin: 12px 0">
-      <button type="submit" class="btn btn-primary">Быстро: утвердить топ-{top_n} по score</button>
-    </form>
-    <form method="post" action="/scanner/scalp/pairs/approve" id="approve-form">
-      <div class="approve-bar">
-        <button type="button" class="btn" onclick="toggleScalpTop(true)">Выбрать топ-{top_n}</button>
-        <button type="button" class="btn" onclick="toggleScalpTop(false)">Снять все</button>
-        <button type="submit" class="btn btn-primary">Утвердить выбранные</button>
-        <span class="hint-inline">Список → стакан, OBI, paper P&L (отдельно от swing live)</span>
-      </div>
-      <div class="table-wrap table-scroll">
-        <table>
-          <thead>
-            <tr>
-              <th></th><th>#</th><th>Пара</th><th>Score</th>
-              <th>Exp L</th><th>Exp S</th><th>Exp ∑</th><th>Лучше</th>
-              <th>Win%</th><th>Сим</th><th>Spread</th><th>Range bps</th><th>Vol USDT</th>
-            </tr>
-          </thead>
-          <tbody>{_scalp_pair_ranking_rows(ranking, top_n=top_n)}</tbody>
-        </table>
-      </div>
-    </form>
-    <script>
-    function toggleScalpTop(on) {{
-      document.querySelectorAll('#approve-form input[name=symbols]').forEach((cb, i) => {{
-        cb.checked = on ? (i < {top_n}) : false;
-      }});
-    }}
-    </script>"""
-
-    rule = _e(result.get("rule") or test_cfg.get("rule") or "1m scalp sim")
-    suggested_hint = _e(", ".join(suggested[:top_n])) if suggested else "—"
-
-    return f"""<!DOCTYPE html>
-<html lang="ru">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Forecast — Скальп-пары ({rank_top}→{top_n})</title>
-  {_panel_fonts_link()}
-  <style>
-    {_panel_theme_css(full=False)}
-    {_progress_panel_css()}
-    .wrap {{ max-width: 1200px; }}
-    .hint {{ color: var(--muted); font-size: 0.85rem; margin: 12px 0 20px; line-height: 1.6; }}
-    .btn {{ cursor: pointer; border: none; color: #2a1020; }}
-    .btn:disabled {{ opacity: 0.5; cursor: not-allowed; }}
-    .approve-bar {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 16px 0; }}
-    .table-scroll {{ max-height: 65vh; overflow: auto; }}
-    tr.row-plus td {{ background: rgba(134, 239, 172, 0.06); }}
-    .live-box {{
-      background: var(--glass); border: 1px solid var(--border); border-radius: 16px;
-      padding: 14px 18px; margin-bottom: 16px;
-    }}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <h1>Скальп: отбор пар ({rank_top} → top-{top_n})</h1>
-    {_dashboard_tabs(active="scalp_pairs", base_q="")}
-    {banner}
-    <div id="progress-panel" class="progress-panel" style="display:{'flex' if status == 'running' else 'none'}">
-      <div class="progress-head">
-        <span id="pair-progress-label">Скан для скальпа…</span>
-        <span id="progress-pct">0%</span>
-      </div>
-      <div class="progress-track"><div id="pair-progress-bar" class="progress-fill" style="width:0%"></div></div>
-      <div id="pair-progress-detail" class="progress-detail">—</div>
-    </div>
-    <div class="live-box">
-      <strong>Live скальп-пары ({live_count})</strong>
-      <span class="hint-inline"> · обновлено {live_at}</span>
-      <div class="hint" style="margin-top:8px">{_e(live_syms)}</div>
-    </div>
-    <p class="hint">
-      Отдельный скан от swing-теста: 1m OHLCV, симуляция <strong>long + short</strong> TP/SL/time-stop, live spread на топ-кандидатах.
-      Критерий: <code>scalp_score</code> (ликвидность + узкий спред + положит. expectancy после комиссии).
-      Файл: <code>symbol_ranking_scalp_live.json</code>
-    </p>
-    <p class="hint"><strong>Правило:</strong> {rule}</p>
-    <p class="hint"><strong>Рекомендовано топ-{top_n}:</strong> {suggested_hint}</p>
-    <form method="post" action="/scanner/scalp/pairs/run" style="margin-bottom: 12px;">
-      <button type="submit" class="btn btn-primary" {run_disabled}>Запустить скан {rank_top} пар</button>
-    </form>
-    <div class="stats">
-      <div class="stat"><label>Статус</label><strong>{_e(status)}</strong></div>
-      <div class="stat"><label>Проанализировано</label><strong>{int(result.get('analyzed_count') or 0) if status == 'done' else '—'}</strong></div>
-      <div class="stat"><label>В тесте</label><strong>{sym_count or total or '—'}</strong></div>
-      <div class="stat"><label>Завершён</label><strong>{finished}</strong></div>
-      <div class="stat"><label>Прогресс</label><strong>{cur}/{total if total else '—'}</strong></div>
-    </div>
-    {approve_block}
-    <footer style="margin-top:24px;color:var(--muted);font-size:0.8rem">
-      <a href="/scanner" style="color:var(--accent)">← Сканер и торговля</a>
-    </footer>
-  </div>
-  {poll_script}
-</body>
-</html>"""
-
-
-def _market_display_name(market_type: str) -> str:
-    return "Binance Spot" if str(market_type).strip().lower() == "spot" else "Binance USDT-M Futures"
-
-
-def _trader_config_cards(at: AutoTradeConfig) -> str:
-    api_src = trading_credentials_source()
-    api_label = {
-        "BINANCE_TRADE_*": "Отдельный торговый ключ",
-        "BINANCE_*": "Общий ключ (BINANCE_*)",
-        "none": "Ключи не заданы",
-    }.get(api_src, api_src)
-    mkt = str(getattr(at, "market_type", "spot")).strip().lower()
-    items = [
-        ("API торговли", api_label),
-        ("Рынок (торговля)", _market_display_name(mkt)),
-        ("Скан OHLCV", "Binance Spot (всегда)"),
-        ("Включено", "Да" if at.enabled else "Нет"),
-        ("Режим", "Dry-run" if at.dry_run else "LIVE"),
-        ("Min score", _fmt_num(at.min_score, 1)),
-        ("Min prob %", _fmt_num(at.min_probability_pct, 1)),
-        ("Min R:R", _fmt_num(at.min_risk_reward, 2)),
-        ("Риск %", _fmt_num(at.risk_pct_of_balance, 2)),
-        ("Max notional", f"{_fmt_num(at.max_notional_usdt, 1)} USDT"),
-        ("Плечо", f"{at.leverage}x"),
-        ("Маржа", _e(at.margin_mode)),
-        ("Cooldown", f"{at.cooldown_minutes} мин"),
-        ("Выбор пар", f"Топ-{int(at.pick_from_top_n)} (все подходящие за скан)"),
-        ("Макс. позиций", str(int(at.max_open_positions))),
-        ("Закрытие при +%", f"{_fmt_num(at.profit_close_pct, 1)}% от маржи"),
-        (
-            "Стоп ROI (uPnL)",
-            f"{_fmt_num(at.stop_loss_roi_usdt, 1)} USDT" if at.stop_loss_roi_usdt > 0 else "Выкл",
-        ),
-        (
-            "Пробитие уровня",
-            "Разрешено" if at.allow_level_breakout else "Отключено",
-        ),
-        (
-            "Паттерн triangle",
-            "Разрешён" if at.allow_triangle else "Отключён",
-        ),
-        (
-            "Часы входа (UTC)",
-            f"{at.allowed_hours[0]}-{at.allowed_hours[1]}" if at.allowed_hours else "Все",
-        ),
-        (
-            "Min ATR",
-            f"{at.min_atr_pct * 100:.2f}%" if at.min_atr_pct > 0 else "Выкл",
-        ),
-    ]
-    return "".join(
-        f'<div class="cfg-card"><span>{_e(k)}</span><strong>{_e(v)}</strong></div>' for k, v in items
-    )
-
-
-def _balance_section(account: dict[str, Any]) -> str:
-    is_spot = str(account.get("market") or "").lower() == "spot"
-    title = "Spot — баланс USDT" if is_spot else "Futures — баланс USDT"
-    used_label = "В ордерах" if is_spot else "В марже"
-    if not account.get("ok"):
-        err = _e(account.get("error") or "Нет данных")
-        return f"""
-    <section class="balance-section">
-      <h2>{title}</h2>
-      <p class="balance-error">{err}</p>
-    </section>"""
-    usdt = account.get("usdt") or {}
-    upnl = float(account.get("unrealized_pnl") or 0.0)
-    updated = _fmt_ts(account.get("updated_at"))
-    return f"""
-    <section class="balance-section">
-      <h2>{title} <span class="hint">обновлено {updated}</span></h2>
-      <div class="balance-grid">
-        <div class="balance-card balance-total">
-          <label>Капитал (total)</label>
-          <strong>{_fmt_num(usdt.get('total'), 2)} <small>USDT</small></strong>
-        </div>
-        <div class="balance-card">
-          <label>Свободно</label>
-          <strong>{_fmt_num(usdt.get('free'), 2)}</strong>
-        </div>
-        <div class="balance-card">
-          <label>{used_label}</label>
-          <strong>{_fmt_num(usdt.get('used'), 2)}</strong>
-        </div>
-        <div class="balance-card">
-          <label>Нереализ. PnL</label>
-          <strong class="{_pnl_class(upnl)}">{_fmt_num(upnl, 2)}</strong>
-        </div>
-        <div class="balance-card">
-          <label>Позиций на бирже</label>
-          <strong>{int(account.get('positions_count', 0))}</strong>
-        </div>
-      </div>
-    </section>"""
-
-
-def _exchange_positions_table(account: dict[str, Any]) -> str:
-    positions = account.get("positions") or []
-    if not account.get("ok") or not positions:
-        return ""
-    rows = []
-    for p in positions:
-        upnl = float(p.get("unrealized_pnl") or 0.0)
-        rows.append(
-            f"""
-        <tr>
-          <td class="sym">{_e(p.get('symbol'))}</td>
-          <td>{_direction_badge(str(p.get('side', '')))}</td>
-          <td class="mono">{_fmt_num(p.get('contracts'), 4)}</td>
-          <td>{_fmt_num(p.get('notional_usdt'), 1)}</td>
-          <td class="mono">{_fmt_num(p.get('entry_price'))}</td>
-          <td class="mono {_pnl_class(upnl)}">{_fmt_num(upnl, 2)}</td>
-          <td>{_e(p.get('leverage'))}x</td>
-        </tr>"""
-        )
-    return f"""
-    <section>
-      <h2>Позиции на бирже ({'Spot' if str(account.get('market') or '').lower() == 'spot' else 'Futures'})</h2>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Пара</th><th>Сторона</th><th>Контракты</th><th>Notional</th>
-              <th>Вход</th><th>uPnL</th><th>Плечо</th>
-            </tr>
-          </thead>
-          <tbody>{"".join(rows)}</tbody>
-        </table>
-      </div>
-    </section>"""
-
-
-def _bot_stats_section(stats: dict[str, Any]) -> str:
-    reasons = stats.get("top_skip_reasons") or []
-    reason_html = ""
-    if reasons:
-        chips = " ".join(
-            f'<span class="chip">{_e(r)} × {n}</span>' for r, n in reasons[:5]
-        )
-        reason_html = f'<p class="skip-reasons"><span class="muted">Частые skip:</span> {chips}</p>'
-
-    return f"""
-    <section>
-      <h2>Статистика бота</h2>
-      <div class="stats stats-bot">
-        <div class="stat"><label>Событий торговли</label><strong>{int(stats.get('trade_events_total', 0))}</strong></div>
-        <div class="stat"><label>LIVE сделок</label><strong class="pnl-pos">{int(stats.get('live_executed', 0))}</strong></div>
-        <div class="stat"><label>Dry-run</label><strong>{int(stats.get('dry_run', 0))}</strong></div>
-        <div class="stat"><label>Пропущено</label><strong>{int(stats.get('skipped', 0))}</strong></div>
-        <div class="stat"><label>Ошибок</label><strong class="pnl-neg">{int(stats.get('failed', 0))}</strong></div>
-        <div class="stat"><label>Сканов в истории</label><strong>{int(stats.get('scans_in_history', 0))}</strong></div>
-      </div>
-      {reason_html}
-    </section>"""
 
 
 def _settings_form_html(*, return_q: str, saved_msg: str | None = None) -> str:
-    rows = get_settings_for_panel()
-    trade_fields: list[str] = []
+    rows = [r for r in get_settings_for_panel() if r.get("group") != "rank"]
     scan_fields: list[str] = []
     for row in rows:
         key = row["key"]
@@ -1647,10 +868,7 @@ def _settings_form_html(*, return_q: str, saved_msg: str | None = None) -> str:
               <span>{label}</span>
               <input type="text" name="{key}" value="{val}" />
             </label>"""
-        if row.get("group") == "scan":
-            scan_fields.append(field)
-        else:
-            trade_fields.append(field)
+        scan_fields.append(field)
 
     banner = ""
     if saved_msg:
@@ -1658,156 +876,16 @@ def _settings_form_html(*, return_q: str, saved_msg: str | None = None) -> str:
 
     return f"""
     <section class="settings-section">
-      <h2>Настройки (.env)</h2>
-      <p class="settings-hint">Ключи Binance и пароль панели (PANEL_AUTH_*) — только в .env на сервере, не здесь. После сохранения настройки применяются сразу.</p>
+      <h2>Настройки сканера (.env)</h2>
+      <p class="settings-hint">Ключи Binance и пароль панели — только в .env на сервере. После сохранения применяются сразу.</p>
       {banner}
       <form method="post" action="/scanner/settings" class="settings-form">
         <input type="hidden" name="return_q" value="{_e(return_q)}" />
-        <h3 class="form-group-title">Автоторговля</h3>
-        <div class="field-grid">{"".join(trade_fields)}</div>
-        <h3 class="form-group-title">Сканер (таймер)</h3>
         <div class="field-grid">{"".join(scan_fields)}</div>
         <button type="submit" class="btn btn-primary btn-save">Сохранить в .env</button>
       </form>
     </section>"""
 
-
-def _position_chart_url(op: dict[str, Any], *, timeframe: str, bars: int = 120) -> str:
-    symbol = str(op.get("symbol") or "").strip()
-    if not symbol:
-        return ""
-    params: dict[str, str | int | float] = {
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "side": str(op.get("side") or "long"),
-        "bars": max(40, min(int(bars), 500)),
-    }
-    for key, fields in (
-        ("entry", ("entry_price", "entry")),
-        ("stop", ("stop",)),
-        ("tp", ("take_profit",)),
-    ):
-        val = None
-        for f in fields:
-            try:
-                x = float(op.get(f) or 0)
-                if x > 0 and x == x:
-                    val = x
-                    break
-            except (TypeError, ValueError):
-                continue
-        if val is not None:
-            params[key] = val
-    return f"/trader/chart?{urlencode(params)}"
-
-
-def _exchange_holdings_as_positions(account: dict[str, Any]) -> list[dict[str, Any]]:
-    if not account.get("ok") or str(account.get("market") or "").lower() != "spot":
-        return []
-    out: list[dict[str, Any]] = []
-    for p in account.get("positions") or []:
-        sym = str(p.get("symbol") or "")
-        if not sym or sym == "USDT/USDT":
-            continue
-        out.append(
-            {
-                "symbol": sym,
-                "side": str(p.get("side") or "long"),
-                "amount": p.get("contracts"),
-                "entry_price": p.get("entry_price"),
-                "notional_usdt": p.get("notional_usdt"),
-                "unrealized_pnl": p.get("unrealized_pnl"),
-                "leverage": 1,
-                "from_exchange_only": True,
-            }
-        )
-    return out
-
-
-def _open_positions_section(
-    state: dict[str, Any],
-    at: AutoTradeConfig,
-    *,
-    return_q: str,
-    timeframe: str = "1h",
-    account: dict[str, Any] | None = None,
-) -> str:
-    from .auto_trader import open_positions_for_panel
-
-    positions = open_positions_for_panel(state, account, at)
-    exchange_only = False
-    if not positions and account:
-        positions = _exchange_holdings_as_positions(account)
-        exchange_only = bool(positions)
-    max_n = int(at.max_open_positions)
-    if not positions:
-        return f"""
-        <div class="pos-card pos-empty">
-          <h3>Открытые позиции (0/{max_n})</h3>
-          <p>Нет активных позиций в state. Если сделка есть на Binance Spot — обновите страницу после деплоя fix или проверьте «Позиции на бирже» ниже.</p>
-        </div>"""
-
-    mkt_label = "Spot" if str(getattr(at, "market_type", "futures")).lower() == "spot" else "Futures"
-    cards: list[str] = []
-    for op in positions:
-        fsym = str(op.get("futures_symbol") or "")
-        spot_sym = str(op.get("symbol") or "")
-        close_key = spot_sym if mkt_label == "Spot" else fsym
-        upnl = float(op.get("unrealized_pnl") or 0.0)
-        notional = float(op.get("notional_usdt") or 0.0)
-        lev = max(1, int(op.get("leverage") or 1))
-        margin = notional / lev if notional > 0 else 0.0
-        target = float(op.get("profit_target_usdt") or 0.0)
-        loss_lim = float(op.get("loss_limit_usdt") or at.stop_loss_roi_usdt or 0.0)
-        dry = bool(op.get("dry_run"))
-        ex_only = bool(op.get("from_exchange_only"))
-        close_html = ""
-        if ex_only:
-            close_html = '<span class="muted">С биржи (state пуст) — закройте вручную или дождитесь sync</span>'
-        elif close_key and not dry and not at.dry_run:
-            sym_label = _e(op.get("symbol") or close_key)
-            close_html = f"""
-        <form method="post" action="/trader/close" class="pos-close-form" onsubmit="return confirm('Закрыть {sym_label} по рынку?');">
-          <input type="hidden" name="futures_symbol" value="{_e(close_key)}" />
-          <input type="hidden" name="return_q" value="{_e(return_q)}" />
-          <button type="submit" class="btn btn-close">Закрыть</button>
-        </form>"""
-        elif dry or at.dry_run:
-            close_html = '<span class="muted">Dry-run — закрытие недоступно</span>'
-
-        cards.append(
-            f"""
-      <div class="pos-card pos-open">
-        <div class="pos-head">
-          <h3>{_e(op.get('symbol'))}</h3>
-          {_direction_badge(str(op.get('side', '')))}
-          {close_html}
-        </div>
-        <div class="pos-grid">
-          <div><label>{mkt_label}</label><strong class="mono">{_e(fsym or spot_sym)}</strong></div>
-          <div><label>Открыта</label><span class="mono">{_fmt_ts(op.get('opened_at'))}</span></div>
-          <div><label>Notional</label><span>{_fmt_num(op.get('notional_usdt'), 1)} USDT</span></div>
-          <div><label>Плечо</label><span>{_e(op.get('leverage'))}x</span></div>
-          <div><label>uPnL</label><span class="{_pnl_class(upnl)}">{_fmt_num(upnl, 2)}</span></div>
-          <div><label>Маржа</label><span>{_fmt_num(margin, 2)} USDT</span></div>
-          <div><label>Цель +{at.profit_close_pct:.0f}% маржи</label><span class="tp">{_fmt_num(target, 2)} USDT</span></div>
-          <div><label>Стоп ROI</label><span class="stop">{'—' if loss_lim <= 0 else f'−{_fmt_num(loss_lim, 2)} USDT'}</span></div>
-          <div><label>Вход</label><span class="mono">{_fmt_num(op.get('entry_price') or op.get('entry'))}</span></div>
-          <div><label>Стоп</label><span class="mono stop">{_fmt_num(op.get('stop'))}</span></div>
-          <div><label>Тейк</label><span class="mono tp">{_fmt_num(op.get('take_profit'))}</span></div>
-        </div>
-      </div>"""
-        )
-
-    hint = ""
-    if exchange_only:
-        hint = '<p class="pos-summary muted">Показаны holdings с биржи (в state бота записи нет — будет восстановлено после sync)</p>'
-    return f"""
-    <div class="pos-stack">
-      <p class="pos-summary">Открыто <strong>{len(positions)}/{max_n}</strong> — новые сделки не откроются при лимите</p>
-      {hint}
-      {"".join(cards)}
-    </div>"""
 
 
 def render_scanner_dashboard(
@@ -1815,13 +893,7 @@ def render_scanner_dashboard(
     report: dict[str, Any],
     updated_at: str | None,
     from_cache: bool,
-    scan_config: dict[str, Any],
-    at: AutoTradeConfig,
-    trade_state: dict[str, Any],
     scan_history: list[dict[str, Any]],
-    trade_history: list[dict[str, Any]],
-    account: dict[str, Any],
-    bot_stats: dict[str, Any],
     top: int,
     bars: int,
     timeframe: str,
@@ -1840,31 +912,14 @@ def render_scanner_dashboard(
     )
     refresh_url = f"/scanner?{base_q}"
     live_pairs = len(load_filtered_symbols())
-    scalp_live = load_scalp_ranking_live()
-    scalp_pairs = int(scalp_live.get("count") or 0)
     scan_poll = ""
     if scan_watch:
         scan_poll = _progress_poll_script(json_url="/scanner/progress/json", reload_on_done=True)
 
-    trader_on = at.enabled
-    trader_live = trader_on and not at.dry_run
     status_scan = _badge("Кэш" if from_cache else "Live", "ok" if from_cache else "warn")
-    status_trade = (
-        _badge("LIVE", "bad") if trader_live else (_badge("Dry-run", "warn") if trader_on else _badge("Выкл", "muted"))
-    )
-
-    last_trade = trade_state.get("last_trade") or {}
-    last_close = trade_state.get("last_close_at")
     sym_scanned = int(report.get("symbols_scanned") or report.get("universe_size") or 0)
     scan_dur = report.get("scan_duration_sec")
-    market_label = "Spot 1x" if str(getattr(at, "market_type", "futures")).lower() == "spot" else "Futures"
-    scan_mode = str(report.get("mode") or "scanner")
-    if scan_mode == "trend_plus_range":
-        scan_hint = "тренд + флет · 50 пар"
-    elif scan_mode == "trend_momentum":
-        scan_hint = "тренд 50 пар"
-    else:
-        scan_hint = "сканер"
+    scan_hint = f"{_e(timeframe)} trend · {live_pairs} пар"
 
     return f"""<!DOCTYPE html>
 <html lang="ru">
@@ -1872,7 +927,7 @@ def render_scanner_dashboard(
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta http-equiv="refresh" content="3600" />
-  <title>Forecast — Сканер и торговля</title>
+  <title>Forecast — Сканер</title>
   {_panel_fonts_link()}
   <style>{_panel_theme_css(full=True)}{_progress_panel_css()}</style>
 </head>
@@ -1880,13 +935,11 @@ def render_scanner_dashboard(
   <div class="wrap">
     <header>
       <div>
-        <h1>Forecast Dashboard</h1>
-        <p class="subtitle">{scan_hint} · {market_label} · обновление каждые 15 мин</p>
+        <h1>Forecast Scanner</h1>
+        <p class="subtitle">{scan_hint}</p>
       </div>
       <div class="pills">
         {status_scan}
-        {status_trade}
-        {_badge(market_label, "ok")}
       </div>
     </header>
 
@@ -1895,61 +948,35 @@ def render_scanner_dashboard(
     {_progress_bar_block(visible=scan_watch)}
 
     <div class="actions">
-      <a class="btn btn-primary" href="{refresh_url}">Обновить</a>
       <form method="post" action="/scanner/live/run" style="display:inline">
         <input type="hidden" name="return_q" value="{_e(base_q)}" />
         <input type="hidden" name="top" value="{int(top)}" />
         <input type="hidden" name="bars" value="{int(bars)}" />
         <input type="hidden" name="timeframe" value="{_e(timeframe)}" />
         <input type="hidden" name="stage1_min_score" value="{float(stage1_min_score)}" />
-        <button type="submit" class="btn">Live-скан</button>
+        <button type="submit" class="btn btn-primary">Запустить скан</button>
       </form>
-      <a class="btn" href="/scanner/pairs" target="_blank">Swing-пары (400)</a>
-      <a class="btn" href="/scanner/scalp/pairs" target="_blank">Скальп-пары (400→8)</a>
+      <a class="btn" href="{refresh_url}">Обновить кэш</a>
     </div>
 
     <div class="stats">
-      <div class="stat"><label>Swing live</label><strong>{live_pairs}</strong></div>
-      <div class="stat"><label>Скальп live</label><strong>{scalp_pairs}</strong></div>
+      <div class="stat"><label>Пары</label><strong>{live_pairs}</strong></div>
       <div class="stat"><label>Последний скан</label><strong>{_fmt_ts(updated_at)}</strong></div>
-      <div class="stat"><label>Пар в скане</label><strong>{sym_scanned}</strong></div>
+      <div class="stat"><label>Просканировано</label><strong>{sym_scanned}</strong></div>
       <div class="stat"><label>Время скана</label><strong>{_fmt_scan_duration(scan_dur)}</strong></div>
       <div class="stat"><label>Кандидаты</label><strong>{int(report.get('candidates_found', 0))}</strong></div>
       <div class="stat"><label>Таймфрейм</label><strong>{_e(timeframe)}</strong></div>
-      <div class="stat"><label>Bars</label><strong>{int(bars)}</strong></div>
-      <div class="stat"><label>Stage1 ≥</label><strong>{float(stage1_min_score):.0f}</strong></div>
-      <div class="stat"><label>Открыто позиций</label><strong>{len(trade_state.get('open_positions') or [])}/{int(at.max_open_positions)}</strong></div>
-      <div class="stat"><label>Посл. сделка</label><strong>{_fmt_ts(last_trade.get('at'))}</strong></div>
-      <div class="stat"><label>Закрытие</label><strong>{_fmt_ts(last_close) if last_close else '—'}</strong></div>
     </div>
 
-    {_balance_section(account)}
     {_settings_form_html(return_q=base_q, saved_msg=saved_msg)}
-    {_bot_stats_section(bot_stats)}
-    {_exchange_positions_table(account)}
 
     <section>
-      <h2>Лучший сетап (№1)</h2>
-      {_hero_setup(hero, pick_from_top_n=int(at.pick_from_top_n))}
+      <h2>Лучший сетап</h2>
+      {_hero_setup(hero)}
     </section>
 
-    {_orderbook_section_html()}
-
-    {_scalp_section_html()}
-
-    <div class="two-col">
-      <section>
-        <h2>Автоторговля — настройки</h2>
-        <div class="cfg-grid">{_trader_config_cards(at)}</div>
-      </section>
-      <section>
-        <h2>Открытые позиции бота</h2>
-        {_open_positions_section(trade_state, at, return_q=base_q, timeframe=timeframe, account=account)}
-      </section>
-    </div>
-
     <section>
-      <h2>Топ сетапы сканера</h2>
+      <h2>Топ сетапы</h2>
       <div class="table-wrap">
         <table>
           <thead>
@@ -1964,33 +991,15 @@ def render_scanner_dashboard(
       </div>
     </section>
 
-    <div class="two-col">
-      <section>
-        <h2>История сканов</h2>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>Время</th><th>Топ пара</th><th>Dir</th><th>Score</th><th>Кандидаты</th><th>Время скана</th></tr></thead>
-            <tbody>{_scan_history_rows(scan_history)}</tbody>
-          </table>
-        </div>
-      </section>
-      <section>
-        <h2>История торговли</h2>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>Время</th><th>Действие</th><th>Пара</th><th>Сторона</th><th>Причина</th><th>Режим</th></tr></thead>
-            <tbody>{_trade_history_rows(trade_history)}</tbody>
-          </table>
-        </div>
-      </section>
-    </div>
-
-    <footer>
-      Кэш: market_scan_latest.json · История: scan_history.jsonl · Торги: auto_trade_state.json
-      · <a href="/scanner?tab=closed&amp;{base_q}" style="color:var(--accent)">Закрытые</a>
-      · <a href="/scanner/pairs" target="_blank" style="color:var(--accent)">Тест пар</a>
-      · <a class="btn" href="/legacy" style="display:inline-block;margin-top:8px">Старый forecast UI</a>
-    </footer>
+    <section>
+      <h2>История сканов</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Время</th><th>Топ пара</th><th>Dir</th><th>Score</th><th>Кандидаты</th><th>Время скана</th></tr></thead>
+          <tbody>{_scan_history_rows(scan_history)}</tbody>
+        </table>
+      </div>
+    </section>
   </div>
   {scan_poll}
 </body>

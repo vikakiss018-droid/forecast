@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -25,7 +26,17 @@ class ScanConfig:
 
 LEVEL_LOOKBACK = 120
 LEVEL_PROXIMITY_FRAC = 0.15
-RANGE_ENTRY_ZONE_FRAC = 0.20
+RANGE_ENTRY_ZONE_FRAC = 0.22  # дефолт; runtime — range_entry_zone_frac()
+
+
+def range_entry_zone_frac() -> float:
+    raw = os.environ.get("RANGE_ENTRY_ZONE_FRAC", "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return float(RANGE_ENTRY_ZONE_FRAC)
 
 
 def _level_proximity(
@@ -109,9 +120,10 @@ def _stage1_snapshot(df: pd.DataFrame) -> dict[str, Any]:
 
     score = 0.0
     score += 12.0 if (near_support or near_resistance) else 0.0
-    score += 8.0 if squeeze else 0.0
+    # triangle/flag/wedge — производные squeeze: один компонент, без двойного счёта
+    score += 10.0 if (squeeze or triangle or flag or wedge) else 0.0
     score += 8.0 if retest_breakout else 0.0
-    score += 8.0 if (triangle or flag or wedge or channel) else 0.0
+    score += 6.0 if channel else 0.0
     score += 6.0 if (double_bottom or double_top) else 0.0
     score += 6.0 if (accumulation or breakout_cons) else 0.0
     score += 5.0 if strong_move_to_zone else 0.0
@@ -184,6 +196,10 @@ def _adjust_stage1_for_direction(
         stage1 += 10.0
     elif direction == "Short" and near_support:
         stage1 -= 15.0
+    elif direction == "Long" and near_support and candle_bullish:
+        stage1 += 10.0
+    elif direction == "Long" and near_resistance:
+        stage1 -= 15.0
 
     return stage1
 
@@ -215,6 +231,10 @@ def _build_why_selected(
         reasons.append("у сопротивления")
     elif direction == "Short" and near_support:
         reasons.append("у поддержки (осторожно)")
+    elif direction == "Long" and near_support and candle_bullish:
+        reasons.append("у поддержки")
+    elif direction == "Long" and near_resistance:
+        reasons.append("у сопротивления (осторожно)")
 
     return ", ".join(reasons)
 
@@ -247,13 +267,15 @@ def _build_trade_plan(df: pd.DataFrame, snap: dict[str, Any], st) -> dict[str, A
     else:
         # range/flat: вход только у уровня, иначе пропустить сетап
         if abs(close - support) <= abs(resistance - close):
-            if abs(close - support) / span >= RANGE_ENTRY_ZONE_FRAC:
+            zone = range_entry_zone_frac()
+            if abs(close - support) / span >= zone:
                 return None
             direction = "Long"
             entry = close
             stop = support - 1.2 * atr
         else:
-            if abs(close - resistance) / span >= RANGE_ENTRY_ZONE_FRAC:
+            zone = range_entry_zone_frac()
+            if abs(close - resistance) / span >= zone:
                 return None
             direction = "Short"
             entry = close

@@ -97,7 +97,7 @@ def fetch_top_usdt_symbols(exchange: ccxt.Exchange, *, limit: int = 200) -> tupl
     return tuple(sym for _, sym in rows[:limit])
 
 
-DEFAULT_TIMEFRAMES: tuple[str, ...] = ("15m", "30m", "1h", "2h", "4h")
+DEFAULT_TIMEFRAMES: tuple[str, ...] = ("15m", "30m", "1h", "2h", "4h", "1d")
 
 TARGET_TRADES_PER_TF = 100
 FEE_R_PER_TRADE = 0.08  # ~0.08R round-trip cost (2×4bp)
@@ -108,14 +108,16 @@ BARS_BY_TF: dict[str, int] = {
     "1h": 1000,
     "2h": 1000,
     "4h": 800,
+    "1d": 500,
 }
 
 STEP_BY_TF: dict[str, int] = {
     "15m": 8,
     "30m": 4,
-    "1h": 2,
+    "1h": 1,  # каждый бар — больше сигналов (цель ≥30 сделок/мес)
     "2h": 1,
     "4h": 1,
+    "1d": 1,
 }
 
 MAX_HOLD_BARS_BY_TF: dict[str, int] = {
@@ -124,6 +126,7 @@ MAX_HOLD_BARS_BY_TF: dict[str, int] = {
     "1h": 48,
     "2h": 36,
     "4h": 24,
+    "1d": 14,
 }
 
 # ema_200 + rolling 48 в features — прогрев для коротких окон (MULTI_BT_START/END)
@@ -231,7 +234,12 @@ def _fetch_df_date_window(
             if short_window:
                 warm = 360 if timeframe == "1h" else max(300, MAX_HOLD_BARS_BY_TF.get(timeframe, 48) + 220)
             else:
-                warm = INDICATOR_WARMUP_BARS_1H if timeframe == "1h" else max(220, MAX_HOLD_BARS_BY_TF.get(timeframe, 48) + 172)
+                if timeframe.endswith("d") or timeframe.endswith("w"):
+                    warm = max(280, MAX_HOLD_BARS_BY_TF.get(timeframe, 48) + 220)
+                else:
+                    warm = INDICATOR_WARMUP_BARS_1H if timeframe == "1h" else max(
+                        220, MAX_HOLD_BARS_BY_TF.get(timeframe, 48) + 172
+                    )
         since_ms = int(start.timestamp() * 1000) - int(warm) * tf_ms
         until_ms = int(end.timestamp() * 1000) + tf_ms
         rows: list[list] = []
@@ -259,7 +267,8 @@ def _fetch_df_date_window(
         if len(df) < min_len:
             return None
         base = add_basic_indicators(df)
-        if short_window:
+        use_min_features = short_window or timeframe.endswith("d") or timeframe.endswith("w")
+        if use_min_features:
             out = _add_backtest_min_features(base)
         else:
             out = add_basic_features(base)

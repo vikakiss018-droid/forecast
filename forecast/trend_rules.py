@@ -11,9 +11,11 @@ from typing import Any, Literal
 import numpy as np
 import pandas as pd
 
-from .market_scanner import LEVEL_PROXIMITY_FRAC, RANGE_ENTRY_ZONE_FRAC, _level_proximity
+from .market_scanner import LEVEL_PROXIMITY_FRAC, _level_proximity, range_entry_zone_frac
 
 TREND_LOOKBACK = 60
+# Бэктест апрель-июль 2026: move 2.5% + TP 4% => 0 сделок (широкий стоп не проходит RR>=1.5),
+# а TP через 2.8R => 76% таймаутов и -4.8R. Оставлен проверенный вариант 0.8% + TP 4%.
 MIN_TREND_MOVE_PCT = 0.008
 RR_TARGET = 2.8
 TP_TARGET_PCT = 0.04  # 4% от цены входа (target_2); 0 = использовать rr_target
@@ -24,8 +26,12 @@ PULLBACK_LONG_POS_MAX = 0.68
 PULLBACK_SHORT_POS_MIN = 0.52
 PULLBACK_SHORT_POS_MAX = 0.72
 MIN_PULLBACK_FROM_SWING_PCT = 0.001
-MIN_REL_VOLUME = 1.2
-MIN_ATR_PCT = 0.0  # 0 = фильтр ATR выключен
+# Частота ≥30 сделок/мес на 50 парах: пороги ниже прежних 1.2 / 0.9 / 0.5%
+MIN_REL_VOLUME = 1.0
+MIN_REL_VOLUME_RANGE = 0.7
+MIN_ATR_PCT = 0.003  # мёртвые пары: стоп 0.5*ATR внутри шума; 0 = фильтр выключен
+REQUIRE_REJECTION_CANDLE = True
+REJECTION_WICK_FRAC = 0.25  # доля диапазона свечи для тени-отклонения
 MIN_SWING_COUNT = 2  # последние 2 локальных HH/HL (или LH/LL)
 SWING_WING = 2
 # Азия: низкая ликвидность на альтах, чаще ложные пробои (UTC, включительно)
@@ -64,7 +70,10 @@ class TrendPullbackParams:
     require_htf_align: bool = False
     htf_timeframe: str = "4h"
     min_rel_volume: float = MIN_REL_VOLUME
+    min_rel_volume_range: float = MIN_REL_VOLUME_RANGE
     min_atr_pct: float = MIN_ATR_PCT
+    require_rejection_candle: bool = REQUIRE_REJECTION_CANDLE
+    rejection_wick_frac: float = REJECTION_WICK_FRAC
     require_swing_structure: bool = False
     min_swing_count: int = MIN_SWING_COUNT
     block_opposite_level: bool = False
@@ -81,14 +90,54 @@ class TrendPullbackParams:
         )
 
 
-# Дефолт: lookback 60, move 0.8%, импульс, rel_volume>=1.2, без 4h/ATR
+# Дефолт: lookback 60, move 0.8%, vol 1.0/0.7, ATR≥0.3%, TP 4% — цель ≥30 сделок/мес
 DEFAULT_TREND_PARAMS = TrendPullbackParams(
     require_pullback=False,
     require_htf_align=False,
     min_rel_volume=MIN_REL_VOLUME,
+    min_rel_volume_range=MIN_REL_VOLUME_RANGE,
     min_atr_pct=MIN_ATR_PCT,
 )
 DEFAULT_PULLBACK_PARAMS = DEFAULT_TREND_PARAMS
+
+# 15m: 30d бэктест ~140 сделок/мес, win~47%, PF~1.07 (TP 4%, move 0.8%)
+PARAMS_15M = TrendPullbackParams(
+    require_pullback=False,
+    require_htf_align=False,
+    trend_lookback=60,
+    min_trend_move_pct=0.008,
+    tp_target_pct=0.04,
+    min_rel_volume=1.0,
+    min_rel_volume_range=0.8,
+    min_atr_pct=0.003,
+    require_rejection_candle=True,
+    block_opposite_level=False,
+)
+
+
+# 1d: mini grid (12 пар, 90d) — lookback 30, move 4%, TP 6%, rel_vol 1.1
+PARAMS_1D = TrendPullbackParams(
+    require_pullback=False,
+    require_htf_align=False,
+    trend_lookback=30,
+    min_trend_move_pct=0.04,
+    tp_target_pct=0.06,
+    min_rel_volume=1.1,
+    min_atr_pct=0.0,
+)
+
+
+def trend_params_for_timeframe(
+    timeframe: str,
+    *,
+    base: TrendPullbackParams | None = None,
+) -> TrendPullbackParams:
+    """Параметры trend/range с учётом TF (1h — дефолт из config/env, 15m/1d — подобранные)."""
+    if timeframe == "15m":
+        return PARAMS_15M
+    if timeframe == "1d":
+        return PARAMS_1D
+    return base or DEFAULT_TREND_PARAMS
 
 
 def _local_swing_indices(series: np.ndarray, *, kind: Literal["high", "low"], wing: int = SWING_WING) -> list[int]:
@@ -216,6 +265,26 @@ def _pullback_ready(
     return False, pos
 
 
+def _rejection_candle_confirms(
+    last: pd.Series,
+    direction: str,
+    *,
+    wick_frac: float = REJECTION_WICK_FRAC,
+) -> bool:
+    """Отклонение от уровня: закрытие в сторону сделки или длинная тень от уровня."""
+    open_ = float(last["open"])
+    close = float(last["close"])
+    high = float(last["high"])
+    low = float(last["low"])
+    rng = max(high - low, 1e-12)
+    thr = max(float(wick_frac), 0.0)
+    if direction == "Long":
+        lower_wick = min(open_, close) - low
+        return close >= open_ or lower_wick >= thr * rng
+    upper_wick = high - max(open_, close)
+    return close <= open_ or upper_wick >= thr * rng
+
+
 def _momentum_candle_confirms(df: pd.DataFrame, trend: str) -> bool:
     last = df.iloc[-1]
     close = float(last["close"])
@@ -335,8 +404,12 @@ def build_range_plan(
     if detect_price_trend(df, params) != "range":
         return None
 
+    # Флет-отскок только при сжатии у уровня — режет шум от «просто рядом с high/low»
+    if not bool(snap.get("squeeze_at_level")):
+        return None
+
     rel_vol = float(snap.get("context", {}).get("rel_volume", 0.0))
-    if params.min_rel_volume > 0 and rel_vol < params.min_rel_volume:
+    if params.min_rel_volume_range > 0 and rel_vol < params.min_rel_volume_range:
         return None
 
     last = df.iloc[-1]
@@ -351,18 +424,24 @@ def build_range_plan(
     span = max(resistance - support, 1e-9)
     range_pos = _range_position(close, support, resistance)
 
+    zone = range_entry_zone_frac()
     if abs(close - support) <= abs(resistance - close):
-        if abs(close - support) / span >= RANGE_ENTRY_ZONE_FRAC:
+        if abs(close - support) / span >= zone:
             return None
         direction = "Long"
         entry = close
         stop = support - 1.2 * atr
     else:
-        if abs(close - resistance) / span >= RANGE_ENTRY_ZONE_FRAC:
+        if abs(close - resistance) / span >= zone:
             return None
         direction = "Short"
         entry = close
         stop = resistance + 1.2 * atr
+
+    if params.require_rejection_candle and not _rejection_candle_confirms(
+        last, direction, wick_frac=params.rejection_wick_frac
+    ):
+        return None
 
     risk = max(abs(entry - stop), atr * 0.5)
     if risk <= 0:
@@ -372,12 +451,15 @@ def build_range_plan(
         if stop >= entry:
             return None
         tp1 = entry + 1.0 * risk
-        tp2 = entry + RR_TARGET * risk
+        # Для флета цель ближе, чем 2.8R — иначе таймауты/развороты съедают expectancy
+        range_rr = min(float(params.rr_target), 1.6)
+        tp2 = entry + range_rr * risk
     else:
         if stop <= entry:
             return None
         tp1 = entry - 1.0 * risk
-        tp2 = entry - RR_TARGET * risk
+        range_rr = min(float(params.rr_target), 1.6)
+        tp2 = entry - range_rr * risk
 
     rr = abs(tp2 - entry) / risk
     return {

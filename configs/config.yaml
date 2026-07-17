@@ -78,21 +78,30 @@ reference_backtest:
   max_hold_bars_1h: 48
   cooldown_bars_same_symbol: 4
 
-# Live-скан + systemd (:03 UTC): тренд + флет, как combined backtest, spot long only
+# Live-скан + systemd (:03 UTC). Цель ≥30 сделок/мес.
+# 1h: без убыточного range не набирается; 15m trend ≈100–130/мес, PF≈1.07 (30d).
 trend_scan:
-  timeframe: 1h
+  timeframe: 15m
   bars: 1000
   top_n: 20
-  stage1_min_score: 18
+  stage1_min_score: 12
   use_filtered: true
-  long_only: true
+  long_only: false
   use_closed_bar_only: true
   allow_trend: true
-  allow_range: true
-  min_prob_pct: 50
+  allow_range: false           # range на 15m ≈0R; выключен, чтобы не размывать edge
+  min_prob_pct: 0
   lookback: 60
   min_move_pct: 0.008
-  min_rel_volume: 1.2
+  min_rel_volume: 1.0
+  min_rel_volume_range: 0.8
+  min_atr_pct: 0.003
+  tp_target_pct: 0.04
+  require_pullback: false
+  require_htf_align: false
+  require_rejection_candle: true
+  block_opposite_level: false
+  btc_regime_filter: true
   block_asian_session: false
 
 auto_trade:
@@ -100,9 +109,9 @@ auto_trade:
   dry_run: true
   market_type: spot
   spot_allow_short: false
-  min_score: 18
-  min_probability_pct: 50
-  min_risk_reward: 1.5
+  min_score: 12
+  min_probability_pct: 0
+  min_risk_reward: 1.2
   risk_pct_of_balance: 0.5
   max_notional_usdt: 50
   cooldown_minutes: 0

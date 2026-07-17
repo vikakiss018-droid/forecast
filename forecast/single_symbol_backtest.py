@@ -52,7 +52,7 @@ DEFAULT_TIMEFRAME = "1h"
 DEFAULT_BARS = 1000
 TARGET_TRADES = 100
 UNLIMITED_TARGET_TRADES = 0  # target_trades <= 0 → все сигналы за окно bars
-COOLDOWN_BARS = 4
+COOLDOWN_BARS = 2  # было 4 — короче cooldown → больше сделок/мес
 
 
 def _trade_target_unlimited(target_trades: int) -> bool:
@@ -150,9 +150,9 @@ class MultiSymbolBacktestConfig:
     timeframe: str = DEFAULT_TIMEFRAME
     bars: int = 0  # 0 → BARS_BY_TF[timeframe]
     target_trades: int = TARGET_TRADES
-    stage1_min_score: float = 18.0
-    stage1_relax_score: float = 12.0
-    trend_only: bool = True
+    stage1_min_score: float = 12.0
+    stage1_relax_score: float = 8.0
+    trend_only: bool = False  # как live: тренд + range bounce
     trend_params: TrendPullbackParams | None = None
     require_htf_align: bool = False
     htf_timeframe: str = "4h"
@@ -228,7 +228,7 @@ def _peek_trend_entry(
     rel_vol = float(snap["context"]["rel_volume"])
     vol_up, vol_down = compute_volume_scores(sub)
     stage1 = _adjust_stage1_for_direction(
-        max(float(snap["stage1_score"]), 10.0),
+        float(snap["stage1_score"]),
         direction=str(plan["direction"]),
         rel_vol=rel_vol,
         candle_bullish=candle_bullish,
@@ -327,7 +327,7 @@ def _peek_range_entry(
     rel_vol = float(snap["context"]["rel_volume"])
     vol_up, vol_down = compute_volume_scores(sub)
     stage1 = _adjust_stage1_for_direction(
-        max(float(snap["stage1_score"]), 10.0),
+        float(snap["stage1_score"]),
         direction=str(plan["direction"]),
         rel_vol=rel_vol,
         candle_bullish=candle_bullish,
@@ -530,8 +530,9 @@ def run_combined_multi_symbol_backtest(
 
     at_yaml = yaml_section("auto_trade")
     auto_cfg = load_auto_trade_config(at_yaml)
-    auto_cfg.min_probability_pct = float(at_yaml.get("min_probability_pct", 50))
-    auto_cfg.min_score = float(at_yaml.get("min_score", 18))
+    auto_cfg.min_probability_pct = float(at_yaml.get("min_probability_pct", 0))
+    auto_cfg.min_score = float(at_yaml.get("min_score", 12))
+    auto_cfg.min_risk_reward = float(at_yaml.get("min_risk_reward", 1.2))
     auto_cfg.allow_level_breakout = bool(at_yaml.get("allow_level_breakout", False))
     auto_cfg.allow_triangle = bool(at_yaml.get("allow_triangle", False))
     if risk_pct is None:
@@ -563,17 +564,36 @@ def run_combined_multi_symbol_backtest(
             if df_htf is None:
                 print(f"[combined_bt] skip {symbol}: no {cfg.htf_timeframe} data", flush=True)
                 continue
-        sym_trades = backtest_combined_single_symbol(
-            df,
-            symbol=symbol,
-            timeframe=cfg.timeframe,
-            auto_cfg=auto_cfg,
-            stage1_min=cfg.stage1_min_score,
-            target_trades=UNLIMITED_TARGET_TRADES,
-            trend_params=trend_params,
-            df_htf=df_htf,
-            long_only=cfg.long_only,
-        )
+        # trend_only=True → только тренд; False → тренд+range
+        if cfg.trend_only:
+            sym_trades = backtest_single_symbol(
+                df,
+                symbol=symbol,
+                timeframe=cfg.timeframe,
+                auto_cfg=auto_cfg,
+                stage1_min=cfg.stage1_min_score,
+                target_trades=UNLIMITED_TARGET_TRADES,
+                trend_only=True,
+                trend_params=trend_params,
+                df_htf=df_htf,
+                long_only=cfg.long_only,
+            )
+            for t in sym_trades:
+                t.setdefault("regime", "trend")
+        else:
+            sym_trades = backtest_combined_single_symbol(
+                df,
+                symbol=symbol,
+                timeframe=cfg.timeframe,
+                auto_cfg=auto_cfg,
+                stage1_min=cfg.stage1_min_score,
+                target_trades=UNLIMITED_TARGET_TRADES,
+                trend_params=trend_params,
+                df_htf=df_htf,
+                long_only=cfg.long_only,
+                allow_trend=True,
+                allow_range=True,
+            )
         all_trades.extend(sym_trades)
         n_t = sum(1 for t in sym_trades if t.get("regime") == "trend")
         n_r = len(sym_trades) - n_t
@@ -642,8 +662,9 @@ def run_range_multi_symbol_backtest(
 
     at_yaml = yaml_section("auto_trade")
     auto_cfg = load_auto_trade_config(at_yaml)
-    auto_cfg.min_probability_pct = float(at_yaml.get("min_probability_pct", 50))
-    auto_cfg.min_score = float(at_yaml.get("min_score", 18))
+    auto_cfg.min_probability_pct = float(at_yaml.get("min_probability_pct", 0))
+    auto_cfg.min_score = float(at_yaml.get("min_score", 12))
+    auto_cfg.min_risk_reward = float(at_yaml.get("min_risk_reward", 1.2))
     auto_cfg.allow_level_breakout = bool(at_yaml.get("allow_level_breakout", False))
     auto_cfg.allow_triangle = bool(at_yaml.get("allow_triangle", False))
     if risk_pct is None:
@@ -769,6 +790,25 @@ def backtest_single_symbol(
     df_htf: pd.DataFrame | None = None,
     long_only: bool = False,
 ) -> list[dict[str, Any]]:
+    # trend_only=False → как live-скан: тренд, иначе range bounce
+    if not trend_only:
+        return backtest_combined_single_symbol(
+            df,
+            symbol=symbol,
+            timeframe=timeframe,
+            auto_cfg=auto_cfg,
+            stage1_min=stage1_min,
+            target_trades=target_trades,
+            step=step,
+            max_hold_bars=max_hold_bars,
+            cooldown_bars=cooldown_bars,
+            trend_params=trend_params,
+            df_htf=df_htf,
+            long_only=long_only,
+            allow_trend=True,
+            allow_range=True,
+        )
+
     params = trend_params or DEFAULT_TREND_PARAMS
     step = step if step is not None else STEP_BY_TF.get(timeframe, 2)
     max_hold = max_hold_bars if max_hold_bars is not None else MAX_HOLD_BARS_BY_TF.get(timeframe, 48)
@@ -789,7 +829,7 @@ def backtest_single_symbol(
             step=step,
             max_hold=max_hold,
             cooldown_bars=cooldown_bars,
-            trend_only=trend_only,
+            trend_only=True,
             trend_params=params,
             df_htf=df_htf,
             long_only=long_only,
@@ -861,8 +901,9 @@ def run_multi_symbol_backtest(
 
     at_yaml = yaml_section("auto_trade")
     auto_cfg = load_auto_trade_config(at_yaml)
-    auto_cfg.min_probability_pct = float(at_yaml.get("min_probability_pct", 50))
-    auto_cfg.min_score = float(at_yaml.get("min_score", 18))
+    auto_cfg.min_probability_pct = float(at_yaml.get("min_probability_pct", 0))
+    auto_cfg.min_score = float(at_yaml.get("min_score", 12))
+    auto_cfg.min_risk_reward = float(at_yaml.get("min_risk_reward", 1.2))
     auto_cfg.allow_level_breakout = bool(at_yaml.get("allow_level_breakout", False))
     auto_cfg.allow_triangle = bool(at_yaml.get("allow_triangle", False))
     if risk_pct is None:

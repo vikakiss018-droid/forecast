@@ -10,11 +10,12 @@ from .paths import load_project_env
 from .run_symbol_ranking import load_filtered_symbols
 from .single_symbol_backtest import MultiSymbolBacktestConfig, run_combined_multi_symbol_backtest
 from .tf_backtest import DEFAULT_SYMBOLS
-from .trend_rules import DEFAULT_TREND_PARAMS, TrendPullbackParams
+from .trend_scanner import trend_params_from_yaml, trend_scan_config_from_env
 
 
 def main() -> int:
-    load_project_env(force=True)
+    # force=False: CLI/shell env перекрывает .env (удобно для абляций)
+    load_project_env(force=False)
     days = int(os.environ.get("COMBINED_BT_DAYS", "30"))
     tf = os.environ.get("COMBINED_BT_TIMEFRAME", "1h").strip() or "1h"
     deposit = float(
@@ -47,16 +48,8 @@ def main() -> int:
     else:
         symbols = DEFAULT_SYMBOLS
 
-    min_vol = float(os.environ.get("TREND_MIN_REL_VOLUME", str(DEFAULT_TREND_PARAMS.min_rel_volume)))
-    lookback = int(os.environ.get("TREND_LOOKBACK", str(DEFAULT_TREND_PARAMS.trend_lookback)))
-    min_move = float(os.environ.get("TREND_MIN_MOVE_PCT", str(DEFAULT_TREND_PARAMS.min_trend_move_pct)))
-    trend_params = TrendPullbackParams(
-        require_pullback=False,
-        require_htf_align=False,
-        min_rel_volume=min_vol,
-        trend_lookback=lookback,
-        min_trend_move_pct=min_move,
-    )
+    scan_cfg = trend_scan_config_from_env()
+    trend_params = trend_params_from_yaml()
 
     out_name = os.environ.get(
         "COMBINED_BT_OUT",
@@ -66,17 +59,27 @@ def main() -> int:
 
     print(
         f"[combined_bt] {len(symbols)} symbols, {days}d {start_s}..{end_s}, {tf}, "
-        f"trend+range, deposit=${deposit} risk={risk}% "
+        f"trend+range stage1>={scan_cfg.stage1_min_score} "
+        f"vol>={trend_params.min_rel_volume}/{trend_params.min_rel_volume_range} "
+        f"atr>={trend_params.min_atr_pct} "
+        f"deposit=${deposit} risk={risk}% "
         f"{'long-only ' if long_only else ''}→ {out_path.name}",
         flush=True,
     )
 
+    # Прокидываем allow_trend/allow_range через monkeypatch на combined runner —
+    # проще: trend_only=True если range выключен.
+    use_trend_only = bool(scan_cfg.allow_trend) and not bool(scan_cfg.allow_range)
     result = run_combined_multi_symbol_backtest(
         cfg=MultiSymbolBacktestConfig(
             symbols=symbols,
             timeframe=tf,
             target_trades=0,
+            stage1_min_score=scan_cfg.stage1_min_score,
+            trend_only=use_trend_only,
             trend_params=trend_params,
+            require_htf_align=trend_params.require_htf_align,
+            htf_timeframe=trend_params.htf_timeframe,
             long_only=long_only,
             entry_window_start=start_s,
             entry_window_end=end_s,
@@ -92,21 +95,19 @@ def main() -> int:
     s = result["summary"]
     st = result.get("summary_by_regime", {}).get("trend", {})
     sr = result.get("summary_by_regime", {}).get("range", {})
+    trades_per_month = round(float(s["trades"]) * 30.0 / max(days, 1), 1)
     print(
-        f"[combined_bt] ALL trades={s['trades']} win%={s['win_rate_pct']} "
+        f"[combined_bt] ALL trades={s['trades']} (~{trades_per_month}/mo) "
+        f"win%={s['win_rate_pct']} "
         f"total_R={s['total_r']} PF={s.get('profit_factor')} "
         f"PnL ${s['estimated_profit_usdt']} ({s['estimated_return_pct']}%)",
         flush=True,
     )
     print(
-        f"  trend:  {st.get('trades', 0)} trades, R={st.get('total_r', 0)}, win%={st.get('win_rate_pct', 0)}",
+        f"[combined_bt] trend: n={st.get('trades')} win%={st.get('win_rate_pct')} R={st.get('total_r')} | "
+        f"range: n={sr.get('trades')} win%={sr.get('win_rate_pct')} R={sr.get('total_r')}",
         flush=True,
     )
-    print(
-        f"  range:  {sr.get('trades', 0)} trades, R={sr.get('total_r', 0)}, win%={sr.get('win_rate_pct', 0)}",
-        flush=True,
-    )
-    print(f"[combined_bt] saved: {out_path}", flush=True)
     return 0
 
 

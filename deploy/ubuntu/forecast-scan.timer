@@ -1,10 +1,11 @@
 [Unit]
-Description=Run forecast combined scan hourly (trend + range, 1h)
+Description=Run forecast scan every 15m (closed 15m bar)
 
 [Timer]
 OnBootSec=5min
-OnCalendar=*:03:00
-AccuracySec=1min
+# После закрытия 15m-свечи (:00/:15/:30/:45) — скан на :03/:18/:33/:48
+OnCalendar=*:03,18,33,48:00
+AccuracySec=30s
 Persistent=true
 Unit=forecast-scan.service
 
