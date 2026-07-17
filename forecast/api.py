@@ -39,6 +39,7 @@ from .ev_calibration import load_ev_calibration
 from .trend_scanner import (
     SCAN_MODE,
     TrendScanConfig,
+    _resolve_scan_symbols,
     scan_combined_setups,
     scan_trend_filtered_setups,
     trend_scan_config_from_env,
@@ -1187,18 +1188,23 @@ def _trend_scan_cfg_from_request(
     timeframe: str,
     stage1_min_score: float,
 ) -> TrendScanConfig:
-    """Параметры как у run_scheduled_scan (50 filtered, тренд + флет 1h)."""
+    """Параметры live-скана: base из .env/yaml + overrides из формы/query."""
     base = trend_scan_config_from_env()
     return TrendScanConfig(
-        timeframe=(timeframe or base.timeframe).strip() or "1h",
+        timeframe=(timeframe or base.timeframe).strip() or base.timeframe,
         bars=int(bars) if bars > 0 else base.bars,
         top_n=int(top) if top > 0 else base.top_n,
         stage1_min_score=float(stage1_min_score),
         min_probability_pct=base.min_probability_pct,
         trend_params=base.trend_params,
         use_filtered_symbols=base.use_filtered_symbols,
+        universe_top_n=base.universe_top_n,
         symbols=base.symbols,
         long_only=base.long_only,
+        use_closed_bar_only=base.use_closed_bar_only,
+        allow_trend=base.allow_trend,
+        allow_range=base.allow_range,
+        btc_regime_filter=base.btc_regime_filter,
     )
 
 
@@ -1211,8 +1217,8 @@ def _scanner_report(
     max_symbols: int | None,
     live: bool,
 ) -> tuple[dict, str | None, bool]:
-    """Return (report, updated_at, from_cache). Combined scan 50 пар (не kNN)."""
-    _ = max_symbols  # legacy query param; список пар из symbol_ranking_filtered_r05_win50.json
+    """Return (report, updated_at, from_cache)."""
+    _ = max_symbols
     if not live:
         cached = load_scan_result()
         if cached is not None:
@@ -1255,17 +1261,29 @@ def _run_live_scan_background(
         timeframe=timeframe,
         stage1_min_score=stage1_min_score,
     )
-    symbols = tuple(scan_cfg.symbols or ()) or load_filtered_symbols()
+    try:
+        symbols = _resolve_scan_symbols(scan_cfg)
+    except Exception as e:
+        save_scan_progress(
+            {
+                "status": "error",
+                "kind": "live_scan",
+                "error": f"нет символов: {e}",
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        return
     if not symbols:
         save_scan_progress(
             {
                 "status": "error",
                 "kind": "live_scan",
-                "error": "нет символов для скана",
+                "error": "нет символов для скана (проверьте FORECAST_USE_FILTERED / FORECAST_SCAN_TOP_N)",
                 "finished_at": datetime.now(timezone.utc).isoformat(),
             }
         )
         return
+    scan_cfg.symbols = symbols
 
     started_at = datetime.now(timezone.utc).isoformat()
     save_scan_progress(
@@ -1305,6 +1323,7 @@ def _run_live_scan_background(
                 "stage1_min_score": scan_cfg.stage1_min_score,
                 "symbols_count": len(symbols),
                 "use_filtered": scan_cfg.use_filtered_symbols,
+                "universe_top_n": scan_cfg.universe_top_n,
                 "allow_trend": scan_cfg.allow_trend,
                 "allow_range": scan_cfg.allow_range,
                 "long_only": scan_cfg.long_only,
