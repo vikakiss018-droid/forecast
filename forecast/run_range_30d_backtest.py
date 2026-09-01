@@ -1,24 +1,32 @@
-"""CLI: 30-day range (flat) backtest on filtered 50 pairs, 1h — same gates as trend bot."""
+"""CLI: historical range-bounce backtest — entries only from heavily retested S/R levels."""
 
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-
 from pathlib import Path
 
 from .paths import load_project_env
 from .run_symbol_ranking import load_filtered_symbols
 from .single_symbol_backtest import MultiSymbolBacktestConfig, run_range_multi_symbol_backtest
 from .tf_backtest import DEFAULT_SYMBOLS
-from .trend_rules import DEFAULT_TREND_PARAMS, TrendPullbackParams
+from .trend_scanner import trend_params_from_yaml, trend_scan_config_from_env
+
+
+def _resolve_days(tf: str) -> int:
+    """Максимально практичное окно: 1h ≈ 3 года, 15m ≈ 1 год (лимит объёма запросов)."""
+    raw = os.environ.get("RANGE_BT_DAYS", "max").strip().lower()
+    if raw in ("", "max", "maximum", "full"):
+        return 1095 if tf in ("1h", "4h", "1d") else 365
+    return max(int(raw), 1)
 
 
 def main() -> int:
-    load_project_env(force=True)
-    days = int(os.environ.get("RANGE_BT_DAYS", "30"))
-    tf = os.environ.get("RANGE_BT_TIMEFRAME", "1h").strip() or "1h"
-    deposit = float(os.environ.get("RANGE_BT_DEPOSIT", os.environ.get("MULTI_BT_DEPOSIT", "300")))
+    load_project_env(force=False)
+    tf = os.environ.get("RANGE_BT_TIMEFRAME", os.environ.get("FORECAST_TIMEFRAME", "1h")).strip() or "1h"
+    days = _resolve_days(tf)
+    deposit = float(os.environ.get("RANGE_BT_DEPOSIT", os.environ.get("MULTI_BT_DEPOSIT", "1000")))
     risk = float(os.environ.get("RANGE_BT_RISK_PCT", os.environ.get("MULTI_BT_RISK_PCT", "0.5")))
     long_only = os.environ.get("RANGE_BT_LONG_ONLY", "0").strip().lower() in ("1", "true", "yes")
 
@@ -40,25 +48,32 @@ def main() -> int:
     else:
         symbols = DEFAULT_SYMBOLS
 
-    min_vol = float(os.environ.get("TREND_MIN_REL_VOLUME", str(DEFAULT_TREND_PARAMS.min_rel_volume)))
-    lookback = int(os.environ.get("TREND_LOOKBACK", str(DEFAULT_TREND_PARAMS.trend_lookback)))
-    min_move = float(os.environ.get("TREND_MIN_MOVE_PCT", str(DEFAULT_TREND_PARAMS.min_trend_move_pct)))
-    trend_params = TrendPullbackParams(
-        require_pullback=False,
-        require_htf_align=False,
-        min_rel_volume=min_vol,
-        trend_lookback=lookback,
-        min_trend_move_pct=min_move,
+    scan_cfg = trend_scan_config_from_env()
+    base = trend_params_from_yaml()
+    # Входы только от уровней с наибольшим числом повторных касаний
+    min_touches = int(os.environ.get("MIN_LEVEL_TOUCHES", "4"))
+    require_max = os.environ.get("REQUIRE_MAX_TOUCHES_SIDE", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+    trend_params = replace(
+        base,
+        min_level_touches=min_touches,
+        require_max_touches_side=require_max,
     )
 
     out_name = os.environ.get(
         "RANGE_BT_OUT",
-        f"range_backtest_filtered50_{days}d{'_long_only' if long_only else ''}.json",
+        f"range_max_touches_{days}d_{tf.replace('/', '-')}{'_long_only' if long_only else ''}.json",
     )
     out_path = Path(__file__).resolve().parent / "data/processed" / out_name
 
     print(
-        f"[range_bt] {len(symbols)} symbols, {days}d {start_s}..{end_s}, {tf}, "
+        f"[range_bt] LEVEL entries, max-repetition only "
+        f"(touches>={min_touches}, max_side={require_max}), "
+        f"{len(symbols)} symbols, {days}d {start_s}..{end_s}, {tf}, "
+        f"stage1>={scan_cfg.stage1_min_score} vol_range>={trend_params.min_rel_volume_range} "
         f"deposit=${deposit} risk={risk}% "
         f"{'long-only ' if long_only else ''}→ {out_path.name}",
         flush=True,
@@ -69,6 +84,7 @@ def main() -> int:
             symbols=symbols,
             timeframe=tf,
             target_trades=0,
+            stage1_min_score=scan_cfg.stage1_min_score,
             trend_params=trend_params,
             long_only=long_only,
             entry_window_start=start_s,
@@ -79,15 +95,27 @@ def main() -> int:
         result_path=out_path,
     )
     if result.get("status") != "done":
-        print(f"[range_bt] failed", flush=True)
+        print("[range_bt] failed", flush=True)
         return 1
 
     s = result["summary"]
     sides = result.get("summary_sides") or {}
+    trades = result.get("trades") or []
+    touch_meta = result.get("touch_stats") or {}
+    touch_vals = [int(t.get("entry_level_touches") or 0) for t in trades if t.get("entry_level_touches") is not None]
+    touch_note = ""
+    if touch_meta:
+        touch_note = (
+            f" touches[med={touch_meta.get('median')} "
+            f"avg={touch_meta.get('avg')} max={touch_meta.get('max')}]"
+        )
+    elif touch_vals:
+        touch_note = f" touches[med={sorted(touch_vals)[len(touch_vals)//2]} max={max(touch_vals)}]"
+    per_mo = round(float(s["trades"]) * 30.0 / max(days, 1), 1)
     print(
-        f"[range_bt] trades={s['trades']} win%={s['win_rate_pct']} "
+        f"[range_bt] trades={s['trades']} (~{per_mo}/mo) win%={s['win_rate_pct']} "
         f"total_R={s['total_r']} PF={s.get('profit_factor')} "
-        f"(long={sides.get('long', 0)} short={sides.get('short', 0)})",
+        f"(long={sides.get('long', 0)} short={sides.get('short', 0)}){touch_note}",
         flush=True,
     )
     print(

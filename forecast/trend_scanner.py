@@ -128,6 +128,23 @@ def trend_params_from_yaml() -> TrendPullbackParams:
             "TREND_BLOCK_ASIAN", bool(y.get("block_asian_session", base.block_asian_session))
         ),
         htf_timeframe=str(y.get("htf_timeframe", base.htf_timeframe)),
+        min_level_touches=env_int(
+            "MIN_LEVEL_TOUCHES",
+            int(y.get("min_level_touches", base.min_level_touches)),
+        ),
+        require_max_touches_side=env_bool(
+            "REQUIRE_MAX_TOUCHES_SIDE",
+            bool(y.get("require_max_touches_side", base.require_max_touches_side)),
+        ),
+        require_with_trend_level=env_bool(
+            "REQUIRE_WITH_TREND_LEVEL",
+            bool(y.get("require_with_trend_level", base.require_with_trend_level)),
+        ),
+        with_trend_level_zone_frac=env_float(
+            "WITH_TREND_LEVEL_ZONE_FRAC",
+            float(y.get("with_trend_level_zone_frac", base.with_trend_level_zone_frac)),
+            positive=True,
+        ),
     )
 
 
@@ -178,13 +195,8 @@ def trend_scan_config_from_env() -> TrendScanConfig:
     )
 
 
-def _btc_regime(ex: ccxt.Exchange) -> str:
-    """
-    Режим BTC на 4h: 'bear' — блок лонгов по альтам, 'bull' — блок шортов.
-    bear: close < EMA200 или 24h return < -2%; bull — зеркально.
-    Конфликт сигналов (например, выше EMA200, но резко падает) => 'neutral'.
-    """
-    df = _fetch_df(ex, BTC_REGIME_SYMBOL, BTC_REGIME_TIMEFRAME, BTC_REGIME_BARS)
+def _btc_regime_from_df(df: pd.DataFrame) -> str:
+    """Режим BTC по уже загруженному 4h DF (последний бар)."""
     if df is None or len(df) < 210:
         return "neutral"
     last = df.iloc[-1]
@@ -205,6 +217,24 @@ def _btc_regime(ex: ccxt.Exchange) -> str:
     if bull:
         return "bull"
     return "neutral"
+
+
+def btc_regime_at(df_btc: pd.DataFrame, as_of: pd.Timestamp) -> str:
+    """BTC regime на момент as_of без lookahead (только закрытые бары ≤ as_of)."""
+    if df_btc is None or df_btc.empty:
+        return "neutral"
+    sub = df_btc[df_btc.index <= as_of]
+    return _btc_regime_from_df(sub)
+
+
+def _btc_regime(ex: ccxt.Exchange) -> str:
+    """
+    Режим BTC на 4h: 'bear' — блок лонгов по альтам, 'bull' — блок шортов.
+    bear: close < EMA200 или 24h return < -2%; bull — зеркально.
+    Конфликт сигналов (например, выше EMA200, но резко падает) => 'neutral'.
+    """
+    df = _fetch_df(ex, BTC_REGIME_SYMBOL, BTC_REGIME_TIMEFRAME, BTC_REGIME_BARS)
+    return _btc_regime_from_df(df)
 
 
 def _resolve_plan(

@@ -52,6 +52,40 @@ def _level_proximity(
     return near_support, near_resistance
 
 
+def count_level_touches(
+    df: pd.DataFrame,
+    level: float,
+    *,
+    lookback: int | None = None,
+    tol_frac: float | None = None,
+    kind: str = "support",
+) -> int:
+    """Сколько раз цена касалась уровня (отдельные касания, не подряд идущие бары)."""
+    if df is None or df.empty or level <= 0:
+        return 0
+    look = min(int(lookback or LEVEL_LOOKBACK), len(df))
+    if look < 3:
+        return 0
+    tail = df.iloc[-look:]
+    atr = float(tail["atr_14"].iloc[-1]) if "atr_14" in tail.columns else 0.0
+    span_tol = max(abs(level) * float(tol_frac or LEVEL_PROXIMITY_FRAC), atr * 0.35, 1e-12)
+    highs = tail["high"].to_numpy(dtype=float)
+    lows = tail["low"].to_numpy(dtype=float)
+    if kind == "resistance":
+        near = np.abs(highs - level) <= span_tol
+    else:
+        near = np.abs(lows - level) <= span_tol
+    touches = 0
+    in_touch = False
+    for flag in near:
+        if flag and not in_touch:
+            touches += 1
+            in_touch = True
+        elif not flag:
+            in_touch = False
+    return int(touches)
+
+
 def _is_tradeable_usdt_spot(sym: str, m: dict[str, Any]) -> bool:
     if not bool(m.get("active", True)):
         return False
@@ -85,6 +119,9 @@ def _stage1_snapshot(df: pd.DataFrame) -> dict[str, Any]:
     atr = max(atr, 1e-9)
 
     near_support, near_resistance = _level_proximity(close, lo_look, hi_look)
+    support_touches = count_level_touches(df, lo_look, lookback=look, kind="support")
+    resistance_touches = count_level_touches(df, hi_look, lookback=look, kind="resistance")
+    max_level_touches = max(support_touches, resistance_touches)
     impulse = abs(float(last.get("ret_24", 0.0))) > 0.025
     squeeze = float(df["range"].iloc[-20:].mean()) < float(df["range"].iloc[-80:].mean()) * 0.7
     retest_breakout = bool(
@@ -127,11 +164,16 @@ def _stage1_snapshot(df: pd.DataFrame) -> dict[str, Any]:
     score += 6.0 if (double_bottom or double_top) else 0.0
     score += 6.0 if (accumulation or breakout_cons) else 0.0
     score += 5.0 if strong_move_to_zone else 0.0
+    # больше повторных касаний уровня → сильнее setup
+    score += min(10.0, 2.0 * float(max_level_touches))
 
     return {
         "trend": trend,
         "near_support": near_support,
         "near_resistance": near_resistance,
+        "support_touches": support_touches,
+        "resistance_touches": resistance_touches,
+        "max_level_touches": max_level_touches,
         "impulse_to_zone": impulse,
         "squeeze_at_level": squeeze,
         "retest_breakout": retest_breakout,

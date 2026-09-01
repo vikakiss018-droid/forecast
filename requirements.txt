@@ -16,6 +16,7 @@ requests
 fastapi
 uvicorn
 python-multipart
+pywebpush
 websockets
 aiohttp
 TA-Lib

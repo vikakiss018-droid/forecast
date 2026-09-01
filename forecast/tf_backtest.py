@@ -245,7 +245,7 @@ def _fetch_df_date_window(
         rows: list[list] = []
         since = since_ms
         params = {"endTime": until_ms}
-        for _ in range(20):
+        for _ in range(500):
             chunk = exchange.fetch_ohlcv(
                 symbol, timeframe, since=since, limit=1000, params=params
             )
@@ -256,6 +256,9 @@ def _fetch_df_date_window(
             if last_ms >= until_ms - tf_ms or len(chunk) < 1000:
                 break
             since = last_ms + 1
+            # защита от бесконечного цикла при дубликатах
+            if len(rows) > 500_000:
+                break
         if not rows:
             return None
         df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])

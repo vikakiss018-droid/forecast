@@ -18,6 +18,7 @@ from pathlib import Path
 import yaml
 
 from .auto_trader import load_auto_trade_config
+from .paper_trading import paper_min_score, record_setups_from_report, update_open_trades
 from .paths import CONFIGS_DIR, load_project_env
 from .scan_cache import save_scan_result
 from .trend_scanner import (
@@ -116,6 +117,18 @@ def main() -> int:
         f"top={n_top} duration_sec={report.get('scan_duration_sec')} saved={path}",
         flush=True,
     )
+
+    # Бумажная симуляция: обновить открытые и открыть новые по score >= порога
+    try:
+        upd = update_open_trades()
+        opened = record_setups_from_report(report)
+        print(
+            f"[paper] checked={upd['checked']} closed={upd['closed']} "
+            f"opened={opened} (score>={paper_min_score()})",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[paper] update failed: {e}", flush=True)
     for row in (report.get("top_setups") or [])[:8]:
         plan = row.get("setup") or {}
         print(

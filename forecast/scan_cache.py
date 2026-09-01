@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .paths import PROCESSED_DATA_DIR, ensure_directories
+
+_log = logging.getLogger(__name__)
 
 DEFAULT_CACHE_PATH = PROCESSED_DATA_DIR / "market_scan_latest.json"
 SCAN_HISTORY_PATH = PROCESSED_DATA_DIR / "scan_history.jsonl"
@@ -28,6 +31,12 @@ def save_scan_result(
     }
     out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     _append_scan_history(payload)
+    try:
+        from .push_alerts import notify_high_score_setups
+
+        notify_high_score_setups(report, updated_at=str(payload.get("updated_at") or ""))
+    except Exception:
+        _log.exception("mobile push after scan failed")
     return out
 
 

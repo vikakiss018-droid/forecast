@@ -80,6 +80,13 @@ class TrendPullbackParams:
     opposite_level_zone_frac: float = LEVEL_PROXIMITY_FRAC
     block_asian_session: bool = False
     asian_session_hours_utc: tuple[int, int] = ASIAN_SESSION_HOURS_UTC
+    # Минимум касаний уровня для range-входа; 0 = выкл. «Наибольшее повторение» —
+    # вход только от стороны с max(support_touches, resistance_touches).
+    min_level_touches: int = 0
+    require_max_touches_side: bool = False
+    # Тренд-вход только у «своего» уровня: long у support, short у resistance.
+    require_with_trend_level: bool = False
+    with_trend_level_zone_frac: float = LEVEL_PROXIMITY_FRAC
 
     def valid(self) -> bool:
         return (
@@ -332,16 +339,28 @@ def build_trend_plan(
     if params.min_atr_pct > 0 and atr_pct < params.min_atr_pct:
         return None
 
+    near_support, near_resistance = _level_proximity(
+        close,
+        support,
+        resistance,
+        zone_frac=params.opposite_level_zone_frac,
+    )
     if params.block_opposite_level:
-        near_support, near_resistance = _level_proximity(
-            close,
-            support,
-            resistance,
-            zone_frac=params.opposite_level_zone_frac,
-        )
         if trend == "up" and near_resistance:
             return None
         if trend == "down" and near_support:
+            return None
+
+    if params.require_with_trend_level:
+        near_s, near_r = _level_proximity(
+            close,
+            support,
+            resistance,
+            zone_frac=params.with_trend_level_zone_frac,
+        )
+        if trend == "up" and not near_s:
+            return None
+        if trend == "down" and not near_r:
             return None
 
     if trend == "up":
@@ -423,6 +442,9 @@ def build_range_plan(
     resistance = float(snap["resistance_level"])
     span = max(resistance - support, 1e-9)
     range_pos = _range_position(close, support, resistance)
+    support_touches = int(snap.get("support_touches", 0) or 0)
+    resistance_touches = int(snap.get("resistance_touches", 0) or 0)
+    max_touches = max(support_touches, resistance_touches)
 
     zone = range_entry_zone_frac()
     if abs(close - support) <= abs(resistance - close):
@@ -431,12 +453,20 @@ def build_range_plan(
         direction = "Long"
         entry = close
         stop = support - 1.2 * atr
+        entry_touches = support_touches
     else:
         if abs(close - resistance) / span >= zone:
             return None
         direction = "Short"
         entry = close
         stop = resistance + 1.2 * atr
+        entry_touches = resistance_touches
+
+    if params.min_level_touches > 0 and entry_touches < int(params.min_level_touches):
+        return None
+    if params.require_max_touches_side and entry_touches < max_touches:
+        # Только от уровня с наибольшим числом повторных касаний
+        return None
 
     if params.require_rejection_candle and not _rejection_candle_confirms(
         last, direction, wick_frac=params.rejection_wick_frac
@@ -475,6 +505,9 @@ def build_range_plan(
         "range_position_pct": round(100.0 * range_pos, 1),
         "trend_support": support,
         "trend_resistance": resistance,
+        "support_touches": support_touches,
+        "resistance_touches": resistance_touches,
+        "entry_level_touches": entry_touches,
         "rel_volume": round(rel_vol, 3),
         "atr_pct": round(atr_pct, 5),
     }

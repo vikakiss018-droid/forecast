@@ -23,6 +23,8 @@ data/liquidity/
 .vscode/
 .DS_Store
 *.swp
+forecast/mobile/node_modules/
+forecast/mobile/.expo/
 
 # Jupyter
 .ipynb_checkpoints/

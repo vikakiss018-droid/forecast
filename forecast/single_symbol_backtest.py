@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -163,6 +163,7 @@ class MultiSymbolBacktestConfig:
     long_only: bool = False
     entry_window_start: str | None = None  # YYYY-MM-DD, UTC
     entry_window_end: str | None = None
+    btc_regime_filter: bool = False
 
 
 @dataclass(frozen=True)
@@ -201,6 +202,8 @@ def _peek_trend_entry(
     trend_params: TrendPullbackParams,
     df_htf: pd.DataFrame | None,
     long_only: bool = False,
+    df_btc: pd.DataFrame | None = None,
+    btc_regime_filter: bool = False,
 ) -> TrendEntryCandidate | None:
     sub = df.iloc[: next_i + 1]
     snap = _stage1_snapshot(sub)
@@ -217,6 +220,16 @@ def _peek_trend_entry(
             return None
         aligned, htf_trend = htf_trend_aligned(df_htf, sub.index[-1], str(plan["trend"]), trend_params)
         if not aligned:
+            return None
+
+    if btc_regime_filter and df_btc is not None:
+        from .trend_scanner import btc_regime_at
+
+        regime = btc_regime_at(df_btc, sub.index[-1])
+        direction = str(plan.get("direction", "")).strip()
+        if regime == "bear" and direction == "Long":
+            return None
+        if regime == "bull" and direction == "Short":
             return None
 
     support = float(plan["trend_support"])
@@ -374,6 +387,9 @@ def _peek_range_entry(
         "atr_pct": plan.get("atr_pct"),
         "trend_support": support,
         "trend_resistance": resistance,
+        "support_touches": plan.get("support_touches"),
+        "resistance_touches": plan.get("resistance_touches"),
+        "entry_level_touches": plan.get("entry_level_touches"),
         "entry_time": str(entry_time),
         "exit_time": str(df.index[exit_i]),
         "entry": entry,
@@ -459,6 +475,8 @@ def backtest_combined_single_symbol(
     long_only: bool = False,
     allow_trend: bool = True,
     allow_range: bool = True,
+    df_btc: pd.DataFrame | None = None,
+    btc_regime_filter: bool = False,
 ) -> list[dict[str, Any]]:
     """Тренд + флет в одном walk-forward (режимы взаимоисключающие на баре)."""
     params = trend_params or DEFAULT_TREND_PARAMS
@@ -488,6 +506,8 @@ def backtest_combined_single_symbol(
                 trend_params=params,
                 df_htf=df_htf,
                 long_only=long_only,
+                df_btc=df_btc,
+                btc_regime_filter=btc_regime_filter,
             )
         if cand is None and allow_range:
             cand = _peek_range_entry(
@@ -559,8 +579,13 @@ def run_combined_multi_symbol_backtest(
             print(f"[combined_bt] skip {symbol}: no data", flush=True)
             continue
         df_htf = None
-        if trend_params.require_htf_align and cfg.timeframe == "1h":
-            df_htf = _fetch_df(exchange, symbol, cfg.htf_timeframe, htf_bars)
+        if trend_params.require_htf_align:
+            if win_start is not None and win_end is not None:
+                df_htf = _fetch_df_date_window(
+                    exchange, symbol, cfg.htf_timeframe, start=win_start, end=win_end
+                )
+            else:
+                df_htf = _fetch_df(exchange, symbol, cfg.htf_timeframe, htf_bars)
             if df_htf is None:
                 print(f"[combined_bt] skip {symbol}: no {cfg.htf_timeframe} data", flush=True)
                 continue
@@ -715,6 +740,20 @@ def run_range_multi_symbol_backtest(
     by_symbol = _aggregate_by_symbol(all_trades)
     long_n = sum(1 for t in all_trades if str(t.get("side")) == "long")
     short_n = len(all_trades) - long_n
+    touch_vals = [
+        int(t["entry_level_touches"])
+        for t in all_trades
+        if t.get("entry_level_touches") is not None
+    ]
+    touch_stats: dict[str, Any] = {}
+    if touch_vals:
+        touch_stats = {
+            "count": len(touch_vals),
+            "min": min(touch_vals),
+            "max": max(touch_vals),
+            "avg": round(float(np.mean(touch_vals)), 2),
+            "median": int(sorted(touch_vals)[len(touch_vals) // 2]),
+        }
 
     payload = {
         "status": "done",
@@ -722,11 +761,16 @@ def run_range_multi_symbol_backtest(
         "entry_style": "range_bounce",
         "long_only": cfg.long_only,
         "rule": (
-            f"флет detect_price_trend=range; отскок от S/R (зона {20}%); "
-            f"rel_volume>={trend_params.min_rel_volume}; stage1>=18; validate_setup RR>=1.5"
+            f"флет detect_price_trend=range; отскок от S/R; "
+            f"min_level_touches>={trend_params.min_level_touches}; "
+            f"require_max_touches_side={trend_params.require_max_touches_side}; "
+            f"rel_volume>={trend_params.min_rel_volume_range}; stage1>={cfg.stage1_min_score}"
             + ("; long only" if cfg.long_only else "")
         ),
         "min_rel_volume": trend_params.min_rel_volume,
+        "min_level_touches": trend_params.min_level_touches,
+        "require_max_touches_side": trend_params.require_max_touches_side,
+        "touch_stats": touch_stats,
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "duration_sec": round(time.perf_counter() - t0, 1),
         "symbols": list(cfg.symbols),
@@ -789,6 +833,8 @@ def backtest_single_symbol(
     trend_params: TrendPullbackParams | None = None,
     df_htf: pd.DataFrame | None = None,
     long_only: bool = False,
+    df_btc: pd.DataFrame | None = None,
+    btc_regime_filter: bool = False,
 ) -> list[dict[str, Any]]:
     # trend_only=False → как live-скан: тренд, иначе range bounce
     if not trend_only:
@@ -807,6 +853,8 @@ def backtest_single_symbol(
             long_only=long_only,
             allow_trend=True,
             allow_range=True,
+            df_btc=df_btc,
+            btc_regime_filter=btc_regime_filter,
         )
 
     params = trend_params or DEFAULT_TREND_PARAMS
@@ -833,6 +881,8 @@ def backtest_single_symbol(
             trend_params=params,
             df_htf=df_htf,
             long_only=long_only,
+            df_btc=df_btc,
+            btc_regime_filter=btc_regime_filter,
         )
         if cand is None:
             next_i += step
@@ -865,24 +915,10 @@ def _effective_trend_params(cfg: MultiSymbolBacktestConfig) -> TrendPullbackPara
     base = cfg.trend_params or DEFAULT_TREND_PARAMS
     if cfg.require_htf_align == base.require_htf_align and cfg.htf_timeframe == base.htf_timeframe:
         return base
-    return TrendPullbackParams(
-        trend_lookback=base.trend_lookback,
-        min_trend_move_pct=base.min_trend_move_pct,
-        rr_target=base.rr_target,
-        tp_target_pct=base.tp_target_pct,
-        require_pullback=base.require_pullback,
-        pullback_lookback=base.pullback_lookback,
-        long_pos_min=base.long_pos_min,
-        long_pos_max=base.long_pos_max,
-        short_pos_min=base.short_pos_min,
-        short_pos_max=base.short_pos_max,
-        min_pullback_from_swing_pct=base.min_pullback_from_swing_pct,
+    return replace(
+        base,
         require_htf_align=cfg.require_htf_align,
         htf_timeframe=cfg.htf_timeframe,
-        min_rel_volume=base.min_rel_volume,
-        min_atr_pct=base.min_atr_pct,
-        block_asian_session=base.block_asian_session,
-        asian_session_hours_utc=base.asian_session_hours_utc,
     )
 
 
@@ -891,6 +927,7 @@ def run_multi_symbol_backtest(
     cfg: MultiSymbolBacktestConfig | None = None,
     deposit_usdt: float = 1000.0,
     risk_pct: float | None = None,
+    result_path: Path | None = None,
 ) -> dict[str, Any]:
     """10 alts, one TF: trend following on historical OHLCV."""
     cfg = cfg or MultiSymbolBacktestConfig()
@@ -933,8 +970,13 @@ def run_multi_symbol_backtest(
             print(f"[multi_bt] skip {symbol}: no data", flush=True)
             continue
         df_htf = None
-        if trend_params.require_htf_align and cfg.timeframe == "1h":
-            df_htf = _fetch_df(exchange, symbol, cfg.htf_timeframe, htf_bars)
+        if trend_params.require_htf_align:
+            if win_start is not None and win_end is not None:
+                df_htf = _fetch_df_date_window(
+                    exchange, symbol, cfg.htf_timeframe, start=win_start, end=win_end
+                )
+            else:
+                df_htf = _fetch_df(exchange, symbol, cfg.htf_timeframe, htf_bars)
             if df_htf is None:
                 print(f"[multi_bt] skip {symbol}: no {cfg.htf_timeframe} data", flush=True)
                 continue
@@ -950,6 +992,8 @@ def run_multi_symbol_backtest(
             trend_params=trend_params,
             df_htf=df_htf,
             long_only=cfg.long_only,
+            df_btc=None,
+            btc_regime_filter=cfg.btc_regime_filter,
         )
         all_trades.extend(sym_trades)
         print(f"[multi_bt] {symbol}: +{len(sym_trades)} (total {len(all_trades)})", flush=True)
@@ -965,8 +1009,13 @@ def run_multi_symbol_backtest(
             if df is None:
                 continue
             df_htf = None
-            if trend_params.require_htf_align and cfg.timeframe == "1h":
-                df_htf = _fetch_df(exchange, symbol, cfg.htf_timeframe, htf_bars)
+            if trend_params.require_htf_align:
+                if win_start is not None and win_end is not None:
+                    df_htf = _fetch_df_date_window(
+                        exchange, symbol, cfg.htf_timeframe, start=win_start, end=win_end
+                    )
+                else:
+                    df_htf = _fetch_df(exchange, symbol, cfg.htf_timeframe, htf_bars)
                 if df_htf is None:
                     continue
             need = UNLIMITED_TARGET_TRADES if unlimited else cfg.target_trades - len(all_trades)
@@ -981,6 +1030,8 @@ def run_multi_symbol_backtest(
                 trend_params=trend_params,
                 df_htf=df_htf,
                 long_only=cfg.long_only,
+                df_btc=None,
+                btc_regime_filter=cfg.btc_regime_filter,
             )
             seen = {(t["symbol"], t["entry_time"]) for t in all_trades}
             for t in extra:
@@ -1012,16 +1063,23 @@ def run_multi_symbol_backtest(
     stats["target_reached"] = unlimited or len(all_trades) >= cfg.target_trades
     stats["unlimited_trades"] = unlimited
     by_symbol = _aggregate_by_symbol(all_trades)
+    long_n = sum(1 for t in all_trades if str(t.get("side")) == "long")
+    short_n = len(all_trades) - long_n
 
     payload = {
         "status": "done",
         "mode": "trend_momentum",
         "entry_style": "momentum",
         "long_only": cfg.long_only,
+        "require_with_trend_level": trend_params.require_with_trend_level,
         "rule": (
-            f"1h тренд 60/0.8%; импульс; rel_volume>={trend_params.min_rel_volume}; "
+            f"{cfg.timeframe} тренд; импульс; rel_volume>={trend_params.min_rel_volume}; "
             f"TP={trend_params.tp_target_pct * 100:.0f}% от входа; "
-            "без swing / отката / 4h / блока уровня; "
+            + (
+                "вход только у своего уровня (long@S / short@R); "
+                if trend_params.require_with_trend_level
+                else "без обязательного уровня; "
+            )
             + (
                 f"без входов {trend_params.asian_session_hours_utc[0]:02d}-"
                 f"{trend_params.asian_session_hours_utc[1]:02d} UTC"
@@ -1046,9 +1104,10 @@ def run_multi_symbol_backtest(
         "target_trades": cfg.target_trades,
         "unlimited_trades": unlimited,
         "summary": stats,
+        "summary_sides": {"long": long_n, "short": short_n},
         "by_symbol": by_symbol,
         "note": (
-            f"{len(cfg.symbols)} монет, TF {cfg.timeframe}, импульсный вход (DEFAULT_TREND_PARAMS), без kNN. "
+            f"{len(cfg.symbols)} монет, TF {cfg.timeframe}, импульсный вход, без kNN. "
             + ("Все сигналы за окно bars (без лимита сделок). " if unlimited else "")
             + "Прибыль USDT = total_R × (депозит × risk%)."
         ),
@@ -1056,7 +1115,9 @@ def run_multi_symbol_backtest(
         "trades_sample_note": "последние 30 сделок в JSON",
     }
     ensure_directories()
-    MULTI_RESULT_PATH.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    out = result_path or MULTI_RESULT_PATH
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     return payload
 
 

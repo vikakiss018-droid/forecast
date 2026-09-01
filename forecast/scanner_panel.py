@@ -467,10 +467,13 @@ def _pnl_class(v: float | None) -> str:
 def _dashboard_tabs(*, active: str, base_q: str) -> str:
     scan_cls = "tab active" if active == "scan" else "tab"
     pairs_cls = "tab active" if active == "pairs" else "tab"
+    paper_cls = "tab active" if active == "paper" else "tab"
     return f"""
     <nav class="dash-tabs">
       <a class="{scan_cls}" href="/scanner?{base_q}">Сканер</a>
       <a class="{pairs_cls}" href="/scanner/pairs">Тест пар</a>
+      <a class="{paper_cls}" href="/paper">Симуляция</a>
+      <a class="tab" href="/scanner?mobile=1">Телефон</a>
     </nav>"""
 
 

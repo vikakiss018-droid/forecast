@@ -10,8 +10,8 @@ from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
-from fastapi import BackgroundTasks, FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 
 from .main import load_config, run_pipeline
 from .paths import CONFIGS_DIR, load_project_env
@@ -63,11 +63,31 @@ from .run_symbol_ranking import (
 )
 from .env_config import SETTINGS_META, update_env_values
 from .panel_auth import PANEL_AUTH_DEPS
+from .paper_panel import render_paper_dashboard
+from .paper_trading import (
+    load_paper_state,
+    paper_summary,
+    record_setups_from_report,
+    update_open_trades,
+)
 from .scanner_panel import (
     render_pair_ranking_dashboard,
     render_scanner_dashboard,
 )
 from .trade_gate import GateMode, TradeGateConfig, evaluate_trade_gate
+from .mobile_app import (
+    mobile_icon_file,
+    mobile_manifest_json,
+    render_mobile_app,
+    setups_payload,
+)
+from .push_alerts import (
+    delete_expo_push_token,
+    delete_push_subscription,
+    get_vapid_public_key,
+    save_expo_push_token,
+    save_push_subscription,
+)
 
 
 load_project_env()
@@ -393,10 +413,156 @@ def _on_startup() -> None:
     loop.create_task(start_orderbook_stream(legacy_symbols))
 
 
+def _is_phone_request(
+    request: Request,
+    *,
+    mobile: str | None = None,
+    desktop: str | None = None,
+) -> bool:
+    if str(desktop or "") == "1":
+        return False
+    if str(mobile or "") == "1":
+        return True
+    ua = (request.headers.get("user-agent") or "").lower()
+    return any(tok in ua for tok in ("iphone", "ipad", "android", "ipod", "windows phone", "mobile"))
+
+
 @app.get("/", dependencies=PANEL_AUTH_DEPS)
-def index_redirect():
-    """Main dashboard: scanner."""
+def index_redirect(request: Request):
+    """Phone opens the mobile app; desktop goes to the scanner."""
+    if _is_phone_request(request):
+        return HTMLResponse(render_mobile_app())
     return RedirectResponse(url="/scanner", status_code=302)
+
+
+def _mobile_icon_response(name: str) -> FileResponse:
+    path = mobile_icon_file(name)
+    if path is None:
+        raise HTTPException(status_code=404, detail="icon not found")
+    return FileResponse(path, media_type="image/png")
+
+
+def _service_worker_response(*, allowed: str) -> Response:
+    path = mobile_icon_file("sw.js")
+    if path is None:
+        raise HTTPException(status_code=404, detail="sw not found")
+    return Response(
+        content=path.read_text(encoding="utf-8"),
+        media_type="application/javascript",
+        headers={"Service-Worker-Allowed": allowed, "Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/m", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
+@app.get("/m/", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
+@app.get("/mobile", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
+@app.get("/app", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
+def mobile_app_page() -> str:
+    """Телефон: выгодные позиции и уведомления при score > порога."""
+    return render_mobile_app()
+
+
+@app.get("/sw.js")
+def mobile_service_worker_root() -> Response:
+    return _service_worker_response(allowed="/")
+
+
+@app.get("/manifest.webmanifest")
+def mobile_manifest_root() -> Response:
+    return Response(content=mobile_manifest_json(), media_type="application/manifest+json")
+
+
+@app.get("/apple-touch-icon.png")
+def apple_touch_icon_root() -> FileResponse:
+    return _mobile_icon_response("apple-touch-icon.png")
+
+
+@app.get("/favicon.ico")
+def favicon_root() -> FileResponse:
+    return _mobile_icon_response("icon-192.png")
+
+
+@app.get("/m/manifest.webmanifest")
+def mobile_manifest() -> Response:
+    return Response(content=mobile_manifest_json(), media_type="application/manifest+json")
+
+
+@app.get("/m/sw.js")
+def mobile_service_worker() -> Response:
+    return _service_worker_response(allowed="/")
+
+
+@app.get("/m/icon-192.png")
+def mobile_icon_192() -> FileResponse:
+    return _mobile_icon_response("icon-192.png")
+
+
+@app.get("/m/icon-512.png")
+def mobile_icon_512() -> FileResponse:
+    return _mobile_icon_response("icon-512.png")
+
+
+@app.get("/m/icon-maskable-512.png")
+def mobile_icon_maskable() -> FileResponse:
+    return _mobile_icon_response("icon-maskable-512.png")
+
+
+@app.get("/m/apple-touch-icon.png")
+def mobile_apple_touch_icon() -> FileResponse:
+    return _mobile_icon_response("apple-touch-icon.png")
+
+
+@app.get("/m/api/setups", dependencies=PANEL_AUTH_DEPS)
+def mobile_setups() -> dict:
+    return setups_payload()
+
+
+@app.get("/m/api/vapid", dependencies=PANEL_AUTH_DEPS)
+def mobile_vapid() -> dict:
+    return {"publicKey": get_vapid_public_key()}
+
+
+@app.post("/m/api/push/subscribe", dependencies=PANEL_AUTH_DEPS)
+async def mobile_push_subscribe(request: Request) -> dict:
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="ожидался JSON подписки")
+    save_push_subscription(body)
+    return {"ok": True}
+
+
+@app.post("/m/api/push/unsubscribe", dependencies=PANEL_AUTH_DEPS)
+async def mobile_push_unsubscribe(request: Request) -> dict:
+    body = await request.json()
+    endpoint = ""
+    if isinstance(body, dict):
+        endpoint = str(body.get("endpoint") or "")
+    delete_push_subscription(endpoint)
+    return {"ok": True}
+
+
+@app.post("/m/api/expo/register", dependencies=PANEL_AUTH_DEPS)
+async def mobile_expo_register(request: Request) -> dict:
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="ожидался JSON")
+    token = str(body.get("token") or "").strip()
+    platform = str(body.get("platform") or "").strip()
+    try:
+        save_expo_push_token(token, platform=platform)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True}
+
+
+@app.post("/m/api/expo/unregister", dependencies=PANEL_AUTH_DEPS)
+async def mobile_expo_unregister(request: Request) -> dict:
+    body = await request.json()
+    token = ""
+    if isinstance(body, dict):
+        token = str(body.get("token") or "")
+    delete_expo_push_token(token)
+    return {"ok": True}
 
 
 @app.get("/legacy", response_class=HTMLResponse)
@@ -1342,6 +1508,11 @@ def _run_live_scan_background(
                 "candidates_found": rep.get("candidates_found"),
             }
         )
+        try:
+            update_open_trades()
+            record_setups_from_report(rep)
+        except Exception:
+            _log.exception("paper trading update after live scan failed")
     except Exception as e:
         save_scan_progress(
             {
@@ -1533,6 +1704,7 @@ async def live_scan_run(request: Request, background_tasks: BackgroundTasks) -> 
 
 @app.get("/scanner", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
 def scanner_panel(
+    request: Request,
     top: int = 20,
     bars: int = 1000,
     timeframe: str = "1h",
@@ -1544,9 +1716,13 @@ def scanner_panel(
     error: str | None = None,
     scan_started: str | None = None,
     scan_busy: str | None = None,
+    mobile: str | None = None,
+    desktop: str | None = None,
 ) -> str:
     """Dashboard: тренд-скан 50 пар, лучший сетап (без автоторговли)."""
     _ = tab  # legacy query param
+    if _is_phone_request(request, mobile=mobile, desktop=desktop):
+        return render_mobile_app()
     saved_msg = None
     if saved == "1":
         saved_msg = "Настройки сохранены в .env"
@@ -1581,4 +1757,33 @@ def scanner_panel(
         saved_msg=saved_msg,
         scan_watch=scan_watch,
     )
+
+
+@app.get("/paper", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
+def paper_dashboard(updated: str | None = None, error: str | None = None) -> str:
+    """Отдельное окно: симуляция сделок по сетапам score >= порога."""
+    msg = None
+    if updated == "1":
+        msg = "Цены обновлены"
+    elif error:
+        msg = f"Ошибка обновления: {error}"
+    state = load_paper_state()
+    return render_paper_dashboard(state=state, summary=paper_summary(state), msg=msg)
+
+
+@app.get("/paper/json", dependencies=PANEL_AUTH_DEPS)
+def paper_json() -> dict[str, Any]:
+    state = load_paper_state()
+    return {"summary": paper_summary(state), "trades": state.get("trades") or []}
+
+
+@app.post("/paper/update", dependencies=PANEL_AUTH_DEPS)
+def paper_update() -> RedirectResponse:
+    """Принудительно обновить открытые симуляции по текущим ценам."""
+    try:
+        update_open_trades()
+    except Exception as e:
+        _log.exception("paper update failed")
+        return RedirectResponse(url=f"/paper?error={quote(str(e), safe='')}", status_code=303)
+    return RedirectResponse(url="/paper?updated=1", status_code=303)
 
