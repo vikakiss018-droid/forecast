@@ -26,8 +26,6 @@ forecast/data/
 *.swp
 forecast/mobile/node_modules/
 forecast/mobile/.expo/
-forecast/cs_market_scanner/.venv/
-forecast/cs_market_scanner/data/
 
 # Jupyter
 .ipynb_checkpoints/
