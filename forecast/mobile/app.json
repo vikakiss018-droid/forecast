@@ -1,0 +1,50 @@
+{
+  "expo": {
+    "name": "Forecast",
+    "slug": "forecast-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "scheme": "forecast",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#140a18"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.forecast.scanner",
+      "infoPlist": {
+        "UIBackgroundModes": ["remote-notification"],
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true
+        }
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#140a18"
+      },
+      "package": "com.forecast.scanner",
+      "permissions": ["RECEIVE_BOOT_COMPLETED", "VIBRATE"],
+      "usesCleartextTraffic": true
+    },
+    "plugins": [
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/icon.png",
+          "color": "#ff9ecf"
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "00000000-0000-0000-0000-000000000000"
+      }
+    }
+  }
+}
