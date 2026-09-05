@@ -108,6 +108,7 @@ def render_stocks_dashboard(
         _progress_poll_script(
             json_url="/stocks/progress/json",
             reload_on_done=True,
+            reload_url="/stocks",
         )
         if scan_watch
         else ""

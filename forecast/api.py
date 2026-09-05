@@ -1739,7 +1739,9 @@ def scanner_panel(
     elif scan_busy == "1":
         saved_msg = "Скан уже выполняется"
 
-    scan_watch = scan_started == "1" or load_scan_progress().get("status") == "running"
+    prog = load_scan_progress()
+    st = str(prog.get("status") or "idle")
+    scan_watch = st == "running" or (scan_started == "1" and st not in ("done", "error"))
 
     rep, updated_at, from_cache = _scanner_report(
         top=top,
@@ -1808,7 +1810,10 @@ def stocks_dashboard(
         msg = "Скан акций уже выполняется"
     elif error:
         msg = f"Ошибка: {error}"
-    scan_watch = scan_started == "1" or load_stocks_progress().get("status") == "running"
+    prog = load_stocks_progress()
+    st = str(prog.get("status") or "idle")
+    # Не держим watch на ?scan_started=1 после done — иначе бесконечная перезагрузка
+    scan_watch = st == "running" or (scan_started == "1" and st not in ("done", "error"))
     return render_stocks_dashboard(
         cached=load_stocks_scan(),
         scan_watch=scan_watch,

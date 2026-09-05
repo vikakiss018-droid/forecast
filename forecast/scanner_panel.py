@@ -508,13 +508,21 @@ def _progress_poll_script(
     *,
     json_url: str,
     reload_on_done: bool = True,
+    reload_url: str | None = None,
     bar_id: str = "scan-progress-bar",
     label_id: str = "scan-progress-label",
     detail_id: str = "scan-progress-detail",
     panel_id: str = "progress-panel",
     interval_ms: int = 2500,
 ) -> str:
-    reload_js = "window.location.reload();" if reload_on_done else ""
+    # replace на чистый URL — иначе ?scan_started=1 остаётся и страница крутится вечно
+    if reload_on_done:
+        if reload_url:
+            reload_js = f"window.location.replace({json.dumps(reload_url)});"
+        else:
+            reload_js = "window.location.replace(window.location.pathname);"
+    else:
+        reload_js = ""
     url_js = json.dumps(json_url)
     return f"""
   <script>
@@ -526,8 +534,10 @@ def _progress_poll_script(
     const detail = document.getElementById({json.dumps(detail_id)});
     const pctEl = document.getElementById('progress-pct');
     if (!panel) return;
+    let finished = false;
 
     async function tick() {{
+      if (finished) return;
       try {{
         const r = await fetch(url, {{ credentials: 'same-origin' }});
         const d = await r.json();
@@ -541,11 +551,12 @@ def _progress_poll_script(
           panel.style.display = 'flex';
           if (bar) bar.style.width = pct + '%';
           if (pctEl) pctEl.textContent = pct + '%';
-          if (label) label.textContent = d.kind === 'pair_test' ? 'Тест пар…' : 'Live-скан…';
+          if (label) label.textContent = d.kind === 'pair_test' ? 'Тест пар…' : (d.kind === 'stocks_scan' ? 'Скан акций…' : 'Live-скан…');
           if (detail) detail.textContent = cur + ' / ' + tot + ' · ' + sym;
           return;
         }}
         if (st === 'done') {{
+          finished = true;
           if (bar) bar.style.width = '100%';
           if (pctEl) pctEl.textContent = '100%';
           if (detail) detail.textContent = 'Готово';
@@ -553,6 +564,7 @@ def _progress_poll_script(
           return;
         }}
         if (st === 'error') {{
+          finished = true;
           panel.style.display = 'flex';
           if (label) label.textContent = 'Ошибка';
           if (detail) detail.textContent = d.error || 'unknown';
@@ -727,6 +739,7 @@ def render_pair_ranking_dashboard(
         poll_script = _progress_poll_script(
             json_url="/scanner/pairs/json",
             reload_on_done=True,
+            reload_url="/scanner/pairs",
             bar_id="pair-progress-bar",
             label_id="pair-progress-label",
             detail_id="pair-progress-detail",
@@ -930,7 +943,11 @@ def render_scanner_dashboard(
     live_pairs = len(load_filtered_symbols())
     scan_poll = ""
     if scan_watch:
-        scan_poll = _progress_poll_script(json_url="/scanner/progress/json", reload_on_done=True)
+        scan_poll = _progress_poll_script(
+            json_url="/scanner/progress/json",
+            reload_on_done=True,
+            reload_url=refresh_url,
+        )
 
     status_scan = _badge("Кэш" if from_cache else "Live", "ok" if from_cache else "warn")
     sym_scanned = int(report.get("symbols_scanned") or report.get("universe_size") or 0)
