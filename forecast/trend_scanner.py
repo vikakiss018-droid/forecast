@@ -68,6 +68,7 @@ class TrendScanConfig:
     allow_trend: bool = True
     allow_range: bool = True
     btc_regime_filter: bool = True
+    min_bars: int = 280  # минимум закрытых баров; для молодых bStocks можно снизить
 
 
 def _resolve_scan_symbols(scan_cfg: TrendScanConfig) -> tuple[str, ...]:
@@ -308,7 +309,8 @@ def scan_combined_setups(
             continue
 
         work = df_closed_only(df) if scan_cfg.use_closed_bar_only else df
-        if len(work) < 280:
+        min_bars = max(80, int(scan_cfg.min_bars or 280))
+        if len(work) < min_bars:
             skipped.append(symbol)
             continue
 

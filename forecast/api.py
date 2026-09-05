@@ -70,6 +70,12 @@ from .paper_trading import (
     record_setups_from_report,
     update_open_trades,
 )
+from .stocks_panel import render_stocks_dashboard
+from .stocks_scanner import (
+    load_stocks_progress,
+    load_stocks_scan,
+    run_stocks_scan_background,
+)
 from .scanner_panel import (
     render_pair_ranking_dashboard,
     render_scanner_dashboard,
@@ -1786,4 +1792,52 @@ def paper_update() -> RedirectResponse:
         _log.exception("paper update failed")
         return RedirectResponse(url=f"/paper?error={quote(str(e), safe='')}", status_code=303)
     return RedirectResponse(url="/paper?updated=1", status_code=303)
+
+
+@app.get("/stocks", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
+def stocks_dashboard(
+    scan_started: str | None = None,
+    scan_busy: str | None = None,
+    error: str | None = None,
+) -> str:
+    """Лучшие входы по токенизированным акциям Binance (bStocks)."""
+    msg = None
+    if scan_started == "1":
+        msg = "Скан акций запущен — смотрите прогресс ниже"
+    elif scan_busy == "1":
+        msg = "Скан акций уже выполняется"
+    elif error:
+        msg = f"Ошибка: {error}"
+    scan_watch = scan_started == "1" or load_stocks_progress().get("status") == "running"
+    return render_stocks_dashboard(
+        cached=load_stocks_scan(),
+        scan_watch=scan_watch,
+        msg=msg,
+    )
+
+
+@app.get("/stocks/json", dependencies=PANEL_AUTH_DEPS)
+def stocks_json() -> dict[str, Any]:
+    data = load_stocks_scan() or {}
+    return {
+        "updated_at": data.get("updated_at"),
+        "universe_count": data.get("universe_count"),
+        "scan_config": data.get("scan_config") or {},
+        "report": data.get("report") or {},
+        "universe": data.get("universe") or [],
+    }
+
+
+@app.get("/stocks/progress/json", dependencies=PANEL_AUTH_DEPS)
+def stocks_progress_json() -> dict[str, Any]:
+    return load_stocks_progress()
+
+
+@app.post("/stocks/run", dependencies=PANEL_AUTH_DEPS)
+async def stocks_run(background_tasks: BackgroundTasks) -> RedirectResponse:
+    cur = load_stocks_progress()
+    if cur.get("status") == "running":
+        return RedirectResponse(url="/stocks?scan_busy=1", status_code=303)
+    background_tasks.add_task(run_stocks_scan_background)
+    return RedirectResponse(url="/stocks?scan_started=1", status_code=303)
 
