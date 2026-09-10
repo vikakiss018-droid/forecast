@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 import ccxt
 
+from .bstocks import without_bstocks
 from .paths import PROCESSED_DATA_DIR, ensure_directories, load_project_env
 from .single_symbol_backtest import _aggregate_by_symbol, backtest_combined_single_symbol
 from .auto_trader import load_auto_trade_config, apply_scan_auto_filters
@@ -470,7 +471,7 @@ def load_filtered_symbols() -> tuple[str, ...]:
     data = load_symbol_ranking_filtered()
     if data.get("status") != "done":
         return ()
-    return tuple(str(s) for s in data.get("symbols") or [])
+    return tuple(without_bstocks(str(s) for s in data.get("symbols") or []))
 
 
 if __name__ == "__main__":

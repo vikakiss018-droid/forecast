@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 MSK = ZoneInfo("Europe/Moscow")
 
+from .bstocks import is_bstock_symbol
 from .env_config import get_settings_for_panel
 from .run_symbol_ranking import load_filtered_symbols, ranking_config_from_env
 
@@ -410,8 +411,13 @@ def _setup_rows(setups: list[dict[str, Any]]) -> str:
 
 
 def _scan_history_rows(items: list[dict[str, Any]]) -> str:
+    items = [
+        h
+        for h in items
+        if not is_bstock_symbol(str((h.get("top") or {}).get("symbol") or ""))
+    ]
     if not items:
-        return '<tr><td colspan="6" class="empty-cell">История появится после нескольких сканов (каждые 5 мин)</td></tr>'
+        return '<tr><td colspan="6" class="empty-cell">История появится после нескольких сканов (каждые 15 мин)</td></tr>'
     rows = []
     for h in items:
         top = h.get("top") or {}
@@ -913,7 +919,10 @@ def _settings_form_html(*, return_q: str, saved_msg: str | None = None) -> str:
     return f"""
     <section class="settings-section">
       <h2>Настройки сканера (.env)</h2>
-      <p class="settings-hint">Ключи Binance и пароль панели — только в .env на сервере. После сохранения применяются сразу.</p>
+      <p class="settings-hint">
+        Live-скан повторяется по интервалу ниже (300 сек = 5 мин, 0 = только кнопка).
+        Плановый кэш на сервере — каждые 15 минут. Ключи Binance и пароль панели — только в .env на сервере.
+      </p>
       {banner}
       <form method="post" action="/scanner/settings" class="settings-form">
         <input type="hidden" name="return_q" value="{_e(return_q)}" />

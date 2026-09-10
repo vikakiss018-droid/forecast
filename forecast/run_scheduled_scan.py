@@ -1,7 +1,7 @@
 """
 Основной цикл: тренд + флет на 1h по 50 парам (symbol_ranking_filtered_r05_win50.json).
 
-Запуск (cron / systemd каждые 5 мин, :03/:08/:13/… UTC):
+Запуск (cron / systemd каждые 15 мин, :03/:18/:33/:48 UTC):
   python -m forecast.run_scheduled_scan
 
 Параметры: configs/config.yaml → trend_scan (+ фильтры из auto_trade для validate_setup)

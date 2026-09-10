@@ -16,6 +16,7 @@ from typing import Any
 import ccxt
 
 from .auto_trader import load_auto_trade_config
+from .bstocks import is_bstock_base
 from .paths import CONFIGS_DIR, PROCESSED_DATA_DIR, ensure_directories
 from .trend_scanner import TrendScanConfig, scan_combined_setups, trend_params_from_yaml
 
@@ -23,30 +24,6 @@ _log = logging.getLogger(__name__)
 
 STOCKS_CACHE_PATH = PROCESSED_DATA_DIR / "stocks_scan_latest.json"
 STOCKS_PROGRESS_PATH = PROCESSED_DATA_DIR / "stocks_scan_progress.json"
-
-# Известные крипто-базы / не-акции, которые заканчиваются на B
-_CRYPTO_FALSE_POSITIVES = frozenset(
-    {
-        "SHIB",
-        "BNB",
-        "ARB",
-        "WBTC",
-        "HBTC",
-        "OBTC",
-        "CBETH",
-        "TBTC",
-        "CKB",
-        "DGB",
-        "TRB",
-        "QNTB",  # Quant (крипто), не акция
-        "BB",  # BounceBit
-        "BEB",
-        "GSB",
-        "YB",
-        "SMHB",
-        "STXB",
-    }
-)
 
 # Человекочитаемые имена (базовый тикер без суффикса B)
 _STOCK_NAMES: dict[str, str] = {
@@ -115,19 +92,6 @@ def stock_display_name(symbol: str) -> str:
     if name:
         return f"{name} · {ticker}"
     return ticker
-
-
-def is_bstock_base(base: str) -> bool:
-    b = (base or "").upper()
-    if b in _CRYPTO_FALSE_POSITIVES or not b.endswith("B"):
-        return False
-    ticker = b[:-1]
-    # Тикеры акций обычно 2–5 букв
-    if not (2 <= len(ticker) <= 5 and ticker.isalpha()):
-        return False
-    if ticker in _CRYPTO_FALSE_POSITIVES:
-        return False
-    return True
 
 
 def discover_bstock_symbols(

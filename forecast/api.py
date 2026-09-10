@@ -61,7 +61,7 @@ from .run_symbol_ranking import (
     ranking_config_from_env,
     run_symbol_ranking_background,
 )
-from .env_config import SETTINGS_META, update_env_values
+from .env_config import SETTINGS_META, live_scan_interval_sec, update_env_values
 from .panel_auth import PANEL_AUTH_DEPS
 from .paper_panel import render_paper_dashboard
 from .paper_trading import (
@@ -90,6 +90,7 @@ from .trade_gate import GateMode, TradeGateConfig, evaluate_trade_gate
 from .mobile_app import (
     mobile_icon_file,
     mobile_manifest_json,
+    pairs_payload,
     render_mobile_app,
     setups_payload,
 )
@@ -423,6 +424,32 @@ def _on_startup() -> None:
         "XRPUSDT", "PEPEUSDT", "DOGEUSDT", "LINKUSDT",
     ]
     loop.create_task(start_orderbook_stream(legacy_symbols))
+    loop.create_task(_live_scan_loop())
+
+
+async def _live_scan_loop() -> None:
+    """Авто live-скан панели. Интервал из настроек LIVE_SCAN_INTERVAL_SEC (0 = выкл)."""
+    await asyncio.sleep(20)
+    while True:
+        interval = live_scan_interval_sec()
+        if interval <= 0:
+            await asyncio.sleep(30)
+            continue
+        try:
+            cur = load_scan_progress()
+            if str(cur.get("status") or "") != "running":
+                cfg = trend_scan_config_from_env()
+                await asyncio.to_thread(
+                    _run_live_scan_background,
+                    top=int(cfg.top_n),
+                    bars=int(cfg.bars or 1000),
+                    timeframe=str(cfg.timeframe),
+                    stage1_min_score=float(cfg.stage1_min_score),
+                )
+        except Exception:
+            _log.exception("scheduled live scan failed")
+        nxt = live_scan_interval_sec()
+        await asyncio.sleep(nxt if nxt > 0 else 30)
 
 
 def _is_phone_request(
@@ -439,11 +466,23 @@ def _is_phone_request(
     return any(tok in ua for tok in ("iphone", "ipad", "android", "ipod", "windows phone", "mobile"))
 
 
+def _phone_app(
+    request: Request,
+    *,
+    tab: str,
+    mobile: str | None = None,
+    desktop: str | None = None,
+) -> str | None:
+    if _is_phone_request(request, mobile=mobile, desktop=desktop):
+        return render_mobile_app(tab=tab)
+    return None
+
+
 @app.get("/", dependencies=PANEL_AUTH_DEPS)
 def index_redirect(request: Request):
     """Phone opens the mobile app; desktop goes to the scanner."""
     if _is_phone_request(request):
-        return HTMLResponse(render_mobile_app())
+        return HTMLResponse(render_mobile_app(tab="scan"))
     return RedirectResponse(url="/scanner", status_code=302)
 
 
@@ -470,8 +509,8 @@ def _service_worker_response(*, allowed: str) -> Response:
 @app.get("/mobile", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
 @app.get("/app", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
 def mobile_app_page() -> str:
-    """Телефон: выгодные позиции и уведомления при score > порога."""
-    return render_mobile_app()
+    """Телефон: все окна панели в мобильном UI."""
+    return render_mobile_app(tab="scan")
 
 
 @app.get("/sw.js")
@@ -527,6 +566,11 @@ def mobile_apple_touch_icon() -> FileResponse:
 @app.get("/m/api/setups", dependencies=PANEL_AUTH_DEPS)
 def mobile_setups() -> dict:
     return setups_payload()
+
+
+@app.get("/m/api/pairs", dependencies=PANEL_AUTH_DEPS)
+def mobile_pairs() -> dict:
+    return pairs_payload()
 
 
 @app.get("/m/api/vapid", dependencies=PANEL_AUTH_DEPS)
@@ -1609,12 +1653,18 @@ async def save_scanner_settings(request: Request) -> RedirectResponse:
 
 @app.get("/scanner/pairs", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
 def pair_ranking_panel(
+    request: Request,
     approved: str | None = None,
     started: str | None = None,
     busy: str | None = None,
     error: str | None = None,
+    mobile: str | None = None,
+    desktop: str | None = None,
 ) -> str:
     """Тест 400 пар + утверждение списка для live-скана."""
+    phone = _phone_app(request, tab="pairs", mobile=mobile, desktop=desktop)
+    if phone is not None:
+        return phone
     msg = None
     err = error
     if approved == "1":
@@ -1734,7 +1784,7 @@ def scanner_panel(
     """Dashboard: тренд-скан 50 пар, лучший сетап (без автоторговли)."""
     _ = tab  # legacy query param
     if _is_phone_request(request, mobile=mobile, desktop=desktop):
-        return render_mobile_app()
+        return render_mobile_app(tab="scan")
     saved_msg = None
     if saved == "1":
         saved_msg = "Настройки сохранены в .env"
@@ -1774,8 +1824,17 @@ def scanner_panel(
 
 
 @app.get("/paper", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
-def paper_dashboard(updated: str | None = None, error: str | None = None) -> str:
+def paper_dashboard(
+    request: Request,
+    updated: str | None = None,
+    error: str | None = None,
+    mobile: str | None = None,
+    desktop: str | None = None,
+) -> str:
     """Отдельное окно: симуляция сделок по сетапам score >= порога."""
+    phone = _phone_app(request, tab="paper", mobile=mobile, desktop=desktop)
+    if phone is not None:
+        return phone
     msg = None
     if updated == "1":
         msg = "Цены обновлены"
@@ -1804,11 +1863,17 @@ def paper_update() -> RedirectResponse:
 
 @app.get("/stocks", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
 def stocks_dashboard(
+    request: Request,
     scan_started: str | None = None,
     scan_busy: str | None = None,
     error: str | None = None,
+    mobile: str | None = None,
+    desktop: str | None = None,
 ) -> str:
     """Лучшие входы по токенизированным акциям Binance (bStocks)."""
+    phone = _phone_app(request, tab="stocks", mobile=mobile, desktop=desktop)
+    if phone is not None:
+        return phone
     msg = None
     if scan_started == "1":
         msg = "Скан акций запущен — смотрите прогресс ниже"
@@ -1855,11 +1920,17 @@ async def stocks_run(background_tasks: BackgroundTasks) -> RedirectResponse:
 
 @app.get("/swing", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
 def swing_dashboard(
+    request: Request,
     scan_started: str | None = None,
     scan_busy: str | None = None,
     error: str | None = None,
+    mobile: str | None = None,
+    desktop: str | None = None,
 ) -> str:
     """Лучшие входы на среднесрок (неделя–месяц), ликвидные majors, дневной график."""
+    phone = _phone_app(request, tab="swing", mobile=mobile, desktop=desktop)
+    if phone is not None:
+        return phone
     msg = None
     if scan_started == "1":
         msg = "Скан среднесрока запущен — смотрите прогресс ниже"

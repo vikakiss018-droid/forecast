@@ -1,5 +1,5 @@
 /* Forecast mobile PWA — notifications when score > threshold */
-const CACHE = "forecast-m-v1";
+const CACHE = "forecast-m-v2";
 
 self.addEventListener("install", (event) => {
   event.waitUntil(self.skipWaiting());

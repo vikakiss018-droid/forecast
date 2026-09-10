@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 
 from .auto_trader import AutoTradeConfig, load_auto_trade_config, validate_setup
+from .bstocks import is_bstock_base
 from .features import SIMILARITY_FEATURE_COLS, add_basic_features
 from .indicators import add_basic_indicators
 from .main import load_config
@@ -88,6 +89,8 @@ def fetch_top_usdt_symbols(exchange: ccxt.Exchange, *, limit: int = 200) -> tupl
             continue
         base = sym.split("/")[0]
         if base in _STABLE_OR_FIAT_BASES:
+            continue
+        if is_bstock_base(base):
             continue
         qv = float(t.get("quoteVolume") or 0.0)
         if qv <= 0:

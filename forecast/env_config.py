@@ -11,6 +11,7 @@ from .paths import ENV_FILE, load_project_env
 
 # Keys the panel may view/edit (no Binance secrets here).
 EDITABLE_KEYS: tuple[str, ...] = (
+    "LIVE_SCAN_INTERVAL_SEC",
     "AUTO_TRADE_MIN_SCORE",
     "AUTO_TRADE_MIN_PROB_PCT",
     "AUTO_TRADE_MIN_RR",
@@ -26,6 +27,7 @@ EDITABLE_KEYS: tuple[str, ...] = (
     "FORECAST_MIN_PROB_PCT",
     "FORECAST_ALLOW_TREND",
     "FORECAST_ALLOW_RANGE",
+    "FORECAST_BTC_REGIME_FILTER",
     "TREND_LOOKBACK",
     "TREND_MIN_MOVE_PCT",
     "TREND_MIN_REL_VOLUME",
@@ -36,6 +38,13 @@ EDITABLE_KEYS: tuple[str, ...] = (
 )
 
 SETTINGS_META: list[dict[str, Any]] = [
+    {
+        "key": "LIVE_SCAN_INTERVAL_SEC",
+        "label": "Live-скан: интервал, сек (300=5 мин, 0=выкл)",
+        "type": "int",
+        "group": "scan",
+        "default": "300",
+    },
     {"key": "FORECAST_TOP", "label": "Скан: топ сетапов", "type": "int", "group": "scan"},
     {"key": "FORECAST_BARS", "label": "Скан: bars", "type": "int", "group": "scan"},
     {"key": "FORECAST_TIMEFRAME", "label": "Скан: таймфрейм", "type": "str", "group": "scan"},
@@ -47,6 +56,7 @@ SETTINGS_META: list[dict[str, Any]] = [
     {"key": "FORECAST_MIN_PROB_PCT", "label": "Скан: min prob %", "type": "float", "group": "scan"},
     {"key": "FORECAST_ALLOW_TREND", "label": "Скан: режим trend", "type": "bool", "group": "scan"},
     {"key": "FORECAST_ALLOW_RANGE", "label": "Скан: режим range", "type": "bool", "group": "scan"},
+    {"key": "FORECAST_BTC_REGIME_FILTER", "label": "Скан: фильтр режима BTC", "type": "bool", "group": "scan", "default": "true"},
     {"key": "AUTO_TRADE_MIN_SCORE", "label": "Скан: min score", "type": "float", "group": "scan"},
     {"key": "AUTO_TRADE_MIN_PROB_PCT", "label": "Скан: min prob % (фильтр)", "type": "float", "group": "scan"},
     {"key": "AUTO_TRADE_MIN_RR", "label": "Скан: min R:R", "type": "float", "group": "scan"},
@@ -91,6 +101,8 @@ def get_settings_for_panel() -> list[dict[str, Any]]:
     for meta in SETTINGS_META:
         key = meta["key"]
         raw = values.get(key, "")
+        if not str(raw).strip() and meta.get("default") is not None:
+            raw = str(meta["default"])
         rows.append({**meta, "value": raw})
     return rows
 
@@ -147,3 +159,15 @@ def update_env_values(updates: dict[str, str]) -> dict[str, str]:
 
     load_project_env(force=True)
     return allowed
+
+
+def live_scan_interval_sec() -> int:
+    """Интервал авто live-скана. 0 = только кнопка. По умолчанию 300 (5 мин)."""
+    load_project_env()
+    raw = os.environ.get("LIVE_SCAN_INTERVAL_SEC", "").strip()
+    if not raw:
+        return 300
+    try:
+        return int(float(raw.replace(",", ".")))
+    except ValueError:
+        return 300

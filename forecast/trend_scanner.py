@@ -16,6 +16,7 @@ import pandas as pd
 
 from .auto_trader import load_auto_trade_config, validate_setup, apply_scan_auto_filters
 from .market_scanner import _adjust_stage1_for_direction, _stage1_snapshot
+from .bstocks import without_bstocks
 from .run_symbol_ranking import load_filtered_symbols
 from .signal_combiner import compute_volume_scores
 from .single_symbol_backtest import _build_candidate
@@ -72,8 +73,14 @@ class TrendScanConfig:
 
 
 def _resolve_scan_symbols(scan_cfg: TrendScanConfig) -> tuple[str, ...]:
-    """Явный список → filtered → топ по объёму (universe_top_n)."""
+    """Явный список → filtered → топ по объёму (universe_top_n).
+
+    bStocks (*B/USDT) для live-сканера отфильтровываются: они живут на /stocks.
+    Явный список акций (use_filtered_symbols=False) не трогаем.
+    """
     if scan_cfg.symbols:
+        if scan_cfg.use_filtered_symbols:
+            return without_bstocks(scan_cfg.symbols)
         return tuple(scan_cfg.symbols)
     if scan_cfg.use_filtered_symbols:
         filtered = load_filtered_symbols()
@@ -81,7 +88,7 @@ def _resolve_scan_symbols(scan_cfg: TrendScanConfig) -> tuple[str, ...]:
             return filtered
     n = max(1, int(scan_cfg.universe_top_n or 400))
     ex = ccxt.binance({"enableRateLimit": True})
-    return fetch_top_usdt_symbols(ex, limit=n)
+    return without_bstocks(fetch_top_usdt_symbols(ex, limit=n))
 
 
 def trend_params_from_yaml() -> TrendPullbackParams:

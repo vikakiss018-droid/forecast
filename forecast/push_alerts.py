@@ -58,6 +58,8 @@ def flatten_setup(row: dict[str, Any], threshold: float | None = None) -> dict[s
         "target_2": plan.get("target_2"),
         "why_selected": row.get("why_selected"),
         "regime": row.get("regime"),
+        "stock_name": row.get("stock_name"),
+        "ticker": row.get("ticker"),
         "hot": score > thr,
     }
 

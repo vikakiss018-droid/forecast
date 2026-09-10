@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .bstocks import drop_bstock_setups, is_bstock_symbol
 from .paths import PROCESSED_DATA_DIR, ensure_directories
 
 _log = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ def save_scan_result(
 ) -> Path:
     ensure_directories()
     out = path or DEFAULT_CACHE_PATH
+    report["top_setups"] = drop_bstock_setups(list(report.get("top_setups") or []))
     payload = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "scan_config": scan_config or {},
@@ -41,7 +43,7 @@ def save_scan_result(
 
 
 def _history_summary(report: dict[str, Any]) -> dict[str, Any]:
-    setups = report.get("top_setups") or []
+    setups = drop_bstock_setups(list(report.get("top_setups") or []))
     if not setups:
         return {"symbol": None, "score": None, "direction": None}
     top = setups[0]
@@ -91,14 +93,18 @@ def load_scan_history(limit: int = 30) -> list[dict[str, Any]]:
         return []
     lines = SCAN_HISTORY_PATH.read_text(encoding="utf-8").splitlines()
     out: list[dict[str, Any]] = []
-    for line in reversed(lines[-max(limit, 1) * 2 :]):
+    for line in reversed(lines):
         line = line.strip()
         if not line:
             continue
         try:
-            out.append(json.loads(line))
+            entry = json.loads(line)
         except json.JSONDecodeError:
             continue
+        top_sym = str((entry.get("top") or {}).get("symbol") or "")
+        if top_sym and is_bstock_symbol(top_sym):
+            continue
+        out.append(entry)
         if len(out) >= limit:
             break
     return out
