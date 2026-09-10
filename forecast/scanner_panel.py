@@ -950,11 +950,15 @@ def render_scanner_dashboard(
 ) -> str:
     setups = report.get("top_setups") or []
     hero = setups[0] if setups else None
-    max_symbols_q = "" if max_symbols is None else str(max_symbols)
-    base_q = (
-        f"top={int(top)}&bars={int(bars)}&timeframe={html.escape(timeframe)}"
-        f"&stage1_min_score={float(stage1_min_score)}&max_symbols={html.escape(max_symbols_q)}"
-    )
+    q_parts = [
+        f"top={int(top)}",
+        f"bars={int(bars)}",
+        f"timeframe={html.escape(timeframe)}",
+        f"stage1_min_score={float(stage1_min_score)}",
+    ]
+    if max_symbols is not None:
+        q_parts.append(f"max_symbols={int(max_symbols)}")
+    base_q = "&".join(q_parts)
     refresh_url = f"/scanner?{base_q}"
     live_pairs = len(load_filtered_symbols())
     scan_poll = ""

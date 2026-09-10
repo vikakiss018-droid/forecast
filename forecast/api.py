@@ -5,13 +5,14 @@ import html
 import logging
 import os
 from dataclasses import replace
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from pydantic import BeforeValidator
 
 from .main import load_config, run_pipeline
 from .paths import CONFIGS_DIR, load_project_env
@@ -107,6 +108,17 @@ load_project_env()
 
 app = FastAPI(title="Forecast App")
 _log = logging.getLogger(__name__)
+
+
+def _blank_to_none(v: Any) -> Any:
+    if v is None:
+        return None
+    if isinstance(v, str) and not v.strip():
+        return None
+    return v
+
+
+OptionalIntQuery = Annotated[int | None, BeforeValidator(_blank_to_none)]
 
 
 def _form_field_values(form: Any, key: str) -> list[str]:
@@ -1594,7 +1606,7 @@ def scanner_json(
     bars: int = 1000,
     timeframe: str = "1h",
     stage1_min_score: float = 18.0,
-    max_symbols: int | None = None,
+    max_symbols: OptionalIntQuery = None,
     live: bool = False,
 ) -> dict:
     """Тренд-скан 50 filtered пар (cached unless live=1)."""
@@ -1771,7 +1783,7 @@ def scanner_panel(
     bars: int = 1000,
     timeframe: str = "1h",
     stage1_min_score: float = 18.0,
-    max_symbols: int | None = None,
+    max_symbols: OptionalIntQuery = None,
     live: bool = False,
     tab: str = "",
     saved: str | None = None,
