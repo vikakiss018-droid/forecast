@@ -411,7 +411,7 @@ def _setup_rows(setups: list[dict[str, Any]]) -> str:
 
 def _scan_history_rows(items: list[dict[str, Any]]) -> str:
     if not items:
-        return '<tr><td colspan="6" class="empty-cell">История появится после нескольких сканов (каждые 15 мин)</td></tr>'
+        return '<tr><td colspan="6" class="empty-cell">История появится после нескольких сканов (каждые 5 мин)</td></tr>'
     rows = []
     for h in items:
         top = h.get("top") or {}
@@ -469,9 +469,11 @@ def _dashboard_tabs(*, active: str, base_q: str) -> str:
     pairs_cls = "tab active" if active == "pairs" else "tab"
     paper_cls = "tab active" if active == "paper" else "tab"
     stocks_cls = "tab active" if active == "stocks" else "tab"
+    swing_cls = "tab active" if active == "swing" else "tab"
     return f"""
     <nav class="dash-tabs">
       <a class="{scan_cls}" href="/scanner?{base_q}">Сканер</a>
+      <a class="{swing_cls}" href="/swing">Среднесрок</a>
       <a class="{stocks_cls}" href="/stocks">Акции</a>
       <a class="{pairs_cls}" href="/scanner/pairs">Тест пар</a>
       <a class="{paper_cls}" href="/paper">Симуляция</a>
@@ -551,7 +553,12 @@ def _progress_poll_script(
           panel.style.display = 'flex';
           if (bar) bar.style.width = pct + '%';
           if (pctEl) pctEl.textContent = pct + '%';
-          if (label) label.textContent = d.kind === 'pair_test' ? 'Тест пар…' : (d.kind === 'stocks_scan' ? 'Скан акций…' : 'Live-скан…');
+          const kinds = {{
+            pair_test: 'Тест пар…',
+            stocks_scan: 'Скан акций…',
+            swing_scan: 'Среднесрок…',
+          }};
+          if (label) label.textContent = kinds[d.kind] || 'Live-скан…';
           if (detail) detail.textContent = cur + ' / ' + tot + ' · ' + sym;
           return;
         }}
@@ -959,7 +966,7 @@ def render_scanner_dashboard(
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <meta http-equiv="refresh" content="3600" />
+  <meta http-equiv="refresh" content="300" />
   <title>Forecast — Сканер</title>
   {_panel_fonts_link()}
   <style>{_panel_theme_css(full=True)}{_progress_panel_css()}</style>

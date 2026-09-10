@@ -59,6 +59,16 @@ def _trade_target_unlimited(target_trades: int) -> bool:
     return int(target_trades) <= 0
 
 
+def _tp_for_profit_close(side: str, entry: float, fallback_tp: float, profit_pct: float | None) -> float:
+    """Закрытие при прибыли profit_pct% от открытой суммы (цены входа / notional). 0/None — TP плана."""
+    if profit_pct is None or float(profit_pct) <= 0:
+        return fallback_tp
+    frac = float(profit_pct) / 100.0
+    if side == "long":
+        return entry * (1.0 + frac)
+    return entry * (1.0 - frac)
+
+
 def _parse_bt_timestamp(raw: str) -> pd.Timestamp:
     ts = pd.Timestamp(raw.strip())
     if ts.tzinfo is None:
@@ -204,6 +214,7 @@ def _peek_trend_entry(
     long_only: bool = False,
     df_btc: pd.DataFrame | None = None,
     btc_regime_filter: bool = False,
+    exit_profit_pct: float | None = None,
 ) -> TrendEntryCandidate | None:
     sub = df.iloc[: next_i + 1]
     snap = _stage1_snapshot(sub)
@@ -262,7 +273,7 @@ def _peek_trend_entry(
     side = str(plan["direction"]).lower()
     entry = close
     stop = float(plan["stop"])
-    tp = float(plan["target_2"])
+    tp = _tp_for_profit_close(side, entry, float(plan["target_2"]), exit_profit_pct)
     exit_px, exit_reason, exit_i = _simulate_exit(
         df,
         next_i,
@@ -323,6 +334,7 @@ def _peek_range_entry(
     cooldown_bars: int,
     trend_params: TrendPullbackParams,
     long_only: bool = False,
+    exit_profit_pct: float | None = None,
 ) -> TrendEntryCandidate | None:
     sub = df.iloc[: next_i + 1]
     snap = _stage1_snapshot(sub)
@@ -362,7 +374,7 @@ def _peek_range_entry(
     side = str(plan["direction"]).lower()
     entry = close
     stop = float(plan["stop"])
-    tp = float(plan["target_2"])
+    tp = _tp_for_profit_close(side, entry, float(plan["target_2"]), exit_profit_pct)
     exit_px, exit_reason, exit_i = _simulate_exit(
         df,
         next_i,
@@ -426,6 +438,7 @@ def backtest_range_single_symbol(
     cooldown_bars: int = COOLDOWN_BARS,
     trend_params: TrendPullbackParams | None = None,
     long_only: bool = False,
+    exit_profit_pct: float | None = None,
 ) -> list[dict[str, Any]]:
     params = trend_params or DEFAULT_TREND_PARAMS
     step = step if step is not None else STEP_BY_TF.get(timeframe, 2)
@@ -449,6 +462,7 @@ def backtest_range_single_symbol(
             cooldown_bars=cooldown_bars,
             trend_params=params,
             long_only=long_only,
+            exit_profit_pct=exit_profit_pct,
         )
         if cand is None:
             next_i += step
@@ -477,6 +491,7 @@ def backtest_combined_single_symbol(
     allow_range: bool = True,
     df_btc: pd.DataFrame | None = None,
     btc_regime_filter: bool = False,
+    exit_profit_pct: float | None = None,
 ) -> list[dict[str, Any]]:
     """Тренд + флет в одном walk-forward (режимы взаимоисключающие на баре)."""
     params = trend_params or DEFAULT_TREND_PARAMS
@@ -508,6 +523,7 @@ def backtest_combined_single_symbol(
                 long_only=long_only,
                 df_btc=df_btc,
                 btc_regime_filter=btc_regime_filter,
+                exit_profit_pct=exit_profit_pct,
             )
         if cand is None and allow_range:
             cand = _peek_range_entry(
@@ -522,6 +538,7 @@ def backtest_combined_single_symbol(
                 cooldown_bars=cooldown_bars,
                 trend_params=params,
                 long_only=long_only,
+                exit_profit_pct=exit_profit_pct,
             )
             regime = "range"
         if cand is None:
@@ -835,6 +852,7 @@ def backtest_single_symbol(
     long_only: bool = False,
     df_btc: pd.DataFrame | None = None,
     btc_regime_filter: bool = False,
+    exit_profit_pct: float | None = None,
 ) -> list[dict[str, Any]]:
     # trend_only=False → как live-скан: тренд, иначе range bounce
     if not trend_only:
@@ -855,6 +873,7 @@ def backtest_single_symbol(
             allow_range=True,
             df_btc=df_btc,
             btc_regime_filter=btc_regime_filter,
+            exit_profit_pct=exit_profit_pct,
         )
 
     params = trend_params or DEFAULT_TREND_PARAMS
@@ -883,6 +902,7 @@ def backtest_single_symbol(
             long_only=long_only,
             df_btc=df_btc,
             btc_regime_filter=btc_regime_filter,
+            exit_profit_pct=exit_profit_pct,
         )
         if cand is None:
             next_i += step

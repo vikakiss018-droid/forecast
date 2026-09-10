@@ -78,7 +78,7 @@ reference_backtest:
   max_hold_bars_1h: 48
   cooldown_bars_same_symbol: 4
 
-# Live-скан + systemd (:03 UTC). Цель ≥30 сделок/мес.
+# Live-скан + systemd (каждые 5 мин). Цель ≥30 сделок/мес.
 # 1h: без убыточного range не набирается; 15m trend ≈100–130/мес, PF≈1.07 (30d).
 trend_scan:
   timeframe: 15m

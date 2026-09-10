@@ -122,6 +122,7 @@ def _run_variant(
     auto_cfg,
     tf: str,
     btc_filter: bool,
+    exit_profit_pct: float | None = None,
 ) -> list[dict[str, Any]]:
     all_trades: list[dict[str, Any]] = []
     for symbol in symbols:
@@ -144,6 +145,7 @@ def _run_variant(
             long_only=False,
             df_btc=df_btc if btc_filter else None,
             btc_regime_filter=btc_filter,
+            exit_profit_pct=exit_profit_pct,
         )
         all_trades.extend(sym_trades)
         print(f"[wf] {label} {symbol}: +{len(sym_trades)} (total {len(all_trades)})", flush=True)
@@ -158,6 +160,9 @@ def main() -> int:
     win_days = int(os.environ.get("WF_WINDOW_DAYS", "30"))
     deposit = float(os.environ.get("WF_DEPOSIT", "1000"))
     risk = float(os.environ.get("WF_RISK_PCT", "0.5"))
+    # Закрытие при прибыли N% от открытой суммы (notional / цена входа). 0 = TP плана.
+    profit_close = float(os.environ.get("WF_PROFIT_CLOSE_PCT", "0") or "0")
+    exit_profit_pct = profit_close if profit_close > 0 else None
 
     end = datetime.now(timezone.utc)
     total_days = n_win * win_days
@@ -189,7 +194,8 @@ def main() -> int:
 
     print(
         f"[wf] load {len(symbols)} symbols {tf} (+{htf}/BTC4h for B), "
-        f"{total_days}d {start_s}..{end_s}, {n_win}×{win_days}d",
+        f"{total_days}d {start_s}..{end_s}, {n_win}×{win_days}d"
+        + (f", exit at +{profit_close:g}% of notional" if exit_profit_pct else ""),
         flush=True,
     )
     exchange = ccxt.binance({"enableRateLimit": True})
@@ -226,6 +232,7 @@ def main() -> int:
         auto_cfg=auto_cfg,
         tf=tf,
         btc_filter=False,
+        exit_profit_pct=exit_profit_pct,
     )
     trades_b = _run_variant(
         label="B_btc+htf",
@@ -238,6 +245,7 @@ def main() -> int:
         auto_cfg=auto_cfg,
         tf=tf,
         btc_filter=True,
+        exit_profit_pct=exit_profit_pct,
     )
 
     fee = float(os.environ.get("WF_FEE_PCT", "0.1"))  # taker, за сторону
@@ -300,11 +308,13 @@ def main() -> int:
     )
 
     trade_keys = ("symbol", "side", "entry_time", "entry", "stop", "tp", "exit_reason", "r_multiple")
-    out = Path(__file__).resolve().parent / "data/processed" / f"walkforward_{n_win}x{win_days}d_{tf}.json"
+    tp_tag = f"_tp{profit_close:g}pct" if exit_profit_pct else ""
+    out = Path(__file__).resolve().parent / "data/processed" / f"walkforward_{n_win}x{win_days}d_{tf}{tp_tag}.json"
     payload = {
         "status": "done",
         "timeframe": tf,
         "htf": htf,
+        "exit_profit_pct": exit_profit_pct,
         "period": {"start": start_s, "end": end_s},
         "windows": windows,
         "symbols": list(dfs.keys()),

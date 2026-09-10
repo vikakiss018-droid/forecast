@@ -257,10 +257,18 @@ def _resolve_plan(
     return None
 
 
-def _why_selected(plan: dict[str, Any], regime: Regime, rel_vol: float, params: TrendPullbackParams) -> str:
+def _why_selected(
+    plan: dict[str, Any],
+    regime: Regime,
+    rel_vol: float,
+    params: TrendPullbackParams,
+    *,
+    timeframe: str = "1h",
+) -> str:
+    tf = timeframe or "1h"
     if regime == "range":
         return (
-            f"range bounce 1h; pos={plan.get('range_position_pct')}% "
+            f"range bounce {tf}; pos={plan.get('range_position_pct')}% "
             f"rel_vol={rel_vol:.2f}; RR={plan.get('risk_reward', 0):.2f}"
         )
     tp_txt = (
@@ -268,7 +276,11 @@ def _why_selected(plan: dict[str, Any], regime: Regime, rel_vol: float, params: 
         if params.tp_target_pct > 0
         else f"TP {params.rr_target:.1f}R"
     )
-    return f"trend {plan.get('trend')} {plan.get('entry_style')} 1h; rel_vol={rel_vol:.2f}; {tp_txt}"
+    htf = f" + {params.htf_timeframe} HTF" if params.require_htf_align else ""
+    return (
+        f"trend {plan.get('trend')} {plan.get('entry_style')} {tf}{htf}; "
+        f"rel_vol={rel_vol:.2f}; {tp_txt}"
+    )
 
 
 def scan_combined_setups(
@@ -374,7 +386,9 @@ def scan_combined_setups(
         cand["entry_style"] = plan.get("entry_style")
         cand["rel_volume"] = plan.get("rel_volume")
         cand["pattern"] = "range bounce" if regime == "range" else f"trend {plan.get('trend', '')}"
-        cand["why_selected"] = _why_selected(plan, regime, rel_vol, params)
+        cand["why_selected"] = _why_selected(
+            plan, regime, rel_vol, params, timeframe=scan_cfg.timeframe
+        )
 
         ok, reason = validate_setup(cand, auto_cfg)
         if not ok:

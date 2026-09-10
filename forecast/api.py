@@ -76,6 +76,12 @@ from .stocks_scanner import (
     load_stocks_scan,
     run_stocks_scan_background,
 )
+from .swing_panel import render_swing_dashboard
+from .swing_scanner import (
+    load_swing_progress,
+    load_swing_scan,
+    run_swing_scan_background,
+)
 from .scanner_panel import (
     render_pair_ranking_dashboard,
     render_scanner_dashboard,
@@ -1845,4 +1851,54 @@ async def stocks_run(background_tasks: BackgroundTasks) -> RedirectResponse:
         return RedirectResponse(url="/stocks?scan_busy=1", status_code=303)
     background_tasks.add_task(run_stocks_scan_background)
     return RedirectResponse(url="/stocks?scan_started=1", status_code=303)
+
+
+@app.get("/swing", response_class=HTMLResponse, dependencies=PANEL_AUTH_DEPS)
+def swing_dashboard(
+    scan_started: str | None = None,
+    scan_busy: str | None = None,
+    error: str | None = None,
+) -> str:
+    """Лучшие входы на среднесрок (неделя–месяц), ликвидные majors, дневной график."""
+    msg = None
+    if scan_started == "1":
+        msg = "Скан среднесрока запущен — смотрите прогресс ниже"
+    elif scan_busy == "1":
+        msg = "Скан среднесрока уже выполняется"
+    elif error:
+        msg = f"Ошибка: {error}"
+    prog = load_swing_progress()
+    st = str(prog.get("status") or "idle")
+    scan_watch = st == "running" or (scan_started == "1" and st not in ("done", "error"))
+    return render_swing_dashboard(
+        cached=load_swing_scan(),
+        scan_watch=scan_watch,
+        msg=msg,
+    )
+
+
+@app.get("/swing/json", dependencies=PANEL_AUTH_DEPS)
+def swing_json() -> dict[str, Any]:
+    data = load_swing_scan() or {}
+    return {
+        "updated_at": data.get("updated_at"),
+        "universe_count": data.get("universe_count"),
+        "scan_config": data.get("scan_config") or {},
+        "report": data.get("report") or {},
+        "universe": data.get("universe") or [],
+    }
+
+
+@app.get("/swing/progress/json", dependencies=PANEL_AUTH_DEPS)
+def swing_progress_json() -> dict[str, Any]:
+    return load_swing_progress()
+
+
+@app.post("/swing/run", dependencies=PANEL_AUTH_DEPS)
+async def swing_run(background_tasks: BackgroundTasks) -> RedirectResponse:
+    cur = load_swing_progress()
+    if cur.get("status") == "running":
+        return RedirectResponse(url="/swing?scan_busy=1", status_code=303)
+    background_tasks.add_task(run_swing_scan_background)
+    return RedirectResponse(url="/swing?scan_started=1", status_code=303)
 

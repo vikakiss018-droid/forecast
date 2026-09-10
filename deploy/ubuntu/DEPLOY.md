@@ -1,6 +1,6 @@
 # Развёртывание на Ubuntu (VPS 2 CPU / 2 GB)
 
-Сканер работает **в фоне каждый час в :03 UTC** (после закрытия 1h-свечи) и пишет кэш в `data/processed/market_scan_latest.json`.  
+Сканер работает **в фоне каждые 5 минут** (`:03 / :08 / :13 / …` UTC, через 3 минуты после закрытия 5m-свечи) и пишет кэш в `data/processed/market_scan_latest.json`.  
 Веб-панель **читает кэш** (быстро), не гоняет полный скан на каждый запрос.
 
 ## 1. Подготовка сервера
@@ -47,7 +47,7 @@ sudo bash deploy/ubuntu/install.sh
 
 Скрипт создаёт пользователя `forecast`, venv, включает:
 - `forecast-api` — uvicorn на порту **8000**
-- `forecast-scan.timer` — тренд-скан **каждый час в :03 UTC**
+- `forecast-scan.timer` — тренд-скан **каждые 5 минут** (`:03 / :08 / :13 / …` UTC)
 
 Настройки скана: `/opt/forecast/deploy/ubuntu/forecast.env` (скопирован из `forecast.env.example`).
 
@@ -108,7 +108,7 @@ source .venv/bin/activate
 python -m forecast.run_scheduled_scan
 ```
 
-Таймер systemd: **каждый час в :03 UTC** (`forecast-scan.timer`), не каждые 15 мин — как закрытие 1h-свечи в бэктесте.
+Таймер systemd: **каждые 5 минут** (`forecast-scan.timer`, `:03 / :08 / :13 / …` UTC).
 
 Перед первым запуском сгенерируйте список 50 пар:
 

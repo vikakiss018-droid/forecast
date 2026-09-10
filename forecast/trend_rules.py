@@ -133,6 +133,24 @@ PARAMS_1D = TrendPullbackParams(
     min_atr_pct=0.0,
 )
 
+# Среднесрок (неделя–месяц): рабочий ТФ — дневной. Стоп по ATR на 1d широкий,
+# поэтому TP через 2R (~недельный–месячный ход), а не фиксированные 4–6%.
+PARAMS_SWING = TrendPullbackParams(
+    require_pullback=False,
+    require_htf_align=False,
+    htf_timeframe="1d",
+    trend_lookback=30,
+    min_trend_move_pct=0.035,
+    tp_target_pct=0.0,
+    rr_target=2.0,
+    min_rel_volume=1.0,
+    min_rel_volume_range=0.8,
+    min_atr_pct=0.0,
+    require_rejection_candle=True,
+    block_asian_session=False,
+    block_opposite_level=False,
+)
+
 
 def trend_params_for_timeframe(
     timeframe: str,

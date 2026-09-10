@@ -109,6 +109,7 @@ BARS_BY_TF: dict[str, int] = {
     "2h": 1000,
     "4h": 800,
     "1d": 500,
+    "1w": 200,
 }
 
 STEP_BY_TF: dict[str, int] = {
