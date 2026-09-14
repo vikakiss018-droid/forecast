@@ -91,9 +91,12 @@ from .trade_gate import GateMode, TradeGateConfig, evaluate_trade_gate
 from .mobile_app import (
     mobile_icon_file,
     mobile_manifest_json,
+    paper_payload,
     pairs_payload,
     render_mobile_app,
     setups_payload,
+    stocks_payload,
+    swing_payload,
 )
 from .push_alerts import (
     delete_expo_push_token,
@@ -578,6 +581,21 @@ def mobile_apple_touch_icon() -> FileResponse:
 @app.get("/m/api/setups", dependencies=PANEL_AUTH_DEPS)
 def mobile_setups() -> dict:
     return setups_payload()
+
+
+@app.get("/m/api/swing", dependencies=PANEL_AUTH_DEPS)
+def mobile_swing() -> dict:
+    return swing_payload()
+
+
+@app.get("/m/api/stocks", dependencies=PANEL_AUTH_DEPS)
+def mobile_stocks() -> dict:
+    return stocks_payload()
+
+
+@app.get("/m/api/paper", dependencies=PANEL_AUTH_DEPS)
+def mobile_paper() -> dict:
+    return paper_payload()
 
 
 @app.get("/m/api/pairs", dependencies=PANEL_AUTH_DEPS)
@@ -1697,7 +1715,7 @@ def pair_ranking_panel(
 
 @app.post("/scanner/pairs/run", dependencies=PANEL_AUTH_DEPS)
 async def pair_ranking_run(background_tasks: BackgroundTasks) -> RedirectResponse:
-    cur = load_symbol_ranking_result()
+    cur = load_symbol_ranking_result()  # сбрасывает зависший status=running
     if cur.get("status") == "running":
         return RedirectResponse(url="/scanner/pairs?busy=1", status_code=303)
     background_tasks.add_task(run_symbol_ranking_background)

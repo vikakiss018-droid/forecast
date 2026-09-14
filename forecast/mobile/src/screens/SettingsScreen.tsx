@@ -75,7 +75,7 @@ export function SettingsScreen({ settings, onSave, onBack }: Props) {
       </Pressable>
       <Text style={styles.title}>Настройки</Text>
       <Text style={styles.hint}>
-        Укажите адрес вашего Forecast-сервера. Логин и пароль — те же, что для панели `/scanner`.
+        Телефон только читает готовые сетапы с сервера. Логин и пароль — те же, что для панели `/scanner`.
       </Text>
 
       <Field label="Адрес сервера">

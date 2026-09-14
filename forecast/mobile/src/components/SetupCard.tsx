@@ -17,6 +17,7 @@ export function SetupCard({ setup }: Props) {
         <Text style={[styles.direction, directionStyle]}>{setup.direction || "—"}</Text>
         {setup.hot ? <Text style={styles.hotBadge}>ВЫГОДНО</Text> : null}
         <Text style={styles.score}>{fmtNum(setup.score, 1)}</Text>
+        {setup.stock_name ? <Text style={styles.name}>{setup.stock_name}</Text> : null}
       </View>
       <View style={styles.grid}>
         <Field label="Паттерн" value={setup.pattern || "—"} />
@@ -121,6 +122,12 @@ const styles = StyleSheet.create({
     color: colors.accent2,
     fontSize: 22,
     fontWeight: "800",
+  },
+  name: {
+    width: "100%",
+    color: colors.muted,
+    fontSize: 12,
+    marginTop: -4,
   },
   grid: {
     flexDirection: "row",

@@ -9,18 +9,26 @@ import {
   View,
 } from "react-native";
 
-import { fetchSetups } from "../api/client";
-import type { ServerSettings, SetupsResponse } from "../api/types";
+import { fetchFeed } from "../api/client";
+import type { FeedKind, ServerSettings, SetupsResponse } from "../api/types";
 import { SetupCard } from "../components/SetupCard";
 import { notifyKey, showLocalHotAlert } from "../lib/notifications";
 import { colors, fmtTime } from "../lib/theme";
 
+const FEED_META: Record<FeedKind, { title: string; fallbackSub: string }> = {
+  scan: { title: "Сканер", fallbackSub: "Крипто live-скан" },
+  swing: { title: "Среднесрок", fallbackSub: "Удержание 1–4 недели" },
+  stocks: { title: "Акции", fallbackSub: "Binance bStocks" },
+};
+
 type Props = {
+  feed: FeedKind;
   settings: ServerSettings;
   onOpenSettings: () => void;
 };
 
-export function HomeScreen({ settings, onOpenSettings }: Props) {
+export function HomeScreen({ feed, settings, onOpenSettings }: Props) {
+  const meta = FEED_META[feed];
   const [data, setData] = useState<SetupsResponse | null>(null);
   const [filter, setFilter] = useState<"hot" | "all">("hot");
   const [loading, setLoading] = useState(true);
@@ -38,24 +46,26 @@ export function HomeScreen({ settings, onOpenSettings }: Props) {
       }
       if (!silent) setLoading(true);
       try {
-        const next = await fetchSetups(settings.baseUrl, settings.username, settings.password);
+        const next = await fetchFeed(feed, settings.baseUrl, settings.username, settings.password);
         setData(next);
         setError(null);
 
-        const key = notifyKey(next);
-        const isNewScan =
-          lastUpdatedRef.current && next.updated_at && next.updated_at !== lastUpdatedRef.current;
-        const hot = next.setups.filter((s) => s.hot);
-        if (settings.notifyEnabled && hot.length && isNewScan && key !== lastKeyRef.current) {
-          const title = hot.length === 1 ? "Выгодная позиция" : `${hot.length} выгодные позиции`;
-          const body = hot
-            .slice(0, 3)
-            .map((s) => `${s.symbol} ${s.direction || ""} · ${s.score}`)
-            .join(" · ");
-          await showLocalHotAlert(title, body);
+        if (feed === "scan") {
+          const key = notifyKey(next);
+          const isNewScan =
+            lastUpdatedRef.current && next.updated_at && next.updated_at !== lastUpdatedRef.current;
+          const hot = next.setups.filter((s) => s.hot);
+          if (settings.notifyEnabled && hot.length && isNewScan && key !== lastKeyRef.current) {
+            const title = hot.length === 1 ? "Выгодная позиция" : `${hot.length} выгодные позиции`;
+            const body = hot
+              .slice(0, 3)
+              .map((s) => `${s.symbol} ${s.direction || ""} · ${s.score}`)
+              .join(" · ");
+            await showLocalHotAlert(title, body);
+          }
+          lastKeyRef.current = key;
+          lastUpdatedRef.current = next.updated_at || null;
         }
-        lastKeyRef.current = key;
-        lastUpdatedRef.current = next.updated_at || null;
       } catch (e) {
         setError(e instanceof Error ? e.message : "Ошибка загрузки");
       } finally {
@@ -63,10 +73,14 @@ export function HomeScreen({ settings, onOpenSettings }: Props) {
         setRefreshing(false);
       }
     },
-    [settings],
+    [feed, settings],
   );
 
   useEffect(() => {
+    lastKeyRef.current = "";
+    lastUpdatedRef.current = null;
+    setData(null);
+    setFilter("hot");
     load();
     const timer = setInterval(() => load(true), 20000);
     return () => clearInterval(timer);
@@ -84,9 +98,9 @@ export function HomeScreen({ settings, onOpenSettings }: Props) {
     <View style={styles.root}>
       <View style={styles.header}>
         <View>
-          <Text style={styles.title}>Выгодные позиции</Text>
+          <Text style={styles.title}>{meta.title}</Text>
           <Text style={styles.subtitle}>
-            {data?.timeframe || "—"} · порог {threshold}
+            {data?.timeframe || meta.fallbackSub} · порог {threshold}
           </Text>
         </View>
         <Pressable style={styles.settingsBtn} onPress={onOpenSettings}>
@@ -122,7 +136,9 @@ export function HomeScreen({ settings, onOpenSettings }: Props) {
                 : "В последнем скане нет сетапов"}
             </Text>
           ) : (
-            setups.map((setup) => <SetupCard key={`${setup.symbol}-${setup.score}`} setup={setup} />)
+            setups.map((setup, index) => (
+              <SetupCard key={`${setup.symbol}-${setup.score}-${index}`} setup={setup} />
+            ))
           )}
         </ScrollView>
       )}

@@ -3,7 +3,9 @@ import { StatusBar } from "expo-status-bar";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 
 import type { ServerSettings } from "./src/api/types";
+import { TabBar, type AppTab } from "./src/components/TabBar";
 import { HomeScreen } from "./src/screens/HomeScreen";
+import { PaperScreen } from "./src/screens/PaperScreen";
 import { SettingsScreen } from "./src/screens/SettingsScreen";
 import { loadSettings, saveSettings } from "./src/lib/settings";
 import { colors } from "./src/lib/theme";
@@ -12,6 +14,7 @@ type Screen = "home" | "settings";
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>("home");
+  const [tab, setTab] = useState<AppTab>("scan");
   const [settings, setSettings] = useState<ServerSettings | null>(null);
 
   useEffect(() => {
@@ -31,14 +34,25 @@ export default function App() {
     <SafeAreaProvider>
       <SafeAreaView style={{ flex: 1, backgroundColor: colors.bg }} edges={["top", "left", "right"]}>
         <StatusBar style="light" />
-        {screen === "home" ? (
-          <HomeScreen settings={settings} onOpenSettings={() => setScreen("settings")} />
-        ) : (
+        {screen === "settings" ? (
           <SettingsScreen
             settings={settings}
             onSave={handleSave}
             onBack={() => setScreen("home")}
           />
+        ) : (
+          <>
+            {tab === "paper" ? (
+              <PaperScreen settings={settings} onOpenSettings={() => setScreen("settings")} />
+            ) : (
+              <HomeScreen
+                feed={tab}
+                settings={settings}
+                onOpenSettings={() => setScreen("settings")}
+              />
+            )}
+            <TabBar active={tab} onChange={setTab} />
+          </>
         )}
       </SafeAreaView>
     </SafeAreaProvider>

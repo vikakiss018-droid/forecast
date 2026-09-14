@@ -6,9 +6,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .paper_trading import load_paper_state, paper_summary
 from .push_alerts import alert_min_score, flatten_setup
 from .run_symbol_ranking import load_symbol_ranking_filtered, load_symbol_ranking_result
 from .scan_cache import load_scan_result, report_from_cache
+from .stocks_scanner import load_stocks_scan
+from .swing_scanner import load_swing_scan
 
 STATIC_MOBILE_DIR = Path(__file__).resolve().parent / "static" / "mobile"
 
@@ -18,20 +21,97 @@ def mobile_icon_file(name: str) -> Path | None:
     return path if path.is_file() else None
 
 
-def setups_payload() -> dict[str, Any]:
+def _compact_setups(
+    rows: list[Any],
+    *,
+    updated_at: Any = None,
+    timeframe: Any = None,
+    candidates_found: Any = 0,
+    symbols_scanned: Any = 0,
+) -> dict[str, Any]:
     threshold = alert_min_score()
-    cached = load_scan_result()
-    report, updated_at = report_from_cache(cached)
-    setups = [flatten_setup(row, threshold) for row in (report.get("top_setups") or [])]
+    setups = [flatten_setup(row, threshold) for row in rows if isinstance(row, dict)]
     setups.sort(key=lambda s: (-float(s.get("score") or 0), str(s.get("symbol") or "")))
     return {
         "updated_at": updated_at,
-        "timeframe": report.get("timeframe"),
-        "candidates_found": report.get("candidates_found") or 0,
-        "symbols_scanned": report.get("symbols_scanned") or report.get("universe_size") or 0,
+        "timeframe": timeframe,
+        "candidates_found": candidates_found or 0,
+        "symbols_scanned": symbols_scanned or 0,
         "alert_min_score": threshold,
         "hot_count": sum(1 for s in setups if s.get("hot")),
         "setups": setups,
+    }
+
+
+def setups_payload() -> dict[str, Any]:
+    cached = load_scan_result()
+    report, updated_at = report_from_cache(cached)
+    return _compact_setups(
+        list(report.get("top_setups") or []),
+        updated_at=updated_at,
+        timeframe=report.get("timeframe"),
+        candidates_found=report.get("candidates_found") or 0,
+        symbols_scanned=report.get("symbols_scanned") or report.get("universe_size") or 0,
+    )
+
+
+def _payload_from_cached_scan(cached: dict[str, Any] | None) -> dict[str, Any]:
+    data = cached or {}
+    report = data.get("report") or {}
+    cfg = data.get("scan_config") or {}
+    return _compact_setups(
+        list(report.get("top_setups") or []),
+        updated_at=data.get("updated_at") or report.get("updated_at"),
+        timeframe=report.get("timeframe") or cfg.get("timeframe"),
+        candidates_found=report.get("candidates_found") or 0,
+        symbols_scanned=report.get("symbols_scanned") or data.get("universe_count") or 0,
+    )
+
+
+def swing_payload() -> dict[str, Any]:
+    return _payload_from_cached_scan(load_swing_scan())
+
+
+def stocks_payload() -> dict[str, Any]:
+    return _payload_from_cached_scan(load_stocks_scan())
+
+
+def paper_payload() -> dict[str, Any]:
+    state = load_paper_state()
+    summary = paper_summary(state)
+    trades: list[dict[str, Any]] = []
+    reason_map = {"tp": "TP", "stop": "стоп", "time": "таймаут"}
+    for raw in state.get("trades") or []:
+        if not isinstance(raw, dict):
+            continue
+        open_trade = str(raw.get("status") or "") == "open"
+        side = str(raw.get("side") or raw.get("direction") or "").strip()
+        if side.lower() == "long":
+            side = "Long"
+        elif side.lower() == "short":
+            side = "Short"
+        reason = str(raw.get("exit_reason") or raw.get("close_reason") or raw.get("reason") or "")
+        trades.append(
+            {
+                "id": raw.get("id"),
+                "symbol": raw.get("symbol"),
+                "side": side,
+                "status": "open" if open_trade else "closed",
+                "win": bool(raw.get("win")) if not open_trade else None,
+                "r": raw.get("unrealized_r") if open_trade else raw.get("r_multiple"),
+                "entry": raw.get("entry"),
+                "last_price": raw.get("last_price"),
+                "stop": raw.get("stop"),
+                "tp": raw.get("tp") or raw.get("target_1"),
+                "score": raw.get("score"),
+                "reason": "" if open_trade else (reason_map.get(reason) or reason),
+            }
+        )
+    open_trades = [t for t in trades if t.get("status") == "open"]
+    closed_trades = [t for t in trades if t.get("status") != "open"]
+    return {
+        "summary": summary,
+        "trades": open_trades + closed_trades[:20],
     }
 
 

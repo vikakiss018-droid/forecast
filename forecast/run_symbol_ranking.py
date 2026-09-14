@@ -449,13 +449,70 @@ def main() -> int:
     return 0
 
 
-def load_symbol_ranking_result() -> dict:
+# Если процесс умер, status=running блокирует кнопку «Запустить» навечно.
+RANKING_STALE_RUNNING_SEC = 3 * 3600  # 3 часа
+
+
+def clear_stale_running_ranking(
+    data: dict[str, Any] | None = None,
+    *,
+    max_age_sec: float = RANKING_STALE_RUNNING_SEC,
+) -> dict[str, Any]:
+    """Сбросить зависший status=running → error, чтобы можно было перезапустить тест."""
+    if data is None:
+        data = load_symbol_ranking_result_raw()
+    if str(data.get("status") or "") != "running":
+        return data
+
+    started_raw = str(data.get("started_at") or "").strip()
+    age_sec: float | None = None
+    if started_raw:
+        try:
+            started = datetime.fromisoformat(started_raw.replace("Z", "+00:00"))
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            age_sec = (datetime.now(timezone.utc) - started.astimezone(timezone.utc)).total_seconds()
+        except ValueError:
+            age_sec = None
+
+    progress = data.get("progress") or {}
+    cur = int(progress.get("current") or 0)
+    total = int(progress.get("total") or 0)
+    stuck_complete = total > 0 and cur >= total and not data.get("finished_at")
+    stale = age_sec is None or age_sec > max_age_sec
+
+    if not (stale or stuck_complete):
+        return data
+
+    reason = (
+        "Тест прерван или завис (status=running без завершения). "
+        "Можно запустить снова."
+    )
+    fixed = {
+        **data,
+        "status": "error",
+        "error": reason,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "stale_cleared": True,
+    }
+    try:
+        save_symbol_ranking_result(fixed)
+    except OSError:
+        pass
+    return fixed
+
+
+def load_symbol_ranking_result_raw() -> dict:
     if not SYMBOL_RANKING_PATH.is_file():
         return {"status": "idle", "path": str(SYMBOL_RANKING_PATH)}
     try:
         return json.loads(SYMBOL_RANKING_PATH.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {"status": "error", "path": str(SYMBOL_RANKING_PATH)}
+
+
+def load_symbol_ranking_result() -> dict:
+    return clear_stale_running_ranking(load_symbol_ranking_result_raw())
 
 
 def load_symbol_ranking_filtered() -> dict:
