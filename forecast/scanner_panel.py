@@ -580,7 +580,7 @@ def _progress_poll_script(
           finished = true;
           panel.style.display = 'flex';
           if (label) label.textContent = 'Ошибка';
-          if (detail) detail.textContent = d.error || 'unknown';
+          if (detail) detail.textContent = d.error || 'сбой теста (см. journalctl -u forecast-api)';
           return;
         }}
         panel.style.display = 'none';

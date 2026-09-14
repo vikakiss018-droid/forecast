@@ -172,19 +172,23 @@ def build_filtered_ranking(
     }
 
 
-def save_filtered_ranking(payload: dict) -> Path:
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Пишем во временный файл и атомарно заменяем — иначе опрос UI ловит битый JSON → Ошибка/unknown."""
     ensure_directories()
-    SYMBOL_RANKING_FILTERED_PATH.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    text = json.dumps(payload, indent=2, ensure_ascii=False)
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def save_filtered_ranking(payload: dict) -> Path:
+    _atomic_write_json(SYMBOL_RANKING_FILTERED_PATH, payload)
     return SYMBOL_RANKING_FILTERED_PATH
 
 
 def save_symbol_ranking_result(payload: dict[str, Any]) -> None:
-    ensure_directories()
-    SYMBOL_RANKING_PATH.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    _atomic_write_json(SYMBOL_RANKING_PATH, payload)
 
 
 def _ranking_rows_from_by(
@@ -392,11 +396,15 @@ def run_symbol_ranking_background() -> None:
         # Панель: после теста сразу отобрать прибыльные (R>0.5, win>50%) в filtered-файл.
         run_symbol_ranking_job(save_auto_filtered=True)
     except Exception as e:
+        import traceback
+
+        traceback.print_exc()
         save_symbol_ranking_result(
             {
                 "status": "error",
-                "error": str(e),
+                "error": str(e) or repr(e),
                 "finished_at": datetime.now(timezone.utc).isoformat(),
+                "kind": "pair_test",
             }
         )
         print(f"[rank] error: {e}", flush=True)
@@ -479,8 +487,8 @@ def clear_stale_running_ranking(
         except ValueError:
             age_sec = None
 
-    # Только по возрасту. progress==total без finished_at — штатный момент конца цикла.
-    if age_sec is not None and age_sec <= max_age_sec:
+    # Только по известному возрасту. Нет/битая дата started_at — не трогаем (опрос UI).
+    if age_sec is None or age_sec <= max_age_sec:
         return data
 
     reason = (
@@ -507,8 +515,16 @@ def load_symbol_ranking_result_raw() -> dict:
         return {"status": "idle", "path": str(SYMBOL_RANKING_PATH)}
     try:
         return json.loads(SYMBOL_RANKING_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {"status": "error", "path": str(SYMBOL_RANKING_PATH)}
+    except json.JSONDecodeError:
+        # Гонка чтения во время записи: не показываем «Ошибка / unknown», ждём следующий poll.
+        return {
+            "status": "running",
+            "kind": "pair_test",
+            "progress": {"current": 0, "total": 0, "symbol": "…"},
+            "transient_read_error": True,
+        }
+    except OSError as e:
+        return {"status": "error", "error": str(e), "path": str(SYMBOL_RANKING_PATH)}
 
 
 def load_symbol_ranking_result(*, clear_stale: bool = True) -> dict:
