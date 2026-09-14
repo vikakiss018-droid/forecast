@@ -857,17 +857,17 @@ def render_pair_ranking_dashboard(
       <strong>Live сейчас:</strong> {live_count} пар
       <span style="color:var(--muted)"> · обновлено {_e(live_at)}</span>
       <br/><span style="color:var(--muted);font-size:0.82rem">
-        Авто-отбор: R &gt; 0.5, win &gt; 50%, ≥1 сделка · после теста отметьте пары и нажмите «Утвердить»
+        Авто-отбор после теста: R &gt; 0.5, win &gt; 50%, ≥1 сделка → обновляет live-список.
+        Можно вручную утвердить другой набор ниже.
       </span>
     </div>
     <form method="post" action="/scanner/pairs/run" style="margin-bottom: 12px;">
-      <button type="submit" class="btn btn-primary" {run_disabled}>Запустить тест {top_n} пар (~5–10 мин)</button>
+      <button type="submit" class="btn btn-primary" {run_disabled}>Запустить тест {top_n} пар (~5–15 мин)</button>
     </form>
     <p class="hint">
-      Тест не меняет live-список автоматически. Параметры берутся из <code>.env</code>
-      (<code>FORECAST_*</code>, <code>TREND_*</code>, <code>RANK_*</code>) —
-      те же, что у live-скана. По завершении выберите пары и утвердите —
-      они попадут в <code>symbol_ranking_filtered_r05_win50.json</code>.
+      Тест берёт топ-{top_n} USDT-пар по объёму (не старый live-список), считает бэктест
+      и сохраняет прибыльные в <code>symbol_ranking_filtered_r05_win50.json</code>.
+      Параметры: <code>.env</code> (<code>FORECAST_*</code>, <code>TREND_*</code>, <code>RANK_*</code>).
     </p>
     <div class="stats">
       <div class="stat"><label>Статус</label><strong>{_e(status)}</strong></div>

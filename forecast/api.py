@@ -59,6 +59,8 @@ from .run_symbol_ranking import (
     load_filtered_symbols,
     load_symbol_ranking_filtered,
     load_symbol_ranking_result,
+    load_symbol_ranking_result_raw,
+    mark_symbol_ranking_starting,
     ranking_config_from_env,
     run_symbol_ranking_background,
 )
@@ -1718,6 +1720,11 @@ async def pair_ranking_run(background_tasks: BackgroundTasks) -> RedirectRespons
     cur = load_symbol_ranking_result()  # сбрасывает зависший status=running
     if cur.get("status") == "running":
         return RedirectResponse(url="/scanner/pairs?busy=1", status_code=303)
+    try:
+        top_n = int(ranking_config_from_env().top_n)
+    except Exception:
+        top_n = 400
+    mark_symbol_ranking_starting(top_n=top_n)
     background_tasks.add_task(run_symbol_ranking_background)
     return RedirectResponse(url="/scanner/pairs?started=1", status_code=303)
 
@@ -1743,7 +1750,8 @@ async def pair_ranking_approve(request: Request) -> RedirectResponse:
 
 @app.get("/scanner/pairs/json", dependencies=PANEL_AUTH_DEPS)
 def pair_ranking_json() -> dict[str, Any]:
-    data = load_symbol_ranking_result()
+    # raw: не трогаем status=running при опросе прогресса (иначе сброс на 400/400)
+    data = load_symbol_ranking_result_raw()
     return {
         "status": data.get("status", "idle"),
         "kind": "pair_test",

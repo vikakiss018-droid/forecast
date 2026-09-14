@@ -389,7 +389,8 @@ def run_symbol_ranking_job(
 
 def run_symbol_ranking_background() -> None:
     try:
-        run_symbol_ranking_job(save_auto_filtered=False)
+        # Панель: после теста сразу отобрать прибыльные (R>0.5, win>50%) в filtered-файл.
+        run_symbol_ranking_job(save_auto_filtered=True)
     except Exception as e:
         save_symbol_ranking_result(
             {
@@ -450,6 +451,8 @@ def main() -> int:
 
 
 # Если процесс умер, status=running блокирует кнопку «Запустить» навечно.
+# Важно: НЕ сбрасывать по progress==total — на последней паре это нормально,
+# а опрос /scanner/pairs/json иначе убивал живой прогон до записи status=done.
 RANKING_STALE_RUNNING_SEC = 3 * 3600  # 3 часа
 
 
@@ -457,6 +460,7 @@ def clear_stale_running_ranking(
     data: dict[str, Any] | None = None,
     *,
     max_age_sec: float = RANKING_STALE_RUNNING_SEC,
+    persist: bool = True,
 ) -> dict[str, Any]:
     """Сбросить зависший status=running → error, чтобы можно было перезапустить тест."""
     if data is None:
@@ -475,13 +479,8 @@ def clear_stale_running_ranking(
         except ValueError:
             age_sec = None
 
-    progress = data.get("progress") or {}
-    cur = int(progress.get("current") or 0)
-    total = int(progress.get("total") or 0)
-    stuck_complete = total > 0 and cur >= total and not data.get("finished_at")
-    stale = age_sec is None or age_sec > max_age_sec
-
-    if not (stale or stuck_complete):
+    # Только по возрасту. progress==total без finished_at — штатный момент конца цикла.
+    if age_sec is not None and age_sec <= max_age_sec:
         return data
 
     reason = (
@@ -495,10 +494,11 @@ def clear_stale_running_ranking(
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "stale_cleared": True,
     }
-    try:
-        save_symbol_ranking_result(fixed)
-    except OSError:
-        pass
+    if persist:
+        try:
+            save_symbol_ranking_result(fixed)
+        except OSError:
+            pass
     return fixed
 
 
@@ -511,8 +511,28 @@ def load_symbol_ranking_result_raw() -> dict:
         return {"status": "error", "path": str(SYMBOL_RANKING_PATH)}
 
 
-def load_symbol_ranking_result() -> dict:
-    return clear_stale_running_ranking(load_symbol_ranking_result_raw())
+def load_symbol_ranking_result(*, clear_stale: bool = True) -> dict:
+    data = load_symbol_ranking_result_raw()
+    if clear_stale:
+        return clear_stale_running_ranking(data)
+    return data
+
+
+def mark_symbol_ranking_starting(*, top_n: int = DEFAULT_RANK_TOP_N) -> dict[str, Any]:
+    """Сразу пометить тест как running (до фонового воркера), чтобы UI не показывал старый рейтинг."""
+    payload: dict[str, Any] = {
+        "status": "running",
+        "mode": "trend_plus_range",
+        "kind": "pair_test",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "symbols_count": int(top_n),
+        "progress": {"current": 0, "total": int(top_n), "symbol": None},
+        "ranking": [],
+        "ranking_note": "тест запущен, идёт загрузка топ-N пар…",
+        "rule": "starting",
+    }
+    save_symbol_ranking_result(payload)
+    return payload
 
 
 def load_symbol_ranking_filtered() -> dict:
