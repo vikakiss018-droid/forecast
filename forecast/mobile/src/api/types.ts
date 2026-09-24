@@ -7,6 +7,7 @@ export type Setup = {
   pattern?: string;
   trend?: string;
   probability_pct?: number;
+  probability_is_heuristic?: boolean;
   risk_reward?: number;
   entry?: number;
   stop?: number;

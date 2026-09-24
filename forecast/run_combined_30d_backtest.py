@@ -83,6 +83,7 @@ def main() -> int:
             long_only=long_only,
             entry_window_start=start_s,
             entry_window_end=end_s,
+            btc_regime_filter=bool(scan_cfg.btc_regime_filter),
         ),
         deposit_usdt=deposit,
         risk_pct=risk,

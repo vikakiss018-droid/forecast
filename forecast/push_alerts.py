@@ -51,6 +51,7 @@ def flatten_setup(row: dict[str, Any], threshold: float | None = None) -> dict[s
         "pattern": row.get("pattern"),
         "trend": row.get("trend") or plan.get("trend"),
         "probability_pct": plan.get("probability_pct"),
+        "probability_is_heuristic": bool(plan.get("probability_is_heuristic", False)),
         "risk_reward": plan.get("risk_reward"),
         "entry": plan.get("entry"),
         "stop": plan.get("stop"),

@@ -17,7 +17,7 @@ from .tf_backtest import BARS_BY_TF, DEFAULT_SYMBOLS, _fetch_df, fetch_top_usdt_
 from pathlib import Path
 from typing import Any, Callable
 
-from .strategy_config import env_float, env_int, yaml_section
+from .strategy_config import env_bool, env_float, env_int, yaml_section
 from .trend_rules import TrendPullbackParams
 
 SYMBOL_RANKING_PATH = PROCESSED_DATA_DIR / "symbol_ranking_latest.json"
@@ -25,6 +25,18 @@ SYMBOL_RANKING_FILTERED_PATH = PROCESSED_DATA_DIR / "symbol_ranking_filtered_r05
 DEFAULT_RANK_TOP_N = 400
 FILTER_TOTAL_R_GT = 0.5
 FILTER_WIN_RATE_PCT_GT = 50.0
+# Аудит: 1 сделка → шум; дефолт 3, переопределение RANK_FILTER_MIN_TRADES.
+FILTER_MIN_TRADES = 3
+
+
+def _filter_min_trades() -> int:
+    raw = os.environ.get("RANK_FILTER_MIN_TRADES", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return FILTER_MIN_TRADES
 
 
 @dataclass(frozen=True)
@@ -41,6 +53,7 @@ class RankingJobConfig:
     allow_range: bool
     trend_params: TrendPullbackParams
     auto_cfg: Any
+    allow_stage1_relax: bool = False
 
     def to_meta(self) -> dict[str, Any]:
         at = self.auto_cfg
@@ -51,6 +64,7 @@ class RankingJobConfig:
             "bars": self.bars,
             "stage1_min": self.stage1_min,
             "stage1_relax": self.stage1_relax,
+            "allow_stage1_relax": self.allow_stage1_relax,
             "target_trades_per_symbol": self.target_trades_per_symbol,
             "use_top_volume": self.use_top_volume,
             "long_only": self.long_only,
@@ -128,6 +142,7 @@ def ranking_config_from_env() -> RankingJobConfig:
         bars=bars,
         stage1_min=float(scan_cfg.stage1_min_score),
         stage1_relax=stage1_relax,
+        allow_stage1_relax=env_bool("RANK_ALLOW_STAGE1_RELAX", False),
         target_trades_per_symbol=per_sym,
         use_top_volume=use_top,
         long_only=scan_cfg.long_only,
@@ -144,13 +159,14 @@ def build_filtered_ranking(
     source_path: str | None = None,
     parent_symbols_count: int | None = None,
 ) -> dict:
-    """Пары с total_r > 0.5, win_rate > 50%, хотя бы 1 сделка."""
+    """Пары с total_r > 0.5, win_rate > 50%, минимум N сделок."""
+    min_trades = _filter_min_trades()
     filtered = [
         dict(r)
         for r in ranking
         if float(r["total_r"]) > FILTER_TOTAL_R_GT
         and float(r["win_rate_pct"]) > FILTER_WIN_RATE_PCT_GT
-        and int(r["trades"]) > 0
+        and int(r["trades"]) >= min_trades
     ]
     filtered.sort(key=lambda x: -float(x["total_r"]))
     for i, row in enumerate(filtered, 1):
@@ -162,13 +178,18 @@ def build_filtered_ranking(
         "criteria": {
             "total_r_gt": FILTER_TOTAL_R_GT,
             "win_rate_pct_gt": FILTER_WIN_RATE_PCT_GT,
-            "min_trades": 1,
+            "min_trades": min_trades,
         },
         "parent_symbols_count": parent_symbols_count,
         "count": len(filtered),
         "symbols": symbols,
         "ranking": filtered,
         "ranking_note": "sorted by total_r descending (best first)",
+        "selection_bias_warning": (
+            "Universe отобран на тех же данных, что и метрики — in-sample bias. "
+            "Для OOS зафиксируйте symbols и прогоните на нетронутом окне "
+            "(MULTI_BT_START/END) без повторного фильтра по R."
+        ),
     }
 
 
@@ -228,6 +249,7 @@ def run_symbol_ranking_job(
             bars=cfg.bars,
             stage1_min=cfg.stage1_min,
             stage1_relax=cfg.stage1_relax,
+            allow_stage1_relax=cfg.allow_stage1_relax,
             target_trades_per_symbol=cfg.target_trades_per_symbol,
             use_top_volume=cfg.use_top_volume,
             long_only=cfg.long_only,
@@ -308,7 +330,7 @@ def run_symbol_ranking_job(
             allow_trend=cfg.allow_trend,
             allow_range=cfg.allow_range,
         )
-        if not sym_trades and per_sym > 0:
+        if cfg.allow_stage1_relax and not sym_trades and per_sym > 0:
             sym_trades = backtest_combined_single_symbol(
                 df,
                 symbol=symbol,
@@ -370,7 +392,8 @@ def run_symbol_ranking_job(
         filtered_payload["created_at"] = payload["finished_at"]
         filt_path = save_filtered_ranking(filtered_payload)
         print(
-            f"[rank] фильтр R>{FILTER_TOTAL_R_GT} win>{FILTER_WIN_RATE_PCT_GT}%: "
+            f"[rank] фильтр R>{FILTER_TOTAL_R_GT} win>{FILTER_WIN_RATE_PCT_GT}% "
+            f"trades>={filtered_payload['criteria']['min_trades']}: "
             f"{filtered_payload['count']} пар → {filt_path}",
             flush=True,
         )
@@ -440,7 +463,7 @@ def approve_live_symbols(symbols: list[str]) -> dict[str, Any]:
             "suggested_auto": {
                 "total_r_gt": FILTER_TOTAL_R_GT,
                 "win_rate_pct_gt": FILTER_WIN_RATE_PCT_GT,
-                "min_trades": 1,
+                "min_trades": _filter_min_trades(),
             },
         },
         "parent_symbols_count": latest.get("symbols_count"),

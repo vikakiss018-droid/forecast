@@ -20,7 +20,7 @@ import yaml
 from .auto_trader import load_auto_trade_config
 from .paper_trading import paper_min_score, record_setups_from_report, update_open_trades
 from .paths import CONFIGS_DIR, load_project_env
-from .scan_cache import save_scan_result
+from .scan_cache import save_scan_result, scan_is_actively_running
 from .trend_scanner import (
     SCAN_MODE,
     _resolve_scan_symbols,
@@ -41,6 +41,9 @@ def _load_auto_trade_yaml(config_path: str) -> dict:
 
 def main() -> int:
     load_project_env(force=True)
+    if scan_is_actively_running(max_age_sec=180.0):
+        print("[combined] skip: live scan already running (avoid Binance rate-limit hang)", flush=True)
+        return 0
     config_path = os.environ.get("FORECAST_CONFIG", "configs/config.yaml")
     scan_cfg = trend_scan_config_from_env()
     auto_yaml = _load_auto_trade_yaml(config_path)

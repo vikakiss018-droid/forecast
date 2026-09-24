@@ -4,6 +4,7 @@ import asyncio
 import html
 import logging
 import os
+import time
 from dataclasses import replace
 from typing import Annotated, Any
 from urllib.parse import quote
@@ -47,6 +48,7 @@ from .trend_scanner import (
 )
 from .auto_trader import load_auto_trade_config
 from .scan_cache import (
+    clear_stale_running_scan,
     load_scan_history,
     load_scan_progress,
     load_scan_result,
@@ -442,6 +444,7 @@ def _on_startup() -> None:
     ]
     loop.create_task(start_orderbook_stream(legacy_symbols))
     loop.create_task(_live_scan_loop())
+    clear_stale_running_scan(max_age_sec=180.0)
 
 
 async def _live_scan_loop() -> None:
@@ -452,8 +455,9 @@ async def _live_scan_loop() -> None:
         if interval <= 0:
             await asyncio.sleep(30)
             continue
+        t0 = time.monotonic()
         try:
-            cur = load_scan_progress()
+            cur = clear_stale_running_scan(max_age_sec=180.0)
             if str(cur.get("status") or "") != "running":
                 cfg = trend_scan_config_from_env()
                 await asyncio.to_thread(
@@ -466,7 +470,12 @@ async def _live_scan_loop() -> None:
         except Exception:
             _log.exception("scheduled live scan failed")
         nxt = live_scan_interval_sec()
-        await asyncio.sleep(nxt if nxt > 0 else 30)
+        if nxt <= 0:
+            await asyncio.sleep(30)
+            continue
+        # Интервал от старта до старта, а не «скан + ещё 5 минут» (иначе выходит ~15 мин).
+        wait = max(5.0, float(nxt) - (time.monotonic() - t0))
+        await asyncio.sleep(wait)
 
 
 def _is_phone_request(
@@ -1551,14 +1560,17 @@ def _run_live_scan_background(
     auto_cfg = load_auto_trade_config(_auto_trade_yaml())
 
     def on_progress(p: dict[str, Any]) -> None:
-        save_scan_progress(
-            {
-                "status": "running",
-                "kind": "live_scan",
-                "started_at": started_at,
-                "progress": p,
-            }
-        )
+        try:
+            save_scan_progress(
+                {
+                    "status": "running",
+                    "kind": "live_scan",
+                    "started_at": started_at,
+                    "progress": p,
+                }
+            )
+        except OSError:
+            _log.exception("scan progress write failed")
 
     try:
         rep = scan_combined_setups(
@@ -1783,7 +1795,7 @@ def orderbook_json() -> dict[str, Any]:
 async def live_scan_run(request: Request, background_tasks: BackgroundTasks) -> RedirectResponse:
     form = await request.form()
     return_q = str(form.get("return_q", "")).strip()
-    cur = load_scan_progress()
+    cur = clear_stale_running_scan(max_age_sec=180.0)
     if cur.get("status") == "running":
         sep = "&" if return_q else ""
         return RedirectResponse(url=f"/scanner?{return_q}{sep}scan_busy=1", status_code=303)

@@ -103,12 +103,27 @@ def _future_return_at_row(
     return float(close[future_bar] / close[anchor_bar] - 1.0)
 
 
+def _standardize_train_query(
+    X_train: np.ndarray,
+    X_query: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Walk-forward z-score: mean/std только по train (без query)."""
+    mu = np.nanmean(X_train, axis=0)
+    sigma = np.nanstd(X_train, axis=0)
+    sigma = np.where(np.isfinite(sigma) & (sigma >= 1e-12), sigma, 1.0)
+    mu = np.where(np.isfinite(mu), mu, 0.0)
+    return (X_train - mu) / sigma, (X_query - mu) / sigma
+
+
 def _knn_train_indices_and_model(
     X: np.ndarray,
     tags: list[str],
     cfg: SimilarityConfig,
-) -> tuple[np.ndarray, NearestNeighbors]:
-    """Train kNN on regime-matched rows (excluding last row), with fallback."""
+) -> tuple[np.ndarray, NearestNeighbors, np.ndarray]:
+    """Train kNN on regime-matched rows (excluding last row), with fallback.
+
+    Returns train_idx, fitted nn, and scaled query row (1, n_features).
+    """
     m = X.shape[0]
     R = tags[-1]
     all_train = np.arange(m - 1, dtype=int)
@@ -124,12 +139,14 @@ def _knn_train_indices_and_model(
     if train_idx.size < 1:
         train_idx = all_train
 
-    X_train = X[train_idx]
+    X_train_raw = X[train_idx]
+    q_raw = X[-1:].copy()
+    X_train, q = _standardize_train_query(X_train_raw, q_raw)
     k = min(cfg.n_neighbors, X_train.shape[0])
     k = max(k, 1)
     nn = NearestNeighbors(n_neighbors=k, metric="euclidean", algorithm="auto")
     nn.fit(X_train)
-    return train_idx, nn
+    return train_idx, nn, q
 
 
 def knn_weighted_neighbor_returns(
@@ -147,10 +164,8 @@ def knn_weighted_neighbor_returns(
 
     close = df["close"].to_numpy(dtype=float)
     tags = _regime_tag_per_anchor(df, cfg.window_bars)
-    train_idx, nn = _knn_train_indices_and_model(X, tags, cfg)
+    train_idx, nn, q = _knn_train_indices_and_model(X, tags, cfg)
 
-    X_train = X[train_idx]
-    q = X[-1:].copy()
     dists, knn_cols = nn.kneighbors(q, return_distance=True)
     dists = dists[0].astype(float)
     orig_rows = train_idx[knn_cols[0]]

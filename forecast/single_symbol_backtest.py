@@ -5,6 +5,7 @@ Walk-forward backtest: historical OHLCV + trend following (no kNN).
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -94,6 +95,39 @@ def _filter_trades_entry_window(
         if start <= et <= end:
             out.append(t)
     return out
+
+
+def _apply_portfolio_concurrency(
+    trades: list[dict[str, Any]],
+    *,
+    max_open_positions: int = 6,
+) -> tuple[list[dict[str, Any]], int]:
+    """Хронологический портфель: не больше max одновременных позиций (как live cap)."""
+    if max_open_positions <= 0 or not trades:
+        ordered = sorted(trades, key=lambda t: str(t.get("entry_time") or ""))
+        return ordered, 0
+    ordered = sorted(
+        trades,
+        key=lambda t: (
+            str(t.get("entry_time") or ""),
+            str(t.get("symbol") or ""),
+        ),
+    )
+    open_exits: list[pd.Timestamp] = []
+    kept: list[dict[str, Any]] = []
+    skipped = 0
+    for t in ordered:
+        et = _parse_bt_timestamp(str(t["entry_time"]))
+        xt = _parse_bt_timestamp(str(t.get("exit_time") or t["entry_time"]))
+        open_exits = [x for x in open_exits if x > et]
+        if len(open_exits) >= max_open_positions:
+            skipped += 1
+            continue
+        open_exits.append(xt)
+        kept.append(t)
+    return kept, skipped
+
+
 DEFAULT_LEVERAGE = 1
 DEFAULT_MAX_NOTIONAL_USDT = 50.0
 
@@ -154,6 +188,61 @@ def enrich_trades_sizing(
         t["pnl_usdt"] = round(pnl, 2)
 
 
+def _next_bar_fill(
+    df: pd.DataFrame,
+    signal_i: int,
+    *,
+    side: str,
+    plan_entry: float,
+    stop: float,
+) -> tuple[int, float] | None:
+    """Вход по open следующего бара после сигнала (как live market после закрытой свечи)."""
+    fill_i = signal_i + 1
+    if fill_i >= len(df) - 1:
+        return None
+    entry = float(df.iloc[fill_i]["open"])
+    max_dev = float(os.environ.get("BT_MAX_ENTRY_DEV_PCT", "0.015") or 0.015)
+    if max_dev > 0 and abs(entry - plan_entry) / max(abs(plan_entry), 1e-12) > max_dev:
+        return None
+    if side == "long" and stop >= entry:
+        return None
+    if side == "short" and stop <= entry:
+        return None
+    return fill_i, entry
+
+
+def _load_btc_regime_df(
+    exchange: Any,
+    *,
+    enabled: bool,
+    window_start: pd.Timestamp | None,
+    window_end: pd.Timestamp | None,
+) -> pd.DataFrame | None:
+    """Единый BTC 4h ряд для всего портфельного BT; при включённом фильтре fail closed."""
+    if not enabled:
+        return None
+    from .trend_scanner import BTC_REGIME_BARS, BTC_REGIME_SYMBOL, BTC_REGIME_TIMEFRAME
+
+    if window_start is not None and window_end is not None:
+        df_btc = _fetch_df_date_window(
+            exchange,
+            BTC_REGIME_SYMBOL,
+            BTC_REGIME_TIMEFRAME,
+            start=window_start,
+            end=window_end,
+        )
+    else:
+        df_btc = _fetch_df(
+            exchange,
+            BTC_REGIME_SYMBOL,
+            BTC_REGIME_TIMEFRAME,
+            BTC_REGIME_BARS,
+        )
+    if df_btc is None:
+        raise RuntimeError("BTC regime filter enabled, but closed BTC/USDT 4h data is unavailable")
+    return df_btc
+
+
 @dataclass
 class MultiSymbolBacktestConfig:
     symbols: tuple[str, ...] = DEFAULT_SYMBOLS
@@ -174,6 +263,10 @@ class MultiSymbolBacktestConfig:
     entry_window_start: str | None = None  # YYYY-MM-DD, UTC
     entry_window_end: str | None = None
     btc_regime_filter: bool = False
+    # Relaxed stage1 fallback искажает финальный тест — по умолчанию выкл.
+    allow_stage1_relax: bool = False
+    # Портфельный cap одновременных позиций (0 = без лимита, только сортировка по времени).
+    max_open_positions: int = 6
 
 
 @dataclass(frozen=True)
@@ -217,6 +310,7 @@ def _peek_trend_entry(
     exit_profit_pct: float | None = None,
 ) -> TrendEntryCandidate | None:
     sub = df.iloc[: next_i + 1]
+    decision_time = df.index[next_i + 1]
     snap = _stage1_snapshot(sub)
 
     plan = build_trend_plan(sub, snap, trend_params) if trend_only else None
@@ -229,14 +323,16 @@ def _peek_trend_entry(
     if trend_params.require_htf_align:
         if df_htf is None:
             return None
-        aligned, htf_trend = htf_trend_aligned(df_htf, sub.index[-1], str(plan["trend"]), trend_params)
+        aligned, htf_trend = htf_trend_aligned(
+            df_htf, decision_time, str(plan["trend"]), trend_params
+        )
         if not aligned:
             return None
 
     if btc_regime_filter and df_btc is not None:
         from .trend_scanner import btc_regime_at
 
-        regime = btc_regime_at(df_btc, sub.index[-1])
+        regime = btc_regime_at(df_btc, decision_time)
         direction = str(plan.get("direction", "")).strip()
         if regime == "bear" and direction == "Long":
             return None
@@ -271,20 +367,24 @@ def _peek_trend_entry(
         return None
 
     side = str(plan["direction"]).lower()
-    entry = close
     stop = float(plan["stop"])
+    filled = _next_bar_fill(df, next_i, side=side, plan_entry=close, stop=stop)
+    if filled is None:
+        return None
+    fill_i, entry = filled
     tp = _tp_for_profit_close(side, entry, float(plan["target_2"]), exit_profit_pct)
     exit_px, exit_reason, exit_i = _simulate_exit(
         df,
-        next_i,
+        fill_i,
         side=side,
         entry=entry,
         stop=stop,
         tp=tp,
         max_bars=max_hold,
+        include_entry_bar=True,
     )
     r_mult = _trade_r(side, entry, exit_px, stop)
-    entry_time = sub.index[-1]
+    entry_time = df.index[fill_i]
     trade = {
         "symbol": symbol,
         "timeframe": timeframe,
@@ -299,6 +399,7 @@ def _peek_trend_entry(
         "trend_support": support,
         "trend_resistance": resistance,
         "entry_time": str(entry_time),
+        "signal_time": str(sub.index[-1]),
         "exit_time": str(df.index[exit_i]),
         "entry": entry,
         "exit": exit_px,
@@ -334,15 +435,27 @@ def _peek_range_entry(
     cooldown_bars: int,
     trend_params: TrendPullbackParams,
     long_only: bool = False,
+    df_btc: pd.DataFrame | None = None,
+    btc_regime_filter: bool = False,
     exit_profit_pct: float | None = None,
 ) -> TrendEntryCandidate | None:
     sub = df.iloc[: next_i + 1]
+    decision_time = df.index[next_i + 1]
     snap = _stage1_snapshot(sub)
     plan = build_range_plan(sub, snap, trend_params)
     if plan is None:
         return None
     if long_only and str(plan.get("direction", "")).strip().lower() == "short":
         return None
+    if btc_regime_filter and df_btc is not None:
+        from .trend_scanner import btc_regime_at
+
+        regime = btc_regime_at(df_btc, decision_time)
+        direction = str(plan.get("direction", "")).strip()
+        if regime == "bear" and direction == "Long":
+            return None
+        if regime == "bull" and direction == "Short":
+            return None
 
     support = float(plan["trend_support"])
     resistance = float(plan["trend_resistance"])
@@ -372,20 +485,24 @@ def _peek_range_entry(
         return None
 
     side = str(plan["direction"]).lower()
-    entry = close
     stop = float(plan["stop"])
+    filled = _next_bar_fill(df, next_i, side=side, plan_entry=close, stop=stop)
+    if filled is None:
+        return None
+    fill_i, entry = filled
     tp = _tp_for_profit_close(side, entry, float(plan["target_2"]), exit_profit_pct)
     exit_px, exit_reason, exit_i = _simulate_exit(
         df,
-        next_i,
+        fill_i,
         side=side,
         entry=entry,
         stop=stop,
         tp=tp,
         max_bars=max_hold,
+        include_entry_bar=True,
     )
     r_mult = _trade_r(side, entry, exit_px, stop)
-    entry_time = sub.index[-1]
+    entry_time = df.index[fill_i]
     trade = {
         "symbol": symbol,
         "timeframe": timeframe,
@@ -403,6 +520,7 @@ def _peek_range_entry(
         "resistance_touches": plan.get("resistance_touches"),
         "entry_level_touches": plan.get("entry_level_touches"),
         "entry_time": str(entry_time),
+        "signal_time": str(sub.index[-1]),
         "exit_time": str(df.index[exit_i]),
         "entry": entry,
         "exit": exit_px,
@@ -438,6 +556,8 @@ def backtest_range_single_symbol(
     cooldown_bars: int = COOLDOWN_BARS,
     trend_params: TrendPullbackParams | None = None,
     long_only: bool = False,
+    df_btc: pd.DataFrame | None = None,
+    btc_regime_filter: bool = False,
     exit_profit_pct: float | None = None,
 ) -> list[dict[str, Any]]:
     params = trend_params or DEFAULT_TREND_PARAMS
@@ -462,6 +582,8 @@ def backtest_range_single_symbol(
             cooldown_bars=cooldown_bars,
             trend_params=params,
             long_only=long_only,
+            df_btc=df_btc,
+            btc_regime_filter=btc_regime_filter,
             exit_profit_pct=exit_profit_pct,
         )
         if cand is None:
@@ -538,6 +660,8 @@ def backtest_combined_single_symbol(
                 cooldown_bars=cooldown_bars,
                 trend_params=params,
                 long_only=long_only,
+                df_btc=df_btc,
+                btc_regime_filter=btc_regime_filter,
                 exit_profit_pct=exit_profit_pct,
             )
             regime = "range"
@@ -590,6 +714,13 @@ def run_combined_multi_symbol_backtest(
             )
         return _fetch_df(exchange, symbol, cfg.timeframe, cfg.bars)
 
+    df_btc = _load_btc_regime_df(
+        exchange,
+        enabled=cfg.btc_regime_filter,
+        window_start=win_start,
+        window_end=win_end,
+    )
+
     for symbol in cfg.symbols:
         df = _load_df(symbol)
         if df is None:
@@ -619,6 +750,8 @@ def run_combined_multi_symbol_backtest(
                 trend_params=trend_params,
                 df_htf=df_htf,
                 long_only=cfg.long_only,
+                df_btc=df_btc,
+                btc_regime_filter=cfg.btc_regime_filter,
             )
             for t in sym_trades:
                 t.setdefault("regime", "trend")
@@ -635,6 +768,8 @@ def run_combined_multi_symbol_backtest(
                 long_only=cfg.long_only,
                 allow_trend=True,
                 allow_range=True,
+                df_btc=df_btc,
+                btc_regime_filter=cfg.btc_regime_filter,
             )
         all_trades.extend(sym_trades)
         n_t = sum(1 for t in sym_trades if t.get("regime") == "trend")
@@ -647,10 +782,22 @@ def run_combined_multi_symbol_backtest(
     if win_start is not None and win_end is not None:
         all_trades = _filter_trades_entry_window(all_trades, start=win_start, end=win_end)
 
+    all_trades, portfolio_skipped = _apply_portfolio_concurrency(
+        all_trades, max_open_positions=int(cfg.max_open_positions)
+    )
+    if portfolio_skipped:
+        print(
+            f"[combined_bt] portfolio cap max_open={cfg.max_open_positions}: "
+            f"skipped {portfolio_skipped} overlapping entries",
+            flush=True,
+        )
+
     trend_trades = [t for t in all_trades if t.get("regime") == "trend"]
     range_trades = [t for t in all_trades if t.get("regime") == "range"]
 
     stats = _summarize(all_trades, deposit_usdt=deposit_usdt, risk_pct=risk_pct, leverage=1)
+    stats["portfolio_skipped"] = portfolio_skipped
+    stats["max_open_positions"] = int(cfg.max_open_positions)
     stats_trend = _summarize(trend_trades, deposit_usdt=deposit_usdt, risk_pct=risk_pct, leverage=1)
     stats_range = _summarize(range_trades, deposit_usdt=deposit_usdt, risk_pct=risk_pct, leverage=1)
     by_symbol = _aggregate_by_symbol(all_trades)
@@ -661,6 +808,8 @@ def run_combined_multi_symbol_backtest(
         "status": "done",
         "mode": "trend_plus_range",
         "long_only": cfg.long_only,
+        "btc_regime_filter": bool(cfg.btc_regime_filter),
+        "btc_regime_timeframe": "4h" if cfg.btc_regime_filter else None,
         "rule": (
             "на каждом баре: тренд (up/down) или флет (range); "
             f"rel_volume>={trend_params.min_rel_volume}; stage1>=18; validate_setup RR>=1.5"
@@ -727,6 +876,13 @@ def run_range_multi_symbol_backtest(
             )
         return _fetch_df(exchange, symbol, cfg.timeframe, cfg.bars)
 
+    df_btc = _load_btc_regime_df(
+        exchange,
+        enabled=cfg.btc_regime_filter,
+        window_start=win_start,
+        window_end=win_end,
+    )
+
     for symbol in cfg.symbols:
         df = _load_df(symbol)
         if df is None:
@@ -741,6 +897,8 @@ def run_range_multi_symbol_backtest(
             target_trades=UNLIMITED_TARGET_TRADES,
             trend_params=trend_params,
             long_only=cfg.long_only,
+            df_btc=df_btc,
+            btc_regime_filter=cfg.btc_regime_filter,
         )
         all_trades.extend(sym_trades)
         print(f"[range_bt] {symbol}: +{len(sym_trades)} (total {len(all_trades)})", flush=True)
@@ -748,12 +906,24 @@ def run_range_multi_symbol_backtest(
     if win_start is not None and win_end is not None:
         all_trades = _filter_trades_entry_window(all_trades, start=win_start, end=win_end)
 
+    all_trades, portfolio_skipped = _apply_portfolio_concurrency(
+        all_trades, max_open_positions=int(cfg.max_open_positions)
+    )
+    if portfolio_skipped:
+        print(
+            f"[range_bt] portfolio cap max_open={cfg.max_open_positions}: "
+            f"skipped {portfolio_skipped} overlapping entries",
+            flush=True,
+        )
+
     stats = _summarize(
         all_trades,
         deposit_usdt=deposit_usdt,
         risk_pct=risk_pct,
         leverage=1,
     )
+    stats["portfolio_skipped"] = portfolio_skipped
+    stats["max_open_positions"] = int(cfg.max_open_positions)
     by_symbol = _aggregate_by_symbol(all_trades)
     long_n = sum(1 for t in all_trades if str(t.get("side")) == "long")
     short_n = len(all_trades) - long_n
@@ -777,6 +947,8 @@ def run_range_multi_symbol_backtest(
         "mode": "range_bounce",
         "entry_style": "range_bounce",
         "long_only": cfg.long_only,
+        "btc_regime_filter": bool(cfg.btc_regime_filter),
+        "btc_regime_timeframe": "4h" if cfg.btc_regime_filter else None,
         "rule": (
             f"флет detect_price_trend=range; отскок от S/R; "
             f"min_level_touches>={trend_params.min_level_touches}; "
@@ -982,9 +1154,14 @@ def run_multi_symbol_backtest(
             )
         return _fetch_df(exchange, symbol, cfg.timeframe, cfg.bars)
 
+    df_btc = _load_btc_regime_df(
+        exchange,
+        enabled=cfg.btc_regime_filter,
+        window_start=win_start,
+        window_end=win_end,
+    )
+
     for symbol in cfg.symbols:
-        if not unlimited and len(all_trades) >= cfg.target_trades:
-            break
         df = _load_df(symbol)
         if df is None:
             print(f"[multi_bt] skip {symbol}: no data", flush=True)
@@ -1000,31 +1177,28 @@ def run_multi_symbol_backtest(
             if df_htf is None:
                 print(f"[multi_bt] skip {symbol}: no {cfg.htf_timeframe} data", flush=True)
                 continue
-        need = UNLIMITED_TARGET_TRADES if unlimited else cfg.target_trades - len(all_trades)
         sym_trades = backtest_single_symbol(
             df,
             symbol=symbol,
             timeframe=cfg.timeframe,
             auto_cfg=auto_cfg,
             stage1_min=cfg.stage1_min_score,
-            target_trades=need,
+            target_trades=UNLIMITED_TARGET_TRADES,
             trend_only=cfg.trend_only,
             trend_params=trend_params,
             df_htf=df_htf,
             long_only=cfg.long_only,
-            df_btc=None,
+            df_btc=df_btc,
             btc_regime_filter=cfg.btc_regime_filter,
         )
         all_trades.extend(sym_trades)
         print(f"[multi_bt] {symbol}: +{len(sym_trades)} (total {len(all_trades)})", flush=True)
-        if not unlimited and len(all_trades) >= cfg.target_trades:
-            all_trades = all_trades[: cfg.target_trades]
-            break
 
-    if unlimited or len(all_trades) < cfg.target_trades:
+    allow_relax = bool(cfg.allow_stage1_relax) or os.environ.get(
+        "MULTI_BT_ALLOW_STAGE1_RELAX", ""
+    ).strip().lower() in ("1", "true", "yes")
+    if allow_relax:
         for symbol in cfg.symbols:
-            if not unlimited and len(all_trades) >= cfg.target_trades:
-                break
             df = _load_df(symbol)
             if df is None:
                 continue
@@ -1038,19 +1212,18 @@ def run_multi_symbol_backtest(
                     df_htf = _fetch_df(exchange, symbol, cfg.htf_timeframe, htf_bars)
                 if df_htf is None:
                     continue
-            need = UNLIMITED_TARGET_TRADES if unlimited else cfg.target_trades - len(all_trades)
             extra = backtest_single_symbol(
                 df,
                 symbol=symbol,
                 timeframe=cfg.timeframe,
                 auto_cfg=auto_cfg,
                 stage1_min=cfg.stage1_relax_score,
-                target_trades=need,
+                target_trades=UNLIMITED_TARGET_TRADES,
                 trend_only=cfg.trend_only,
                 trend_params=trend_params,
                 df_htf=df_htf,
                 long_only=cfg.long_only,
-                df_btc=None,
+                df_btc=df_btc,
                 btc_regime_filter=cfg.btc_regime_filter,
             )
             seen = {(t["symbol"], t["entry_time"]) for t in all_trades}
@@ -1059,12 +1232,25 @@ def run_multi_symbol_backtest(
                 if key not in seen:
                     all_trades.append(t)
                     seen.add(key)
-                if not unlimited and len(all_trades) >= cfg.target_trades:
-                    all_trades = all_trades[: cfg.target_trades]
-                    break
+    elif not allow_relax:
+        print("[multi_bt] stage1 relax fallback disabled (audit: fixed rules)", flush=True)
 
     if win_start is not None and win_end is not None:
         all_trades = _filter_trades_entry_window(all_trades, start=win_start, end=win_end)
+
+    all_trades, portfolio_skipped = _apply_portfolio_concurrency(
+        all_trades, max_open_positions=int(cfg.max_open_positions)
+    )
+    # target применяется только после глобальной хронологической сортировки/cap,
+    # поэтому результат не зависит от порядка symbols.
+    if not unlimited:
+        all_trades = all_trades[: cfg.target_trades]
+    if portfolio_skipped:
+        print(
+            f"[multi_bt] portfolio cap max_open={cfg.max_open_positions}: "
+            f"skipped {portfolio_skipped} overlapping entries",
+            flush=True,
+        )
 
     if cfg.use_leverage_sizing and cfg.leverage > 1:
         enrich_trades_sizing(
@@ -1082,6 +1268,8 @@ def run_multi_symbol_backtest(
     )
     stats["target_reached"] = unlimited or len(all_trades) >= cfg.target_trades
     stats["unlimited_trades"] = unlimited
+    stats["portfolio_skipped"] = portfolio_skipped
+    stats["max_open_positions"] = int(cfg.max_open_positions)
     by_symbol = _aggregate_by_symbol(all_trades)
     long_n = sum(1 for t in all_trades if str(t.get("side")) == "long")
     short_n = len(all_trades) - long_n
@@ -1091,6 +1279,8 @@ def run_multi_symbol_backtest(
         "mode": "trend_momentum",
         "entry_style": "momentum",
         "long_only": cfg.long_only,
+        "btc_regime_filter": bool(cfg.btc_regime_filter),
+        "btc_regime_timeframe": "4h" if cfg.btc_regime_filter else None,
         "require_with_trend_level": trend_params.require_with_trend_level,
         "rule": (
             f"{cfg.timeframe} тренд; импульс; rel_volume>={trend_params.min_rel_volume}; "

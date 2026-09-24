@@ -408,14 +408,14 @@ def build_trend_plan(
         tp1 = entry - 1.0 * risk
 
     rr = abs(tp2 - entry) / risk
-    prob = 62.0 if direction == "Long" else 38.0
-    if direction == "Short":
-        prob = 62.0
-
+    # Эвристика направления, не калиброванная вероятность.
+    prob = 62.0
     style = "pullback" if params.require_pullback else "momentum"
     return {
         "direction": direction,
         "probability_pct": float(prob),
+        "heuristic_confidence": float(prob),
+        "probability_is_heuristic": True,
         "entry": float(entry),
         "stop": float(stop),
         "target_1": float(tp1),
@@ -513,6 +513,8 @@ def build_range_plan(
     return {
         "direction": direction,
         "probability_pct": 55.0,
+        "heuristic_confidence": 55.0,
+        "probability_is_heuristic": True,
         "entry": float(entry),
         "stop": float(stop),
         "target_1": float(tp1),
@@ -531,16 +533,38 @@ def build_range_plan(
     }
 
 
+def htf_bar_closed_as_of(open_time: pd.Timestamp, timeframe: str, as_of: pd.Timestamp) -> bool:
+    """True, если HTF-бар с open_time уже полностью закрыт к as_of."""
+    from .liquidity_model import timeframe_to_minutes
+
+    ot = pd.Timestamp(open_time)
+    ao = pd.Timestamp(as_of)
+    if ot.tzinfo is None:
+        ot = ot.tz_localize("UTC")
+    else:
+        ot = ot.tz_convert("UTC")
+    if ao.tzinfo is None:
+        ao = ao.tz_localize("UTC")
+    else:
+        ao = ao.tz_convert("UTC")
+    close_time = ot + pd.Timedelta(minutes=timeframe_to_minutes(timeframe))
+    return close_time <= ao
+
+
 def htf_trend_at(
     df_htf: pd.DataFrame,
     as_of: pd.Timestamp,
     params: TrendPullbackParams | None = None,
+    *,
+    htf_timeframe: str | None = None,
 ) -> str:
-    """Тренд на старшем TF по закрытым барам ≤ as_of (без lookahead)."""
+    """Тренд на старшем TF только по полностью закрытым барам (open_time + TF <= as_of)."""
     params = params or DEFAULT_PULLBACK_PARAMS
     if df_htf is None or df_htf.empty:
         return "range"
-    sub = df_htf[df_htf.index <= as_of]
+    tf = htf_timeframe or params.htf_timeframe or "4h"
+    closed_mask = [htf_bar_closed_as_of(ts, tf, as_of) for ts in df_htf.index]
+    sub = df_htf.loc[closed_mask]
     if len(sub) < params.trend_lookback + 5:
         return "range"
     return detect_price_trend(sub, params)
@@ -555,7 +579,8 @@ def htf_trend_aligned(
     """1h-сигнал только если 4h (HTF) в том же направлении."""
     if ltf_trend not in ("up", "down"):
         return False, "ltf_range"
-    htf = htf_trend_at(df_htf, as_of, params)
+    params = params or DEFAULT_PULLBACK_PARAMS
+    htf = htf_trend_at(df_htf, as_of, params, htf_timeframe=params.htf_timeframe)
     if htf == "range":
         return False, "htf_range"
     if htf != ltf_trend:
@@ -564,9 +589,10 @@ def htf_trend_aligned(
 
 
 def trend_only_stats(_snap: dict[str, Any], plan: dict[str, Any]) -> Any:
+    """Эвристическая уверенность (не калиброванная вероятность)."""
     trend = str(plan.get("trend", "range"))
     if trend == "up":
-        return SimpleNamespace(prob_up=0.65, prob_down=0.35)
+        return SimpleNamespace(prob_up=0.65, prob_down=0.35, heuristic_confidence=0.65)
     if trend == "down":
-        return SimpleNamespace(prob_up=0.35, prob_down=0.65)
-    return SimpleNamespace(prob_up=0.5, prob_down=0.5)
+        return SimpleNamespace(prob_up=0.35, prob_down=0.65, heuristic_confidence=0.65)
+    return SimpleNamespace(prob_up=0.5, prob_down=0.5, heuristic_confidence=0.5)

@@ -20,6 +20,7 @@ function normalizeSetup(row: Record<string, unknown>, threshold: number): Setup 
     pattern: row.pattern as string | undefined,
     trend: (row.trend ?? plan.trend) as string | undefined,
     probability_pct: plan.probability_pct as number | undefined,
+    probability_is_heuristic: plan.probability_is_heuristic as boolean | undefined,
     risk_reward: plan.risk_reward as number | undefined,
     entry: plan.entry as number | undefined,
     stop: plan.stop as number | undefined,

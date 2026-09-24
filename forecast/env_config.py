@@ -35,6 +35,12 @@ EDITABLE_KEYS: tuple[str, ...] = (
     "RANK_TOP_N",
     "RANK_TARGET_PER_SYMBOL",
     "RANK_STAGE1_RELAX_SCORE",
+    "RANK_ALLOW_STAGE1_RELAX",
+    "RANK_FILTER_MIN_TRADES",
+    "AUTO_TRADE_MAX_SIGNAL_AGE_SEC",
+    "AUTO_TRADE_MAX_ENTRY_DEV_PCT",
+    "BT_MAX_ENTRY_DEV_PCT",
+    "MULTI_BT_ALLOW_STAGE1_RELAX",
 )
 
 SETTINGS_META: list[dict[str, Any]] = [
@@ -73,6 +79,48 @@ SETTINGS_META: list[dict[str, Any]] = [
     {"key": "RANK_TOP_N", "label": "Тест пар: кол-во пар", "type": "int", "group": "rank"},
     {"key": "RANK_TARGET_PER_SYMBOL", "label": "Тест пар: сделок на пару", "type": "int", "group": "rank"},
     {"key": "RANK_STAGE1_RELAX_SCORE", "label": "Тест пар: stage1 relax", "type": "float", "group": "rank"},
+    {
+        "key": "RANK_ALLOW_STAGE1_RELAX",
+        "label": "Тест пар: разрешить stage1 relax",
+        "type": "bool",
+        "group": "rank",
+        "default": "false",
+    },
+    {
+        "key": "RANK_FILTER_MIN_TRADES",
+        "label": "Filtered ranking: мин. сделок",
+        "type": "int",
+        "group": "rank",
+        "default": "3",
+    },
+    {
+        "key": "AUTO_TRADE_MAX_SIGNAL_AGE_SEC",
+        "label": "Авто: TTL сигнала, сек (0=авто 2×TF)",
+        "type": "float",
+        "group": "scan",
+        "default": "0",
+    },
+    {
+        "key": "AUTO_TRADE_MAX_ENTRY_DEV_PCT",
+        "label": "Авто: max отклонение mark от entry (0.015)",
+        "type": "float",
+        "group": "scan",
+        "default": "0.015",
+    },
+    {
+        "key": "BT_MAX_ENTRY_DEV_PCT",
+        "label": "BT: max отклонение next-bar open (0.015)",
+        "type": "float",
+        "group": "rank",
+        "default": "0.015",
+    },
+    {
+        "key": "MULTI_BT_ALLOW_STAGE1_RELAX",
+        "label": "BT: разрешить stage1 relax fallback",
+        "type": "bool",
+        "group": "rank",
+        "default": "false",
+    },
 ]
 
 _ENV_LINE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")

@@ -200,6 +200,8 @@ def _add_backtest_min_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def _fetch_df(exchange: ccxt.Exchange, symbol: str, timeframe: str, bars: int) -> pd.DataFrame | None:
     try:
+        if getattr(exchange, "timeout", None) in (None, 0) or int(exchange.timeout) > 20_000:
+            exchange.timeout = 15_000
         rows = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=bars)
     except Exception:
         return None
@@ -293,9 +295,11 @@ def _simulate_exit(
     stop: float,
     tp: float,
     max_bars: int,
+    include_entry_bar: bool = False,
 ) -> tuple[float, str, int]:
-    end = min(entry_i + 1 + max_bars, len(df))
-    for j in range(entry_i + 1, end):
+    start = entry_i if include_entry_bar else entry_i + 1
+    end = min(start + max_bars, len(df))
+    for j in range(start, end):
         row = df.iloc[j]
         hi = float(row["high"])
         lo = float(row["low"])

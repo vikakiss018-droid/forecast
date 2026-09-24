@@ -112,9 +112,11 @@ def load_scan_history(limit: int = 30) -> list[dict[str, Any]]:
 
 def save_scan_progress(payload: dict[str, Any]) -> None:
     ensure_directories()
-    SCAN_PROGRESS_PATH.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    row = dict(payload)
+    row.setdefault("updated_at", datetime.now(timezone.utc).isoformat())
+    tmp = SCAN_PROGRESS_PATH.with_suffix(SCAN_PROGRESS_PATH.suffix + ".tmp")
+    tmp.write_text(json.dumps(row, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(SCAN_PROGRESS_PATH)
 
 
 def load_scan_progress() -> dict[str, Any]:
@@ -124,7 +126,54 @@ def load_scan_progress() -> dict[str, Any]:
         data = json.loads(SCAN_PROGRESS_PATH.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {"status": "idle"}
     except (json.JSONDecodeError, OSError):
-        return {"status": "error", "error": "bad progress file"}
+        return {"status": "idle"}
+
+
+def _progress_age_sec(data: dict[str, Any]) -> float | None:
+    raw = str(data.get("updated_at") or data.get("started_at") or "").strip()
+    if not raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - ts.astimezone(timezone.utc)).total_seconds()
+    except ValueError:
+        return None
+
+
+def scan_is_actively_running(*, max_age_sec: float = 180.0) -> bool:
+    cur = load_scan_progress()
+    if str(cur.get("status") or "") != "running":
+        return False
+    age = _progress_age_sec(cur)
+    return age is None or age <= max_age_sec
+
+
+def clear_stale_running_scan(
+    data: dict[str, Any] | None = None,
+    *,
+    max_age_sec: float = 180.0,
+    persist: bool = True,
+) -> dict[str, Any]:
+    """Если live-скан завис (нет heartbeat), сбросить running — иначе 5-мин цикл не стартует."""
+    cur = data if data is not None else load_scan_progress()
+    if str(cur.get("status") or "") != "running":
+        return cur
+    age = _progress_age_sec(cur)
+    if age is None or age <= max_age_sec:
+        return cur
+    cleared = {
+        "status": "idle",
+        "kind": cur.get("kind") or "live_scan",
+        "error": f"stale running ({int(age)}s without progress)",
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "progress": cur.get("progress") or {},
+    }
+    if persist:
+        save_scan_progress(cleared)
+        print(f"[scanner] cleared stale running scan after {int(age)}s", flush=True)
+    return cleared
 
 
 def clear_scan_progress() -> None:

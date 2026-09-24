@@ -87,7 +87,7 @@ def _resolve_scan_symbols(scan_cfg: TrendScanConfig) -> tuple[str, ...]:
         if filtered:
             return filtered
     n = max(1, int(scan_cfg.universe_top_n or 400))
-    ex = ccxt.binance({"enableRateLimit": True})
+    ex = ccxt.binance({"enableRateLimit": True, "timeout": 15_000})
     return without_bstocks(fetch_top_usdt_symbols(ex, limit=n))
 
 
@@ -228,10 +228,13 @@ def _btc_regime_from_df(df: pd.DataFrame) -> str:
 
 
 def btc_regime_at(df_btc: pd.DataFrame, as_of: pd.Timestamp) -> str:
-    """BTC regime на момент as_of без lookahead (только закрытые бары ≤ as_of)."""
+    """BTC regime на момент as_of без lookahead (только полностью закрытые бары)."""
     if df_btc is None or df_btc.empty:
         return "neutral"
-    sub = df_btc[df_btc.index <= as_of]
+    from .trend_rules import htf_bar_closed_as_of
+
+    closed_mask = [htf_bar_closed_as_of(ts, BTC_REGIME_TIMEFRAME, as_of) for ts in df_btc.index]
+    sub = df_btc.loc[closed_mask]
     return _btc_regime_from_df(sub)
 
 
@@ -242,6 +245,13 @@ def _btc_regime(ex: ccxt.Exchange) -> str:
     Конфликт сигналов (например, выше EMA200, но резко падает) => 'neutral'.
     """
     df = _fetch_df(ex, BTC_REGIME_SYMBOL, BTC_REGIME_TIMEFRAME, BTC_REGIME_BARS)
+    # Не отбрасываем безусловно последнюю свечу: она может быть уже закрыта.
+    if df is not None and not df.empty:
+        from .trend_rules import htf_bar_closed_as_of
+
+        now = pd.Timestamp.now(tz="UTC")
+        closed = [htf_bar_closed_as_of(ts, BTC_REGIME_TIMEFRAME, now) for ts in df.index]
+        df = df.loc[closed]
     return _btc_regime_from_df(df)
 
 
@@ -306,7 +316,7 @@ def scan_combined_setups(
     auto_cfg.allow_level_breakout = False
     auto_cfg.allow_triangle = False
 
-    ex = ccxt.binance({"enableRateLimit": True})
+    ex = ccxt.binance({"enableRateLimit": True, "timeout": 15_000})
     t0 = time.perf_counter()
     candidates: list[dict[str, Any]] = []
     skipped: list[str] = []
@@ -322,88 +332,93 @@ def scan_combined_setups(
     for i, symbol in enumerate(symbols_list, 1):
         if progress_cb:
             progress_cb({"current": i, "total": total, "symbol": symbol})
-        df = _fetch_df(ex, symbol, scan_cfg.timeframe, bars)
-        if df is None:
-            skipped.append(symbol)
-            continue
-
-        work = df_closed_only(df) if scan_cfg.use_closed_bar_only else df
-        min_bars = max(80, int(scan_cfg.min_bars or 280))
-        if len(work) < min_bars:
-            skipped.append(symbol)
-            continue
-
-        snap = _stage1_snapshot(work)
-        resolved = _resolve_plan(
-            work,
-            snap,
-            params,
-            allow_trend=scan_cfg.allow_trend,
-            allow_range=scan_cfg.allow_range,
-        )
-        if resolved is None:
-            continue
-
-        plan, regime = resolved
-        direction = str(plan.get("direction", "")).strip()
-        if scan_cfg.long_only and direction.lower() == "short":
-            continue
-        if btc_regime == "bear" and direction == "Long":
-            continue
-        if btc_regime == "bull" and direction == "Short":
-            continue
-
-        if regime == "trend" and params.require_htf_align:
-            df_htf = _fetch_df(ex, symbol, params.htf_timeframe, HTF_ALIGN_BARS)
-            if df_htf is None:
+        try:
+            df = _fetch_df(ex, symbol, scan_cfg.timeframe, bars)
+            if df is None:
+                skipped.append(symbol)
                 continue
-            aligned, htf_reason = htf_trend_aligned(
-                df_htf, work.index[-1], str(plan.get("trend", "")), params
+
+            work = df_closed_only(df) if scan_cfg.use_closed_bar_only else df
+            min_bars = max(80, int(scan_cfg.min_bars or 280))
+            if len(work) < min_bars:
+                skipped.append(symbol)
+                continue
+
+            snap = _stage1_snapshot(work)
+            resolved = _resolve_plan(
+                work,
+                snap,
+                params,
+                allow_trend=scan_cfg.allow_trend,
+                allow_range=scan_cfg.allow_range,
             )
-            if not aligned:
-                print(f"[combined_scan] skip {symbol} (htf): {htf_reason}", flush=True)
+            if resolved is None:
                 continue
 
-        last = work.iloc[-1]
-        close = float(last["close"])
-        candle_bullish = close > float(last["open"])
-        rel_vol = float(snap["context"]["rel_volume"])
-        support = float(plan["trend_support"])
-        resistance = float(plan["trend_resistance"])
-        vol_up, vol_down = compute_volume_scores(work)
+            plan, regime = resolved
+            direction = str(plan.get("direction", "")).strip()
+            if scan_cfg.long_only and direction.lower() == "short":
+                continue
+            if btc_regime == "bear" and direction == "Long":
+                continue
+            if btc_regime == "bull" and direction == "Short":
+                continue
 
-        # Без floor: пара без уровней/паттернов не должна проходить порог за счёт одного объёма
-        stage1 = _adjust_stage1_for_direction(
-            float(snap["stage1_score"]),
-            direction=str(plan["direction"]),
-            rel_vol=rel_vol,
-            candle_bullish=candle_bullish,
-            close=close,
-            support=support,
-            resistance=resistance,
-            vol_up=vol_up,
-            vol_down=vol_down,
-        )
-        if stage1 < scan_cfg.stage1_min_score:
+            if regime == "trend" and params.require_htf_align:
+                df_htf = _fetch_df(ex, symbol, params.htf_timeframe, HTF_ALIGN_BARS)
+                if df_htf is None:
+                    continue
+                aligned, htf_reason = htf_trend_aligned(
+                    df_htf, work.index[-1], str(plan.get("trend", "")), params
+                )
+                if not aligned:
+                    print(f"[combined_scan] skip {symbol} (htf): {htf_reason}", flush=True)
+                    continue
+
+            last = work.iloc[-1]
+            close = float(last["close"])
+            candle_bullish = close > float(last["open"])
+            rel_vol = float(snap["context"]["rel_volume"])
+            support = float(plan["trend_support"])
+            resistance = float(plan["trend_resistance"])
+            vol_up, vol_down = compute_volume_scores(work)
+
+            # Без floor: пара без уровней/паттернов не должна проходить порог за счёт одного объёма
+            stage1 = _adjust_stage1_for_direction(
+                float(snap["stage1_score"]),
+                direction=str(plan["direction"]),
+                rel_vol=rel_vol,
+                candle_bullish=candle_bullish,
+                close=close,
+                support=support,
+                resistance=resistance,
+                vol_up=vol_up,
+                vol_down=vol_down,
+            )
+            if stage1 < scan_cfg.stage1_min_score:
+                continue
+
+            cand = _build_candidate(symbol=symbol, snap=snap, plan=plan, stage1=stage1, df=work)
+            cand["regime"] = regime
+            cand["trend"] = plan.get("trend")
+            cand["entry_style"] = plan.get("entry_style")
+            cand["rel_volume"] = plan.get("rel_volume")
+            cand["pattern"] = "range bounce" if regime == "range" else f"trend {plan.get('trend', '')}"
+            cand["why_selected"] = _why_selected(
+                plan, regime, rel_vol, params, timeframe=scan_cfg.timeframe
+            )
+
+            ok, reason = validate_setup(cand, auto_cfg)
+            if not ok:
+                print(f"[combined_scan] skip {symbol} ({regime}): {reason}", flush=True)
+                continue
+
+            regime_counts[regime] = regime_counts.get(regime, 0) + 1
+            candidates.append(cand)
+        except Exception as e:
+            skipped.append(symbol)
+            print(f"[combined_scan] skip {symbol}: {e}", flush=True)
             continue
-
-        cand = _build_candidate(symbol=symbol, snap=snap, plan=plan, stage1=stage1, df=work)
-        cand["regime"] = regime
-        cand["trend"] = plan.get("trend")
-        cand["entry_style"] = plan.get("entry_style")
-        cand["rel_volume"] = plan.get("rel_volume")
-        cand["pattern"] = "range bounce" if regime == "range" else f"trend {plan.get('trend', '')}"
-        cand["why_selected"] = _why_selected(
-            plan, regime, rel_vol, params, timeframe=scan_cfg.timeframe
-        )
-
-        ok, reason = validate_setup(cand, auto_cfg)
-        if not ok:
-            print(f"[combined_scan] skip {symbol} ({regime}): {reason}", flush=True)
-            continue
-
-        regime_counts[regime] = regime_counts.get(regime, 0) + 1
-        candidates.append(cand)
 
     candidates.sort(key=lambda c: (-float(c.get("score") or 0), str(c.get("regime"))))
     top = candidates[: max(1, scan_cfg.top_n)]

@@ -44,6 +44,10 @@ class AutoTradeConfig:
     allow_triangle: bool = True
     allowed_hours: tuple[int, int] | None = None
     min_atr_pct: float = 0.008
+    # Макс. возраст кэша сигнала (сек). 0 = авто: 2×TF, минимум 30 мин.
+    max_signal_age_sec: float = 0.0
+    # Отклонение mark от планового entry (доля). 0 = выкл.
+    max_entry_deviation_pct: float = 0.015
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -116,6 +120,8 @@ def load_auto_trade_config(yaml_cfg: dict[str, Any] | None = None) -> AutoTradeC
         allow_level_breakout=bool(y.get("allow_level_breakout", True)),
         allow_triangle=bool(y.get("allow_triangle", True)),
         min_atr_pct=float(y.get("min_atr_pct", 0.008)),
+        max_signal_age_sec=float(y.get("max_signal_age_sec", 0.0)),
+        max_entry_deviation_pct=float(y.get("max_entry_deviation_pct", 0.015)),
     )
     ah_raw = y.get("allowed_hours")
     if ah_raw is not None and str(ah_raw).strip():
@@ -140,6 +146,8 @@ def load_auto_trade_config(yaml_cfg: dict[str, Any] | None = None) -> AutoTradeC
         "AUTO_TRADE_ALLOW_LEVEL_BREAKOUT": ("allow_level_breakout", _env_bool),
         "AUTO_TRADE_ALLOW_TRIANGLE": ("allow_triangle", _env_bool),
         "AUTO_TRADE_MIN_ATR_PCT": ("min_atr_pct", _env_float),
+        "AUTO_TRADE_MAX_SIGNAL_AGE_SEC": ("max_signal_age_sec", _env_float),
+        "AUTO_TRADE_MAX_ENTRY_DEV_PCT": ("max_entry_deviation_pct", _env_float),
     }
     for env_name, (attr, fn) in env_map.items():
         if not os.environ.get(env_name, "").strip():
@@ -154,6 +162,8 @@ def load_auto_trade_config(yaml_cfg: dict[str, Any] | None = None) -> AutoTradeC
             "AUTO_TRADE_PROFIT_CLOSE_PCT",
             "AUTO_TRADE_STOP_LOSS_ROI_USDT",
             "AUTO_TRADE_MIN_ATR_PCT",
+            "AUTO_TRADE_MAX_SIGNAL_AGE_SEC",
+            "AUTO_TRADE_MAX_ENTRY_DEV_PCT",
         ):
             val = _env_float(env_name, float(default) if default else 0.0)
             if val > 0 or env_name in (
@@ -162,6 +172,8 @@ def load_auto_trade_config(yaml_cfg: dict[str, Any] | None = None) -> AutoTradeC
                 "AUTO_TRADE_PROFIT_CLOSE_PCT",
                 "AUTO_TRADE_STOP_LOSS_ROI_USDT",
                 "AUTO_TRADE_MIN_ATR_PCT",
+                "AUTO_TRADE_MAX_SIGNAL_AGE_SEC",
+                "AUTO_TRADE_MAX_ENTRY_DEV_PCT",
             ):
                 setattr(base, attr, val)
             continue
@@ -259,6 +271,8 @@ def _setup_metadata_from_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         "trend": candidate.get("trend"),
         "score": candidate.get("score"),
         "probability_pct": setup.get("probability_pct"),
+        "heuristic_confidence": setup.get("heuristic_confidence"),
+        "probability_is_heuristic": bool(setup.get("probability_is_heuristic", False)),
         "risk_reward": setup.get("risk_reward"),
         "why_selected": candidate.get("why_selected"),
         "vol_s_up": candidate.get("vol_s_up"),
@@ -300,6 +314,8 @@ def record_closed_trade(
         "trend": rec.get("trend"),
         "score": rec.get("score"),
         "probability_pct": rec.get("probability_pct"),
+        "heuristic_confidence": rec.get("heuristic_confidence"),
+        "probability_is_heuristic": bool(rec.get("probability_is_heuristic", False)),
         "risk_reward": rec.get("risk_reward"),
         "why_selected": rec.get("why_selected"),
         "trade_rank": rec.get("trade_rank"),
@@ -688,6 +704,11 @@ def _sync_open_positions(exchange: Any, state: dict[str, Any], cfg: AutoTradeCon
 def _sync_futures_positions(exchange: Any, state: dict[str, Any], cfg: AutoTradeConfig) -> dict[str, Any]:
     state = _normalize_state(state)
     live = _fetch_live_positions_map(exchange)
+    known_fsyms = {
+        str(rec.get("futures_symbol") or _futures_symbol(exchange, str(rec.get("symbol") or "")))
+        for rec in (state.get("open_positions") or [])
+        if rec.get("symbol") or rec.get("futures_symbol")
+    }
     kept: list[dict[str, Any]] = []
     for rec in state.get("open_positions") or []:
         spot = str(rec.get("symbol") or "")
@@ -721,6 +742,48 @@ def _sync_futures_positions(exchange: Any, state: dict[str, Any], cfg: AutoTrade
         row["loss_limit_usdt"] = _loss_limit_usdt(cfg)
         row["mark_price"] = float(p.get("markPrice") or p.get("entryPrice") or 0.0)
         kept.append(row)
+
+    # Импорт неизвестных позиций с биржи (после сбоя bracket / ручного входа).
+    if not cfg.dry_run:
+        for fsym, p in live.items():
+            if fsym in known_fsyms:
+                continue
+            contracts = abs(float(p.get("contracts") or 0.0))
+            if contracts <= 0:
+                continue
+            side_raw = str(p.get("side") or "").lower()
+            if side_raw in ("long", "short"):
+                side = side_raw
+            else:
+                side = "long" if float(p.get("contracts") or 0.0) > 0 else "short"
+            entry_px = float(p.get("entryPrice") or p.get("markPrice") or 0.0)
+            spot = fsym.split(":")[0] if ":" in fsym else fsym
+            orphan = {
+                "symbol": spot,
+                "futures_symbol": fsym,
+                "market": "futures",
+                "side": side,
+                "opened_at": datetime.now(timezone.utc).isoformat(),
+                "notional_usdt": contracts * entry_px if entry_px > 0 else 0.0,
+                "leverage": cfg.leverage,
+                "entry": entry_px,
+                "entry_price": entry_px,
+                "amount": contracts,
+                "contracts": contracts,
+                "stop": 0.0,
+                "take_profit": 0.0,
+                "unrealized_pnl": float(p.get("unrealizedPnl") or 0.0),
+                "mark_price": float(p.get("markPrice") or entry_px),
+                "orphan_imported": True,
+                "needs_protection": True,
+            }
+            kept.append(orphan)
+            print(
+                f"[auto_trade] CRITICAL: imported unknown futures position {fsym} "
+                f"side={side} contracts={contracts} — needs protection",
+                flush=True,
+            )
+
     if len(kept) < len(state.get("open_positions") or []):
         state["last_close_reason"] = "position_closed"
         now = datetime.now(timezone.utc).isoformat()
@@ -729,6 +792,189 @@ def _sync_futures_positions(exchange: Any, state: dict[str, Any], cfg: AutoTrade
     state["open_positions"] = kept
     state.pop("open", None)
     return state
+
+
+def _orphan_protective_stop(entry: float, side: str, *, frac: float = 0.03) -> float:
+    """Аварийный стоп для orphan-позиции без плана (~3% от входа)."""
+    f = max(0.005, float(frac))
+    if side == "long":
+        return float(entry) * (1.0 - f)
+    return float(entry) * (1.0 + f)
+
+
+def _protect_orphan_futures(
+    exchange: Any,
+    state: dict[str, Any],
+    cfg: AutoTradeConfig,
+) -> dict[str, Any]:
+    """Ставит reduce-only STOP_MARKET на импортированные позиции без защиты."""
+    if cfg.dry_run or is_spot_market(cfg):
+        return state
+    state = _normalize_state(state)
+    updated: list[dict[str, Any]] = []
+    for rec in state.get("open_positions") or []:
+        row = dict(rec)
+        if not row.get("needs_protection") and not row.get("orphan_imported"):
+            updated.append(row)
+            continue
+        if float(row.get("stop") or 0) > 0 and row.get("stop_order_id"):
+            row["needs_protection"] = False
+            updated.append(row)
+            continue
+        fsym = str(row.get("futures_symbol") or "")
+        side = str(row.get("side") or "long").lower()
+        amount = float(row.get("contracts") or row.get("amount") or 0.0)
+        entry = float(row.get("entry_price") or row.get("entry") or row.get("mark_price") or 0.0)
+        if not fsym or amount <= 0 or entry <= 0:
+            updated.append(row)
+            continue
+        placed = _place_emergency_futures_stop(
+            exchange,
+            fsym,
+            side=side,
+            amount=amount,
+            entry=entry,
+        )
+        try:
+            if not placed.get("ok"):
+                raise RuntimeError(str(placed.get("reason") or "UNKNOWN_STOP_ERROR"))
+            row["stop"] = float(placed["stop"])
+            row["stop_order_id"] = placed.get("stop_order_id")
+            row["needs_protection"] = False
+            row["orphan_stop_placed"] = True
+            print(
+                f"[auto_trade] orphan protection: STOP_MARKET {fsym} "
+                f"side={side} stop={placed.get('stop_price')}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[auto_trade] CRITICAL: orphan stop failed {fsym}: {e}", flush=True)
+            row["needs_protection"] = True
+            row["last_error"] = f"ORPHAN_STOP_FAILED:{e}"
+        updated.append(row)
+    state["open_positions"] = updated
+    return state
+
+
+def _place_emergency_futures_stop(
+    exchange: Any,
+    fsym: str,
+    *,
+    side: str,
+    amount: float,
+    entry: float,
+    stop_frac: float = 0.03,
+) -> dict[str, Any]:
+    """Последняя линия защиты, если bracket/market-close не сработали."""
+    try:
+        amt = float(exchange.amount_to_precision(fsym, amount))
+        if amt <= 0 or entry <= 0:
+            return {"ok": False, "reason": "BAD_EMERGENCY_STOP_INPUT"}
+        stop = _orphan_protective_stop(entry, side, frac=stop_frac)
+        stop_p = exchange.price_to_precision(fsym, stop)
+        close_side = "sell" if side == "long" else "buy"
+        order = exchange.create_order(
+            fsym,
+            "STOP_MARKET",
+            close_side,
+            amt,
+            None,
+            {"reduceOnly": True, "closePosition": False, "stopPrice": stop_p},
+        )
+        return {
+            "ok": True,
+            "stop": float(stop),
+            "stop_price": stop_p,
+            "stop_order_id": order.get("id"),
+        }
+    except Exception as e:
+        return {"ok": False, "reason": str(e)}
+
+
+def _emergency_close_futures(
+    exchange: Any,
+    fsym: str,
+    *,
+    side: str,
+    amount: float,
+) -> dict[str, Any]:
+    """Reduce-only market close после сбоя защитных ордеров."""
+    close_side = "sell" if side == "long" else "buy"
+    try:
+        amt = float(exchange.amount_to_precision(fsym, amount))
+        if amt <= 0:
+            return {"ok": False, "reason": "ZERO_AMOUNT"}
+        order = exchange.create_order(
+            fsym,
+            "market",
+            close_side,
+            amt,
+            None,
+            {"reduceOnly": True},
+        )
+        return {"ok": True, "order": order}
+    except Exception as e:
+        return {"ok": False, "reason": str(e)}
+
+
+def _place_futures_brackets(
+    exchange: Any,
+    fsym: str,
+    *,
+    side: str,
+    amount: float,
+    stop: float,
+    tp: float,
+) -> dict[str, Any]:
+    close_side = "sell" if side == "long" else "buy"
+    stop_p = exchange.price_to_precision(fsym, stop)
+    tp_p = exchange.price_to_precision(fsym, tp)
+    common = {"reduceOnly": True, "closePosition": False}
+    stop_order = None
+    tp_order = None
+    last_err: str | None = None
+    for attempt in range(2):
+        try:
+            stop_order = exchange.create_order(
+                fsym,
+                "STOP_MARKET",
+                close_side,
+                amount,
+                None,
+                {**common, "stopPrice": stop_p},
+            )
+            break
+        except Exception as e:
+            last_err = f"STOP_FAILED:{e}"
+            print(f"[auto_trade] stop attempt {attempt + 1} failed {fsym}: {e}", flush=True)
+    if stop_order is None:
+        return {"ok": False, "reason": last_err or "STOP_FAILED"}
+    try:
+        tp_order = exchange.create_order(
+            fsym,
+            "TAKE_PROFIT_MARKET",
+            close_side,
+            amount,
+            None,
+            {**common, "stopPrice": tp_p},
+        )
+    except Exception as e:
+        print(f"[auto_trade] TP failed {fsym} (stop is live): {e}", flush=True)
+        return {
+            "ok": False,
+            "partial": True,
+            "reason": f"TP_FAILED:{e}",
+            "protection_live": True,
+            "stop_order_id": stop_order.get("id"),
+            "tp_order_id": None,
+            "tp_error": str(e),
+        }
+    return {
+        "ok": True,
+        "partial": False,
+        "stop_order_id": stop_order.get("id"),
+        "tp_order_id": tp_order.get("id") if tp_order else None,
+    }
 
 
 def _open_positions_count(state: dict[str, Any]) -> int:
@@ -1099,6 +1345,7 @@ def manage_open_positions(*, yaml_cfg: dict[str, Any] | None = None) -> dict[str
     exchange = exchange_for_config(cfg)
     state = _reconcile_spot_into_state(exchange, state, cfg)
     state = _sync_open_positions(exchange, state, cfg)
+    state = _protect_orphan_futures(exchange, state, cfg)
     state = ensure_spot_exit_orders(exchange, state, cfg)
     state = _sync_open_positions(exchange, state, cfg)
     closed = _apply_auto_closes(exchange, state, cfg)
@@ -1191,7 +1438,6 @@ def execute_futures_trade(
         return {"ok": False, "reason": f"AMOUNT_TOO_SMALL:{amount}<{min_amount}"}
 
     open_side = "buy" if side == "long" else "sell"
-    close_side = "sell" if side == "long" else "buy"
 
     if cfg.dry_run:
         return {
@@ -1216,7 +1462,34 @@ def execute_futures_trade(
     entry_price = float(entry_order.get("average") or entry_order.get("price") or mark_entry)
     amount = float(exchange.amount_to_precision(fsym, filled))
     if amount < min_amount:
-        return {"ok": False, "reason": "FILLED_TOO_SMALL", "entry_order": entry_order}
+        live_pos = _fetch_open_position(exchange, fsym)
+        live_amount = abs(float((live_pos or {}).get("contracts") or filled or amount))
+        closed = _emergency_close_futures(exchange, fsym, side=side, amount=live_amount)
+        fallback_stop = None
+        if not closed.get("ok"):
+            fallback_stop = _place_emergency_futures_stop(
+                exchange,
+                fsym,
+                side=side,
+                amount=live_amount,
+                entry=entry_price,
+            )
+        return {
+            "ok": False,
+            "reason": (
+                "FILLED_TOO_SMALL_EMERGENCY_CLOSED"
+                if closed.get("ok")
+                else "FILLED_TOO_SMALL_POSITION_OPEN"
+            ),
+            "entry_order": entry_order,
+            "emergency_close": closed,
+            "emergency_stop": fallback_stop,
+            "residual_position": not bool(closed.get("ok")),
+            "futures_symbol": fsym,
+            "stop_order_id": (fallback_stop or {}).get("stop_order_id"),
+            "entry_price": entry_price,
+            "amount": live_amount,
+        }
 
     planned_risk = abs(entry - stop) / max(entry, 1e-12)
     real_risk = abs(entry_price - stop) / max(entry_price, 1e-12)
@@ -1227,26 +1500,60 @@ def execute_futures_trade(
             flush=True,
         )
 
-    stop_p = exchange.price_to_precision(fsym, stop)
-    tp_p = exchange.price_to_precision(fsym, tp)
-    common = {"reduceOnly": True, "closePosition": False}
+    try:
+        brackets = _place_futures_brackets(
+            exchange, fsym, side=side, amount=amount, stop=stop, tp=tp
+        )
+    except Exception as e:
+        brackets = {"ok": False, "reason": f"BRACKET_EXCEPTION:{e}"}
 
-    stop_order = exchange.create_order(
-        fsym,
-        "STOP_MARKET",
-        close_side,
-        amount,
-        None,
-        {**common, "stopPrice": stop_p},
-    )
-    tp_order = exchange.create_order(
-        fsym,
-        "TAKE_PROFIT_MARKET",
-        close_side,
-        amount,
-        None,
-        {**common, "stopPrice": tp_p},
-    )
+    if not brackets.get("ok"):
+        print(
+            f"[auto_trade] CRITICAL: brackets failed after fill {fsym}: {brackets.get('reason')} — emergency close",
+            flush=True,
+        )
+        closed = _emergency_close_futures(exchange, fsym, side=side, amount=amount)
+        fallback_stop: dict[str, Any] | None = None
+        if closed.get("ok"):
+            cancel_symbol_open_orders(
+                exchange,
+                fsym,
+                order_ids=[str(brackets["stop_order_id"])] if brackets.get("stop_order_id") else None,
+            )
+        elif not brackets.get("stop_order_id"):
+            # Market-close itself failed and no planned stop exists: protect immediately.
+            fallback_stop = _place_emergency_futures_stop(
+                exchange,
+                fsym,
+                side=side,
+                amount=amount,
+                entry=entry_price,
+            )
+            print(
+                f"[auto_trade] CRITICAL: emergency close failed {fsym}; "
+                f"fallback STOP ok={fallback_stop.get('ok')} reason={fallback_stop.get('reason')}",
+                flush=True,
+            )
+        residual_position = not bool(closed.get("ok"))
+        protection_order_id = brackets.get("stop_order_id") or (
+            fallback_stop or {}
+        ).get("stop_order_id")
+        return {
+            "ok": False,
+            "reason": (
+                f"BRACKET_FAILED_EMERGENCY_CLOSED:{brackets.get('reason')}"
+                if closed.get("ok")
+                else f"BRACKET_FAILED_POSITION_OPEN:{brackets.get('reason')}"
+            ),
+            "entry_order": entry_order,
+            "emergency_close": closed,
+            "emergency_stop": fallback_stop,
+            "residual_position": residual_position,
+            "futures_symbol": fsym,
+            "stop_order_id": protection_order_id,
+            "entry_price": entry_price,
+            "amount": amount,
+        }
 
     return {
         "ok": True,
@@ -1259,8 +1566,9 @@ def execute_futures_trade(
         "amount": amount,
         "leverage": cfg.leverage,
         "entry_order_id": entry_order.get("id"),
-        "stop_order_id": stop_order.get("id"),
-        "tp_order_id": tp_order.get("id"),
+        "stop_order_id": brackets.get("stop_order_id"),
+        "tp_order_id": brackets.get("tp_order_id"),
+        "brackets_partial": bool(brackets.get("partial")),
         "entry": entry,
         "entry_price": entry_price,
         "stop": stop,
@@ -1644,6 +1952,15 @@ def _try_open_candidate(
         }
 
     price_sym = symbol if is_spot_market(cfg) else trade_sym
+    ok_dev, dev_reason = _entry_deviation_ok(exchange, price_sym, setup, cfg)
+    if not ok_dev:
+        return {
+            "action": "skipped",
+            "reason": dev_reason,
+            "symbol": symbol,
+            "trade_rank": trade_rank,
+        }
+
     notional = _notional_usdt(
         free_usdt=free_usdt,
         entry=_estimate_entry_price(exchange, price_sym, float(setup["entry"])),
@@ -1685,6 +2002,33 @@ def _try_open_candidate(
             cfg=cfg,
         )
     if not exec_result.get("ok"):
+        if not cfg.dry_run and exec_result.get("residual_position"):
+            protection_id = exec_result.get("stop_order_id")
+            fallback_stop = exec_result.get("emergency_stop") or {}
+            residual = {
+                "symbol": symbol,
+                "futures_symbol": exec_result.get("futures_symbol", trade_sym),
+                "market": "futures",
+                "side": side,
+                "opened_at": datetime.now(timezone.utc).isoformat(),
+                "notional_usdt": notional,
+                "leverage": cfg.leverage,
+                "entry": setup["entry"],
+                "entry_price": exec_result.get("entry_price", setup["entry"]),
+                "stop": fallback_stop.get("stop") or (setup.get("stop") if protection_id else 0.0),
+                "take_profit": 0.0,
+                "amount": exec_result.get("amount"),
+                "contracts": exec_result.get("amount"),
+                "stop_order_id": protection_id,
+                "orders": {"stop": protection_id},
+                "exit_orders_placed": bool(protection_id),
+                "needs_protection": not bool(protection_id),
+                "orphan_imported": True,
+                "exit_error": exec_result.get("reason"),
+            }
+            if not _has_symbol_open(state, str(residual["futures_symbol"])):
+                state.setdefault("open_positions", []).append(residual)
+                save_trade_state(state)
         reason = str(exec_result.get("reason") or "")
         soft_skip = reason.startswith("NOTIONAL_BELOW_MIN") or reason.startswith("AMOUNT_TOO_SMALL")
         return {
@@ -1770,6 +2114,77 @@ def _try_open_candidate(
     }
 
 
+def _default_max_signal_age_sec(
+    cfg: AutoTradeConfig,
+    cached: dict[str, Any] | None = None,
+) -> float:
+    if cfg.max_signal_age_sec > 0:
+        return float(cfg.max_signal_age_sec)
+    # 2× timeframe скана из кэша, минимум 30 мин
+    try:
+        from .liquidity_model import timeframe_to_minutes
+        from .scan_cache import load_scan_result
+
+        if cached is None:
+            cached = load_scan_result() or {}
+        sc = cached.get("scan_config") or {}
+        tf = str(sc.get("timeframe") or os.environ.get("FORECAST_TIMEFRAME") or "1h")
+        return max(1800.0, float(timeframe_to_minutes(tf) * 60 * 2))
+    except Exception:
+        return 7200.0
+
+
+def _scan_cache_age_sec(cached: dict[str, Any] | None) -> float | None:
+    if not cached:
+        return None
+    raw = str(cached.get("updated_at") or "").strip()
+    if not raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return max(
+            0.0,
+            (datetime.now(timezone.utc) - ts.astimezone(timezone.utc)).total_seconds(),
+        )
+    except ValueError:
+        return None
+
+
+def _entry_deviation_ok(
+    exchange: Any,
+    symbol: str,
+    setup: dict[str, Any],
+    cfg: AutoTradeConfig,
+) -> tuple[bool, str]:
+    max_dev = float(cfg.max_entry_deviation_pct or 0.0)
+    if max_dev <= 0:
+        return True, "OK"
+    plan_entry = float(setup.get("entry") or 0.0)
+    if plan_entry <= 0:
+        return False, "BAD_PLAN_ENTRY"
+    mark = _estimate_entry_price(exchange, symbol, plan_entry)
+    dev = abs(mark - plan_entry) / plan_entry
+    if dev > max_dev:
+        return False, f"ENTRY_DEVIATION:{dev:.2%}>{max_dev:.2%} mark={mark:.6g} plan={plan_entry:.6g}"
+    # Пересчёт RR по текущему mark
+    stop = float(setup.get("stop") or 0.0)
+    tp = float(setup.get("target_2") if cfg.use_target_2 else setup.get("target_1", setup.get("target_2") or 0.0))
+    side = _normalize_side(str(setup.get("direction", "")))
+    if stop <= 0 or tp <= 0:
+        return False, "BAD_STOP_TP"
+    if side == "long" and (stop >= mark or tp <= mark):
+        return False, "STALE_GEOMETRY_LONG"
+    if side == "short" and (stop <= mark or tp >= mark):
+        return False, "STALE_GEOMETRY_SHORT"
+    risk = abs(mark - stop)
+    rr = abs(tp - mark) / max(risk, 1e-12)
+    if rr < cfg.min_risk_reward:
+        return False, f"STALE_RR:{rr:.2f}<{cfg.min_risk_reward}"
+    return True, "OK"
+
+
 def maybe_run_auto_trade(
     report: dict[str, Any] | None = None,
     *,
@@ -1786,15 +2201,38 @@ def maybe_run_auto_trade(
     exchange = exchange_for_config(cfg)
     state = _reconcile_spot_into_state(exchange, state, cfg)
     state = _sync_open_positions(exchange, state, cfg)
+    state = _protect_orphan_futures(exchange, state, cfg)
     state = ensure_spot_exit_orders(exchange, state, cfg)
     state = _sync_open_positions(exchange, state, cfg)
     _apply_auto_closes(exchange, state, cfg)
     state = _sync_open_positions(exchange, state, cfg)
     save_trade_state(state)
 
+    cached: dict[str, Any] | None = None
     if report is None:
         cached = load_scan_result()
         report = (cached or {}).get("report") or {}
+        age = _scan_cache_age_sec(cached)
+        max_age = _default_max_signal_age_sec(cfg, cached)
+        stale_reason = None
+        if not cached:
+            stale_reason = "NO_SIGNAL_CACHE"
+        elif age is None:
+            stale_reason = "STALE_SIGNAL:NO_TIMESTAMP"
+        elif age > max_age:
+            stale_reason = f"STALE_SIGNAL:{int(age)}s>{int(max_age)}s"
+        if stale_reason:
+            result = {
+                "action": "skipped",
+                "reason": stale_reason,
+                "opened_count": 0,
+                "attempts": [],
+                "cache_updated_at": (cached or {}).get("updated_at"),
+            }
+            print(f"[auto_trade] {result['reason']}", flush=True)
+            _log_trade_attempt(state, cfg, result)
+            save_trade_state(state)
+            return result
 
     now_h = datetime.now(timezone.utc).hour
     if cfg.allowed_hours is not None and not _in_allowed_hours(now_h, cfg.allowed_hours):
@@ -1903,6 +2341,5 @@ def maybe_run_auto_trade(
 
 
 def run_from_cache(yaml_cfg: dict[str, Any] | None = None) -> dict[str, Any]:
-    cached = load_scan_result(DEFAULT_CACHE_PATH)
-    report = (cached or {}).get("report") or {}
-    return maybe_run_auto_trade(report, yaml_cfg=yaml_cfg)
+    # maybe_run_auto_trade сам читает кэш и проверяет TTL
+    return maybe_run_auto_trade(None, yaml_cfg=yaml_cfg)

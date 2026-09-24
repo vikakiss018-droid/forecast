@@ -369,7 +369,7 @@ def _hero_setup(setup_row: dict[str, Any] | None) -> str:
       <div class="hero-grid">
         <div><label>Паттерн</label><div>{_e(setup_row.get('pattern'))}</div></div>
         <div><label>Тренд</label><div>{_e(setup_row.get('trend'))}</div></div>
-        <div><label>Вероятность</label><div>{_fmt_num(plan.get('probability_pct'), 1)}%</div></div>
+        <div><label>Эвристика</label><div>{_fmt_num(plan.get('probability_pct'), 1)}%</div></div>
         <div><label>R:R</label><div>{_fmt_num(plan.get('risk_reward'), 2)}</div></div>
         <div><label>Вход</label><div class="mono">{_fmt_num(plan.get('entry'))}</div></div>
         <div><label>Стоп</label><div class="mono stop">{_fmt_num(plan.get('stop'))}</div></div>
@@ -1035,7 +1035,7 @@ def render_scanner_dashboard(
           <thead>
             <tr>
               <th>#</th><th>Пара</th><th>Паттерн</th><th>Тренд</th><th>Score</th>
-              <th>Направление</th><th>Prob</th><th>Entry</th><th>Stop</th>
+              <th>Направление</th><th>Heuristic</th><th>Entry</th><th>Stop</th>
               <th>TP1</th><th>TP2</th><th>R:R</th><th>Почему</th>
             </tr>
           </thead>

@@ -25,7 +25,9 @@ class ScanConfig:
 
 
 LEVEL_LOOKBACK = 120
+# Доля диапазона для near-support/resistance; не используется как touch tolerance.
 LEVEL_PROXIMITY_FRAC = 0.15
+LEVEL_TOUCH_ATR_MULT = 0.35
 RANGE_ENTRY_ZONE_FRAC = 0.22  # дефолт; runtime — range_entry_zone_frac()
 
 
@@ -63,14 +65,23 @@ def count_level_touches(
     """Сколько раз цена касалась уровня (отдельные касания, не подряд идущие бары)."""
     if df is None or df.empty or level <= 0:
         return 0
-    look = min(int(lookback or LEVEL_LOOKBACK), len(df))
+    look = min(int(lookback or LEVEL_LOOKBACK), max(0, len(df) - 1))
     if look < 3:
         return 0
-    tail = df.iloc[-look:]
-    atr = float(tail["atr_14"].iloc[-1]) if "atr_14" in tail.columns else 0.0
-    span_tol = max(abs(level) * float(tol_frac or LEVEL_PROXIMITY_FRAC), atr * 0.35, 1e-12)
-    highs = tail["high"].to_numpy(dtype=float)
-    lows = tail["low"].to_numpy(dtype=float)
+    # Исключаем текущий (возможно незакрытый) бар — только подтверждённые касания.
+    end = len(df) - 1
+    hist = df.iloc[max(0, end - look) : end]
+    if len(hist) < 3:
+        return 0
+    atr = float(hist["atr_14"].iloc[-1]) if "atr_14" in hist.columns else 0.0
+    # Дефолт строго ATR×0.35 (не ±доля цены); tol_frac — явный legacy override.
+    span_tol = (
+        max(abs(level) * float(tol_frac), 1e-12)
+        if tol_frac is not None
+        else max(atr * LEVEL_TOUCH_ATR_MULT, 1e-12)
+    )
+    highs = hist["high"].to_numpy(dtype=float)
+    lows = hist["low"].to_numpy(dtype=float)
     if kind == "resistance":
         near = np.abs(highs - level) <= span_tol
     else:
@@ -342,6 +353,8 @@ def _build_trade_plan(df: pd.DataFrame, snap: dict[str, Any], st) -> dict[str, A
     return {
         "direction": direction,
         "probability_pct": float(prob),
+        "heuristic_confidence": float(prob),
+        "probability_is_heuristic": True,
         "entry": float(entry),
         "stop": float(stop),
         "target_1": float(tp1),
@@ -476,4 +489,3 @@ def scan_market_top_setups(
         "scan_duration_sec": scan_duration_sec,
         "symbols_scanned": int(len(universe)),
     }
-

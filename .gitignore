@@ -17,6 +17,7 @@ data/raw/
 data/processed/
 data/liquidations/
 data/liquidity/
+data/spot_comparison_cache/
 forecast/data/
 
 # IDE / OS
