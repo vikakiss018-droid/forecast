@@ -103,9 +103,11 @@ from .mobile_app import (
     swing_payload,
 )
 from .push_alerts import (
+    delete_apns_token,
     delete_expo_push_token,
     delete_push_subscription,
     get_vapid_public_key,
+    save_apns_token,
     save_expo_push_token,
     save_push_subscription,
 )
@@ -660,6 +662,107 @@ async def mobile_expo_unregister(request: Request) -> dict:
         token = str(body.get("token") or "")
     delete_expo_push_token(token)
     return {"ok": True}
+
+
+@app.post("/m/api/apns/register", dependencies=PANEL_AUTH_DEPS)
+async def mobile_apns_register(request: Request) -> dict:
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="ожидался JSON")
+    token = str(body.get("token") or "").strip()
+    platform = str(body.get("platform") or "ios").strip()
+    try:
+        save_apns_token(token, platform=platform)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True}
+
+
+@app.post("/m/api/apns/unregister", dependencies=PANEL_AUTH_DEPS)
+async def mobile_apns_unregister(request: Request) -> dict:
+    body = await request.json()
+    token = ""
+    if isinstance(body, dict):
+        token = str(body.get("token") or "")
+    delete_apns_token(token)
+    return {"ok": True}
+
+
+def _mobile_progress_for_kind(kind: str) -> dict[str, Any]:
+    k = (kind or "scan").strip().lower()
+    if k in ("swing",):
+        data = load_swing_progress()
+    elif k in ("stocks", "stock"):
+        data = load_stocks_progress()
+    elif k in ("pairs", "pair", "pair_test"):
+        data = load_symbol_ranking_result_raw()
+    else:
+        data = load_scan_progress()
+    if not isinstance(data, dict):
+        data = {"status": "idle"}
+    prog = data.get("progress") if isinstance(data.get("progress"), dict) else {}
+    return {
+        "ok": True,
+        "kind": k,
+        "status": str(data.get("status") or "idle"),
+        "error": data.get("error"),
+        "progress": {
+            "current": prog.get("current") or 0,
+            "total": prog.get("total") or 0,
+            "symbol": prog.get("symbol"),
+        },
+        "symbols_count": data.get("symbols_count"),
+    }
+
+
+@app.get("/m/api/scan/progress", dependencies=PANEL_AUTH_DEPS)
+def mobile_scan_progress(kind: str = "scan") -> dict[str, Any]:
+    return _mobile_progress_for_kind(kind)
+
+
+@app.post("/m/api/scan/run", dependencies=PANEL_AUTH_DEPS)
+async def mobile_scan_run(request: Request, background_tasks: BackgroundTasks) -> dict[str, Any]:
+    body: dict[str, Any] = {}
+    try:
+        raw = await request.json()
+        if isinstance(raw, dict):
+            body = raw
+    except Exception:
+        body = {}
+    kind = str(body.get("kind") or "scan").strip().lower()
+
+    if kind in ("paper",):
+        try:
+            update_open_trades()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
+        return {"ok": True, "kind": "paper", "started": True, "busy": False}
+
+    cur = _mobile_progress_for_kind(kind)
+    if str(cur.get("status") or "") == "running":
+        return {"ok": True, "kind": kind, "started": False, "busy": True, "status": "running"}
+
+    if kind in ("swing",):
+        background_tasks.add_task(run_swing_scan_background)
+    elif kind in ("stocks", "stock"):
+        background_tasks.add_task(run_stocks_scan_background)
+    elif kind in ("pairs", "pair", "pair_test"):
+        try:
+            top_n = int(ranking_config_from_env().top_n)
+        except Exception:
+            top_n = 400
+        mark_symbol_ranking_starting(top_n=top_n)
+        background_tasks.add_task(run_symbol_ranking_background)
+    else:
+        cfg = trend_scan_config_from_env()
+        background_tasks.add_task(
+            _run_live_scan_background,
+            top=int(cfg.top_n),
+            bars=int(cfg.bars or 1000),
+            timeframe=str(cfg.timeframe or "1h"),
+            stage1_min_score=float(cfg.stage1_min_score),
+        )
+    return {"ok": True, "kind": kind, "started": True, "busy": False, "status": "running"}
 
 
 @app.get("/legacy", response_class=HTMLResponse)

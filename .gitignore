@@ -27,6 +27,8 @@ forecast/data/
 *.swp
 forecast/mobile/node_modules/
 forecast/mobile/.expo/
+forecast/ios/**/xcuserdata/
+forecast/ios/**/*.xcuserstate
 
 # Jupyter
 .ipynb_checkpoints/

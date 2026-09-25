@@ -1,6 +1,9 @@
-# Forecast Mobile (iOS / Android)
+# Forecast Mobile
 
-Отдельное нативное приложение — не вкладка браузера. Подключается к вашему Forecast API и показывает выгодные позиции (score > 35), с push-уведомлениями после скана.
+Нативная iOS-версия (без Expo) лежит в [`../ios`](../ios). Её и ставьте на телефон через Xcode.
+
+Эта папка `mobile/` — старый прототип на Expo, больше не используется.
+
 
 ## Быстрый старт (разработка)
 
@@ -19,18 +22,23 @@ npx expo start
 
 > Expo Go — для проверки. Для «настоящего» приложения на иконке телефона без Expo Go соберите APK/IPA ниже.
 
-## Сборка APK / IPA (полноценное приложение)
+## EAS (своё приложение на телефоне, без App Store)
+
+Нужен бесплатный аккаунт на [expo.dev](https://expo.dev) (это не Apple Developer). Apple ID разработчика понадобится только на шаге `eas build -p ios`.
 
 ```bash
 cd forecast/mobile
-npm install -g eas-cli
-eas login
-eas init          # создаст projectId в app.json
-eas build -p android --profile preview   # APK для Android
-eas build -p ios --profile preview     # нужен Apple Developer
+npm install
+npx eas login
+npx eas init
+npx eas build -p ios --profile preview
 ```
 
-После сборки скачайте файл и установите на телефон (Android — APK напрямую, iOS — через TestFlight или ad-hoc).
+`eas init` запишет настоящий `projectId` в `app.json` — без него серверные push не работают.
+
+Профиль `preview` — **internal / ad hoc**: ставится только на зарегистрированные iPhone, в App Store не публикуется. После сборки откройте ссылку из терминала на телефоне и установите.
+
+На iPhone один раз: Настройки → Основные → VPN и управление устройством → доверять сертификату.
 
 ### Android APK локально (без EAS)
 

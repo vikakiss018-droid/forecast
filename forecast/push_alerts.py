@@ -14,6 +14,7 @@ _log = logging.getLogger(__name__)
 DEFAULT_ALERT_MIN_SCORE = 35.0
 SUBSCRIPTIONS_PATH = PROCESSED_DATA_DIR / "mobile_push_subscriptions.json"
 EXPO_TOKENS_PATH = PROCESSED_DATA_DIR / "mobile_expo_tokens.json"
+APNS_TOKENS_PATH = PROCESSED_DATA_DIR / "mobile_apns_tokens.json"
 VAPID_PATH = PROCESSED_DATA_DIR / "mobile_vapid.json"
 LAST_PUSH_PATH = PROCESSED_DATA_DIR / "mobile_last_push.json"
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
@@ -138,6 +139,129 @@ def delete_expo_push_token(token: str) -> None:
         return
     rows = [r for r in _load_expo_tokens() if r.get("token") != token]
     _write_json(EXPO_TOKENS_PATH, rows)
+
+
+def _normalize_apns_token(token: str) -> str:
+    return "".join(ch for ch in (token or "") if ch in "0123456789abcdefABCDEF").lower()
+
+
+def _load_apns_tokens() -> list[dict[str, Any]]:
+    data = _read_json(APNS_TOKENS_PATH, [])
+    if not isinstance(data, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        token = _normalize_apns_token(str(row.get("token") or ""))
+        if len(token) >= 64:
+            out.append({"token": token, "platform": str(row.get("platform") or "ios")})
+    return out
+
+
+def save_apns_token(token: str, *, platform: str = "ios") -> None:
+    token = _normalize_apns_token(token)
+    if len(token) < 64:
+        raise ValueError("неверный APNs device token")
+    rows = [r for r in _load_apns_tokens() if r.get("token") != token]
+    rows.append({"token": token, "platform": (platform or "ios").strip() or "ios"})
+    _write_json(APNS_TOKENS_PATH, rows)
+
+
+def delete_apns_token(token: str) -> None:
+    token = _normalize_apns_token(token)
+    if not token:
+        return
+    rows = [r for r in _load_apns_tokens() if r.get("token") != token]
+    _write_json(APNS_TOKENS_PATH, rows)
+
+
+def _apns_jwt() -> str | None:
+    key_path = (os.environ.get("APNS_KEY_PATH") or "").strip()
+    key_id = (os.environ.get("APNS_KEY_ID") or "").strip()
+    team_id = (os.environ.get("APNS_TEAM_ID") or "").strip()
+    if not key_path or not key_id or not team_id:
+        return None
+    from pathlib import Path
+
+    path = Path(key_path)
+    if not path.is_file():
+        _log.warning("APNS_KEY_PATH not found: %s", key_path)
+        return None
+    try:
+        import time
+
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+    except ImportError:
+        _log.warning("APNs skipped: cryptography not installed")
+        return None
+
+    pem = path.read_bytes()
+    key = serialization.load_pem_private_key(pem, password=None)
+    header = {"alg": "ES256", "kid": key_id}
+    claims = {"iss": team_id, "iat": int(time.time())}
+
+    def _b64url(raw: bytes) -> str:
+        import base64
+
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    signing_input = f"{_b64url(json.dumps(header, separators=(',', ':')).encode())}." f"{_b64url(json.dumps(claims, separators=(',', ':')).encode())}"
+    der = key.sign(signing_input.encode("ascii"), ec.ECDSA(hashes.SHA256()))
+    r, s = decode_dss_signature(der)
+    sig = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+    return f"{signing_input}.{_b64url(sig)}"
+
+
+def _send_apns(token: str, payload: dict[str, str]) -> bool:
+    """Return False if the device token should be removed."""
+    jwt = _apns_jwt()
+    bundle = (os.environ.get("APNS_BUNDLE_ID") or "com.forecast.scanner").strip()
+    if not jwt:
+        _log.info("APNs skipped: set APNS_KEY_PATH, APNS_KEY_ID, APNS_TEAM_ID")
+        return True
+    sandbox = (os.environ.get("APNS_USE_SANDBOX") or "true").strip().lower() in ("1", "true", "yes")
+    host = "api.sandbox.push.apple.com" if sandbox else "api.push.apple.com"
+    url = f"https://{host}/3/device/{token}"
+    body = json.dumps(
+        {
+            "aps": {
+                "alert": {"title": payload.get("title"), "body": payload.get("body")},
+                "sound": "default",
+            },
+            "url": payload.get("url"),
+            "tag": payload.get("tag"),
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    headers = [
+        "authorization: bearer " + jwt,
+        f"apns-topic: {bundle}",
+        "apns-push-type: alert",
+        "apns-priority: 10",
+        "content-type: application/json",
+    ]
+    try:
+        import subprocess
+
+        cmd = ["curl", "-sS", "--http2", "-o", "-", "-w", "\n%{http_code}", "-X", "POST", url]
+        for h in headers:
+            cmd.extend(["-H", h])
+        cmd.extend(["--data-binary", "@-"])
+        proc = subprocess.run(cmd, input=body, capture_output=True, timeout=20, check=False)
+        text = (proc.stdout or b"").decode("utf-8", "replace")
+        lines = text.rsplit("\n", 1)
+        code = int(lines[-1]) if lines[-1].isdigit() else 0
+        if code in (404, 410):
+            return False
+        if code >= 400:
+            _log.warning("APNs http %s: %s", code, lines[0][:200] if lines else "")
+        return True
+    except Exception as e:
+        _log.warning("APNs error: %s", e)
+        return True
 
 
 def _generate_vapid_keys() -> dict[str, str] | None:
@@ -309,6 +433,19 @@ def notify_high_score_setups(report: dict[str, Any], *, updated_at: str | None =
             sent += 1
     if len(kept_expo) != len(expo_rows):
         _write_json(EXPO_TOKENS_PATH, kept_expo)
+
+    apns_rows = _load_apns_tokens()
+    kept_apns: list[dict[str, Any]] = []
+    for row in apns_rows:
+        token = str(row.get("token") or "")
+        if not token:
+            continue
+        ok = _send_apns(token, payload)
+        if ok:
+            kept_apns.append(row)
+            sent += 1
+    if len(kept_apns) != len(apns_rows):
+        _write_json(APNS_TOKENS_PATH, kept_apns)
 
     _write_json(
         LAST_PUSH_PATH,
